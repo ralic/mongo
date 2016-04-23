@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -33,6 +35,7 @@
 #include <set>
 
 #include "mongo/util/clock_source.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -95,6 +98,11 @@ ClusterCursorManager::PinnedCursor::PinnedCursor(PinnedCursor&& other)
 
 ClusterCursorManager::PinnedCursor& ClusterCursorManager::PinnedCursor::operator=(
     ClusterCursorManager::PinnedCursor&& other) {
+#if defined(_MSC_VER) && _MSC_VER < 1900  // MSVC 2013 STL can emit self-move-assign.
+    if (&other == this)
+        return *this;
+#endif
+
     if (_cursor) {
         // The underlying cursor has not yet been returned.
         returnAndKillCursor();
@@ -133,6 +141,21 @@ long long ClusterCursorManager::PinnedCursor::getNumReturnedSoFar() const {
     return _cursor->getNumReturnedSoFar();
 }
 
+void ClusterCursorManager::PinnedCursor::queueResult(const BSONObj& obj) {
+    invariant(_cursor);
+    _cursor->queueResult(obj);
+}
+
+bool ClusterCursorManager::PinnedCursor::remotesExhausted() {
+    invariant(_cursor);
+    return _cursor->remotesExhausted();
+}
+
+Status ClusterCursorManager::PinnedCursor::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
+    invariant(_cursor);
+    return _cursor->setAwaitDataTimeout(awaitDataTimeout);
+}
+
 void ClusterCursorManager::PinnedCursor::returnAndKillCursor() {
     invariant(_cursor);
 
@@ -148,8 +171,8 @@ void ClusterCursorManager::PinnedCursor::returnAndKillCursor() {
 }
 
 ClusterCursorManager::ClusterCursorManager(ClockSource* clockSource)
-    : _pseudoRandom(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64()),
-      _clockSource(clockSource) {
+    : _clockSource(clockSource),
+      _pseudoRandom(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64()) {
     invariant(_clockSource);
 }
 
@@ -158,12 +181,31 @@ ClusterCursorManager::~ClusterCursorManager() {
     invariant(_namespaceToContainerMap.empty());
 }
 
-ClusterCursorManager::PinnedCursor ClusterCursorManager::registerCursor(
+void ClusterCursorManager::shutdown() {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _inShutdown = true;
+    lk.unlock();
+
+    killAllCursors();
+    reapZombieCursors();
+}
+
+StatusWith<CursorId> ClusterCursorManager::registerCursor(
     std::unique_ptr<ClusterClientCursor> cursor,
     const NamespaceString& nss,
     CursorType cursorType,
     CursorLifetime cursorLifetime) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    // Read the clock out of the lock.
+    const auto now = _clockSource->now();
+
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+    if (_inShutdown) {
+        lk.unlock();
+        cursor->kill();
+        return Status(ErrorCodes::ShutdownInProgress,
+                      "Cannot register new cursors as we are in the process of shutting down");
+    }
 
     invariant(cursor);
 
@@ -199,20 +241,24 @@ ClusterCursorManager::PinnedCursor ClusterCursorManager::registerCursor(
     } while (cursorId == 0 || entryMap.count(cursorId) > 0);
 
     // Create a new CursorEntry and register it in the CursorEntryContainer's map.
-    auto emplaceResult = entryMap.emplace(
-        cursorId, CursorEntry(std::move(cursor), cursorType, cursorLifetime, _clockSource->now()));
+    auto emplaceResult =
+        entryMap.emplace(cursorId, CursorEntry(std::move(cursor), cursorType, cursorLifetime, now));
     invariant(emplaceResult.second);
 
-    // Pin and return the cursor.  Note that pinning a cursor transfers ownership of the underlying
-    // ClusterClientCursor object to the pin; the CursorEntry is left with a null
-    // ClusterClientCursor.
-    CursorEntry& entry = emplaceResult.first->second;
-    return PinnedCursor(this, entry.releaseCursor(), nss, cursorId);
+    return cursorId;
 }
 
 StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCursor(
     const NamespaceString& nss, CursorId cursorId) {
+    // Read the clock out of the lock.
+    const auto now = _clockSource->now();
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    if (_inShutdown) {
+        return Status(ErrorCodes::ShutdownInProgress,
+                      "Cannot check out cursor as we are in the process of shutting down");
+    }
 
     CursorEntry* entry = getEntry_inlock(nss, cursorId);
     if (!entry) {
@@ -226,7 +272,7 @@ StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCur
         return cursorInUseStatus(nss, cursorId);
     }
 
-    entry->setLastActive(_clockSource->now());
+    entry->setLastActive(now);
 
     // Note that pinning a cursor transfers ownership of the underlying ClusterClientCursor object
     // to the pin; the CursorEntry is left with a null ClusterClientCursor.
@@ -237,9 +283,11 @@ void ClusterCursorManager::checkInCursor(std::unique_ptr<ClusterClientCursor> cu
                                          const NamespaceString& nss,
                                          CursorId cursorId,
                                          CursorState cursorState) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     invariant(cursor);
+
+    const bool remotesExhausted = cursor->remotesExhausted();
 
     CursorEntry* entry = getEntry_inlock(nss, cursorId);
     invariant(entry);
@@ -250,10 +298,21 @@ void ClusterCursorManager::checkInCursor(std::unique_ptr<ClusterClientCursor> cu
         return;
     }
 
-    // The cursor is exhausted, and the cursor doesn't have a pending kill.  We should delete it.
+    if (!remotesExhausted) {
+        // The cursor still has open remote cursors that need to be cleaned up. Schedule for
+        // deletion by the reaper thread by setting the kill pending flag.
+        entry->setKillPending();
+        return;
+    }
+
+    // The cursor is exhausted, is not already scheduled for deletion, and does not have any
+    // remote cursor state left to clean up. We can delete the cursor right away.
     auto detachedCursor = detachCursor_inlock(nss, cursorId);
     invariantOK(detachedCursor.getStatus());
-    // Cursor is deleted when 'detachedCursor' goes out of scope.
+
+    // Deletion of the cursor can happen out of the lock.
+    lk.unlock();
+    detachedCursor.getValue().reset();
 }
 
 Status ClusterCursorManager::killCursor(const NamespaceString& nss, CursorId cursorId) {
@@ -277,6 +336,8 @@ void ClusterCursorManager::killMortalCursorsInactiveSince(Date_t cutoff) {
             CursorEntry& entry = cursorIdEntryPair.second;
             if (entry.getLifetimeType() == CursorLifetime::Mortal &&
                 entry.getLastActive() <= cutoff) {
+                log() << "Marking cursor id " << cursorIdEntryPair.first
+                      << " for deletion, idle since " << entry.getLastActive().toString();
                 entry.setKillPending();
             }
         }
@@ -322,8 +383,8 @@ void ClusterCursorManager::reapZombieCursors() {
 
         lk.unlock();
         zombieCursor.getValue()->kill();
+        zombieCursor.getValue().reset();
         lk.lock();
-        // Cursor deleted as it goes out of scope.
     }
 }
 
@@ -337,8 +398,15 @@ ClusterCursorManager::Stats ClusterCursorManager::stats() const {
             const CursorEntry& entry = cursorIdEntryPair.second;
 
             if (entry.getKillPending()) {
+                // Killed cursors do not count towards the number of pinned cursors or the number of
+                // open cursors.
                 continue;
             }
+
+            if (!entry.isCursorOwned()) {
+                ++stats.cursorsPinned;
+            }
+
             switch (entry.getCursorType()) {
                 case CursorType::NamespaceNotSharded:
                     ++stats.cursorsNotSharded;

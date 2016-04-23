@@ -43,11 +43,11 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
-    }
     virtual void help(std::stringstream& ss) const {
         ss << "internal";
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
@@ -81,7 +81,6 @@ private:
                          const BSONObj& cmdObj);
     Status _authenticateCR(OperationContext* txn, const UserName& user, const BSONObj& cmdObj);
     Status _authenticateX509(OperationContext* txn, const UserName& user, const BSONObj& cmdObj);
-    bool _clusterIdMatch(const std::string& subjectName, const std::string& srvSubjectName);
 };
 
 extern CmdAuthenticate cmdAuthenticate;

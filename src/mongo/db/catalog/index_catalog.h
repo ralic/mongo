@@ -36,6 +36,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/platform/unordered_map.h"
 
 namespace mongo {
@@ -262,10 +263,25 @@ public:
 
     // ----- data modifiers ------
 
-    // this throws for now
-    Status indexRecord(OperationContext* txn, const BSONObj& obj, const RecordId& loc);
+    /**
+     * When 'keysInsertedOut' is not null, it will be set to the number of index keys inserted by
+     * this operation.
+     *
+     * This method may throw.
+     */
+    Status indexRecords(OperationContext* txn,
+                        const std::vector<BsonRecord>& bsonRecords,
+                        int64_t* keysInsertedOut);
 
-    void unindexRecord(OperationContext* txn, const BSONObj& obj, const RecordId& loc, bool noWarn);
+    /**
+     * When 'keysDeletedOut' is not null, it will be set to the number of index keys removed by
+     * this operation.
+     */
+    void unindexRecord(OperationContext* txn,
+                       const BSONObj& obj,
+                       const RecordId& loc,
+                       bool noWarn,
+                       int64_t* keysDeletedOut);
 
     // ------- temp internal -------
 
@@ -294,16 +310,22 @@ private:
 
     void _checkMagic() const;
 
-    Status _indexRecord(OperationContext* txn,
-                        IndexCatalogEntry* index,
-                        const BSONObj& obj,
-                        const RecordId& loc);
+    Status _indexFilteredRecords(OperationContext* txn,
+                                 IndexCatalogEntry* index,
+                                 const std::vector<BsonRecord>& bsonRecords,
+                                 int64_t* keysInsertedOut);
+
+    Status _indexRecords(OperationContext* txn,
+                         IndexCatalogEntry* index,
+                         const std::vector<BsonRecord>& bsonRecords,
+                         int64_t* keysInsertedOut);
 
     Status _unindexRecord(OperationContext* txn,
                           IndexCatalogEntry* index,
                           const BSONObj& obj,
                           const RecordId& loc,
-                          bool logIfError);
+                          bool logIfError,
+                          int64_t* keysDeletedOut);
 
     /**
      * this does no sanity checks
@@ -329,7 +351,7 @@ private:
     // appropriate, etc.
     static BSONObj _fixIndexSpec(const BSONObj& spec);
 
-    Status _isSpecOk(const BSONObj& spec) const;
+    Status _isSpecOk(OperationContext* txn, const BSONObj& spec) const;
 
     Status _doesSpecConflictWithExisting(OperationContext* txn, const BSONObj& spec) const;
 

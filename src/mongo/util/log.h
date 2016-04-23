@@ -211,12 +211,13 @@ bool rotateLogs(bool renameFiles);
 /** output the error # and error message with prefix.
     handy for use as parm in uassert/massert.
     */
-std::string errnoWithPrefix(const char* prefix);
+std::string errnoWithPrefix(StringData prefix);
 
 extern Tee* const warnings;            // Things put here go in serverStatus
 extern Tee* const startupWarningsLog;  // Things put here get reported in MMS
 
 std::string errnoWithDescription(int errorcode = -1);
+std::pair<int, std::string> errnoAndDescription();
 
 /**
  * Write the current context (backtrace), along with the optional "msg".

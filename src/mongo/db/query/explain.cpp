@@ -30,11 +30,18 @@
 
 #include "mongo/db/query/explain.h"
 
-
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/exec/cached_plan.h"
+#include "mongo/db/exec/count_scan.h"
+#include "mongo/db/exec/distinct_scan.h"
+#include "mongo/db/exec/idhack.h"
+#include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/near.h"
+#include "mongo/db/exec/text.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/stage_builder.h"
@@ -55,17 +62,27 @@ using std::vector;
  * Traverse the tree rooted at 'root', and add all tree nodes into the list 'flattened'.
  */
 void flattenStatsTree(const PlanStageStats* root, vector<const PlanStageStats*>* flattened) {
+    invariant(root->stageType != STAGE_MULTI_PLAN);
     flattened->push_back(root);
-    for (size_t i = 0; i < root->children.size(); ++i) {
-        flattenStatsTree(root->children[i], flattened);
+    for (auto&& child : root->children) {
+        flattenStatsTree(child.get(), flattened);
     }
 }
 
 /**
- * Traverse the tree rooted at 'root', and add all nodes into the list 'flattened'.
+ * Traverse the tree rooted at 'root', and add all nodes into the list 'flattened'. If a
+ * MultiPlanStage is encountered, only add the best plan and its children to 'flattened'.
  */
 void flattenExecTree(const PlanStage* root, vector<const PlanStage*>* flattened) {
     flattened->push_back(root);
+
+    if (root->stageType() == STAGE_MULTI_PLAN) {
+        // Only add the winning plan from a MultiPlanStage.
+        auto mps = static_cast<const MultiPlanStage*>(root);
+        const PlanStage* winningStage = mps->getChildren()[mps->bestPlanIdx()].get();
+        return flattenExecTree(winningStage, flattened);
+    }
+
     const auto& children = root->getChildren();
     for (size_t i = 0; i < children.size(); ++i) {
         flattenExecTree(children[i].get(), flattened);
@@ -300,6 +317,12 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             bob->appendNumber("keysExamined", spec->keysExamined);
         }
+    } else if (STAGE_ENSURE_SORTED == stats.stageType) {
+        EnsureSortedStats* spec = static_cast<EnsureSortedStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainCommon::EXEC_STATS) {
+            bob->appendNumber("nDropped", spec->nDropped);
+        }
     } else if (STAGE_FETCH == stats.stageType) {
         FetchStats* spec = static_cast<FetchStats*>(stats.specific.get());
         if (verbosity >= ExplainCommon::EXEC_STATS) {
@@ -311,6 +334,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
 
         bob->append("keyPattern", spec->keyPattern);
         bob->append("indexName", spec->indexName);
+        bob->append("indexVersion", spec->indexVersion);
 
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             BSONArrayBuilder intervalsBob(bob->subarrayStart("searchIntervals"));
@@ -357,6 +381,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
 
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             bob->appendNumber("keysExamined", spec->keysExamined);
+            bob->appendNumber("seeks", spec->seeks);
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
             bob->appendNumber("seenInvalidated", spec->seenInvalidated);
@@ -367,7 +392,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
-            bob->appendNumber("locsForgotten", spec->locsForgotten);
+            bob->appendNumber("recordIdsForgotten", spec->recordIdsForgotten);
         }
     } else if (STAGE_LIMIT == stats.stageType) {
         LimitStats* spec = static_cast<LimitStats*>(stats.specific.get());
@@ -410,6 +435,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         bob->append("indexPrefix", spec->indexPrefix);
         bob->append("indexName", spec->indexName);
         bob->append("parsedTextQuery", spec->parsedTextQuery);
+        bob->append("textIndexVersion", spec->textIndexVersion);
     } else if (STAGE_TEXT_MATCH == stats.stageType) {
         TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
 
@@ -476,9 +502,26 @@ void Explain::statsToBSON(const PlanStageStats& stats,
 }
 
 // static
+BSONObj Explain::getWinningPlanStats(const PlanExecutor* exec) {
+    BSONObjBuilder bob;
+    getWinningPlanStats(exec, &bob);
+    return bob.obj();
+}
+
+// static
+void Explain::getWinningPlanStats(const PlanExecutor* exec, BSONObjBuilder* bob) {
+    MultiPlanStage* mps = getMultiPlanStage(exec->getRootStage());
+    unique_ptr<PlanStageStats> winningStats(
+        mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
+            : std::move(exec->getRootStage()->getStats()));
+
+    statsToBSON(*winningStats, ExplainCommon::EXEC_STATS, bob, bob);
+}
+
+// static
 void Explain::generatePlannerInfo(PlanExecutor* exec,
                                   PlanStageStats* winnerStats,
-                                  const vector<PlanStageStats*>& rejectedStats,
+                                  const vector<unique_ptr<PlanStageStats>>& rejectedStats,
                                   BSONObjBuilder* out) {
     CanonicalQuery* query = exec->getCanonicalQuery();
 
@@ -510,7 +553,7 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     // does not canonicalize for idhack updates). In these cases, 'query' is NULL.
     if (NULL != query) {
         BSONObjBuilder parsedQueryBob(plannerBob.subobjStart("parsedQuery"));
-        query->root()->toBSON(&parsedQueryBob);
+        query->root()->serialize(&parsedQueryBob);
         parsedQueryBob.doneFast();
     }
 
@@ -582,18 +625,32 @@ void Explain::explainStages(PlanExecutor* exec,
                             ExplainCommon::Verbosity verbosity,
                             BSONObjBuilder* out) {
     //
-    // Step 1: run the stages as required by the verbosity level.
+    // Collect plan stats, running the plan if necessary. The stats also give the structure of the
+    // plan tree.
     //
 
-    // Inspect the tree to see if there is a MultiPlanStage.
+    // Inspect the tree to see if there is a MultiPlanStage. Plan selection has already happened at
+    // this point, since we have a PlanExecutor.
     MultiPlanStage* mps = getMultiPlanStage(exec->getRootStage());
 
-    // Get stats of the winning plan from the trial period, if the verbosity level
-    // is high enough and there was a runoff between multiple plans.
+    // Get stats of the winning plan from the trial period, if the verbosity level is high enough
+    // and there was a runoff between multiple plans.
     unique_ptr<PlanStageStats> winningStatsTrial;
-    if (verbosity >= ExplainCommon::EXEC_ALL_PLANS && NULL != mps) {
-        winningStatsTrial = exec->getStats();
+    if (verbosity >= ExplainCommon::EXEC_ALL_PLANS && mps) {
+        winningStatsTrial = std::move(mps->getStats()->children[mps->bestPlanIdx()]);
         invariant(winningStatsTrial.get());
+    }
+
+    // If more than one plan was considered, get the stats from the trial period for the rejected
+    // plans.
+    vector<unique_ptr<PlanStageStats>> allPlansStats;
+    if (mps) {
+        auto mpsStats = mps->getStats();
+        for (size_t i = 0; i < mpsStats->children.size(); ++i) {
+            if (i != static_cast<size_t>(mps->bestPlanIdx())) {
+                allPlansStats.emplace_back(std::move(mpsStats->children[i]));
+            }
+        }
     }
 
     // If we need execution stats, then run the plan in order to gather the stats.
@@ -602,25 +659,19 @@ void Explain::explainStages(PlanExecutor* exec,
         executePlanStatus = exec->executePlan();
     }
 
-    //
-    // Step 2: collect plan stats (which also give the structure of the plan tree).
-    //
+    // Get stats for the winning plan. If there is only a single candidate plan, it is considered
+    // the winner.
+    unique_ptr<PlanStageStats> winningStats(
+        mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
+            : std::move(exec->getStats()));
 
-    // Get stats for the winning plan.
-    unique_ptr<PlanStageStats> winningStats(exec->getStats());
-
-    // Get stats for the rejected plans, if more than one plan was considered.
-    OwnedPointerVector<PlanStageStats> allPlansStats;
-    if (NULL != mps) {
-        allPlansStats = mps->generateCandidateStats();
-    }
 
     //
-    // Step 3: use the stats trees to produce explain BSON.
+    // Use the stats trees to produce explain BSON.
     //
 
     if (verbosity >= ExplainCommon::QUERY_PLANNER) {
-        generatePlannerInfo(exec, winningStats.get(), allPlansStats.vector(), out);
+        generatePlannerInfo(exec, winningStats.get(), allPlansStats, out);
     }
 
     if (verbosity >= ExplainCommon::EXEC_STATS) {
@@ -646,15 +697,15 @@ void Explain::explainStages(PlanExecutor* exec,
             // from the trial period of the winning plan. The "allPlansExecution" section
             // will contain an apples-to-apples comparison of the winning plan's stats against
             // all rejected plans' stats collected during the trial period.
-            if (NULL != mps) {
+            if (mps) {
                 invariant(winningStatsTrial.get());
-                allPlansStats.push_back(winningStatsTrial.release());
+                allPlansStats.emplace_back(std::move(winningStatsTrial));
             }
 
             BSONArrayBuilder allPlansBob(execBob.subarrayStart("allPlansExecution"));
             for (size_t i = 0; i < allPlansStats.size(); ++i) {
                 BSONObjBuilder planBob(allPlansBob.subobjStart());
-                generateExecStats(allPlansStats[i], verbosity, &planBob, boost::none);
+                generateExecStats(allPlansStats[i].get(), verbosity, &planBob, boost::none);
                 planBob.doneFast();
             }
             allPlansBob.doneFast();
@@ -724,6 +775,46 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
         }
         if (STAGE_SORT == stages[i]->stageType()) {
             statsOut->hasSortStage = true;
+        }
+
+        if (STAGE_IXSCAN == stages[i]->stageType()) {
+            const IndexScan* ixscan = static_cast<const IndexScan*>(stages[i]);
+            const IndexScanStats* ixscanStats =
+                static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
+            statsOut->indexesUsed.insert(ixscanStats->indexName);
+        } else if (STAGE_COUNT_SCAN == stages[i]->stageType()) {
+            const CountScan* countScan = static_cast<const CountScan*>(stages[i]);
+            const CountScanStats* countScanStats =
+                static_cast<const CountScanStats*>(countScan->getSpecificStats());
+            statsOut->indexesUsed.insert(countScanStats->indexName);
+        } else if (STAGE_IDHACK == stages[i]->stageType()) {
+            const IDHackStage* idHackStage = static_cast<const IDHackStage*>(stages[i]);
+            const IDHackStats* idHackStats =
+                static_cast<const IDHackStats*>(idHackStage->getSpecificStats());
+            statsOut->indexesUsed.insert(idHackStats->indexName);
+        } else if (STAGE_DISTINCT_SCAN == stages[i]->stageType()) {
+            const DistinctScan* distinctScan = static_cast<const DistinctScan*>(stages[i]);
+            const DistinctScanStats* distinctScanStats =
+                static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
+            statsOut->indexesUsed.insert(distinctScanStats->indexName);
+        } else if (STAGE_TEXT == stages[i]->stageType()) {
+            const TextStage* textStage = static_cast<const TextStage*>(stages[i]);
+            const TextStats* textStats =
+                static_cast<const TextStats*>(textStage->getSpecificStats());
+            statsOut->indexesUsed.insert(textStats->indexName);
+        } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
+                   STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {
+            const NearStage* nearStage = static_cast<const NearStage*>(stages[i]);
+            const NearStats* nearStats =
+                static_cast<const NearStats*>(nearStage->getSpecificStats());
+            statsOut->indexesUsed.insert(nearStats->indexName);
+        } else if (STAGE_CACHED_PLAN == stages[i]->stageType()) {
+            const CachedPlanStage* cachedPlan = static_cast<const CachedPlanStage*>(stages[i]);
+            const CachedPlanStats* cachedStats =
+                static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
+            statsOut->replanned = cachedStats->replanned;
+        } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
+            statsOut->fromMultiPlanner = true;
         }
     }
 }

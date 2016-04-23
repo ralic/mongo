@@ -58,7 +58,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/util/log.h"
@@ -406,7 +406,10 @@ Status Database::dropCollection(OperationContext* txn, StringData fullns) {
         }
     }
 
-    getGlobalServiceContext()->getOpObserver()->onDropCollection(txn, nss);
+    auto opObserver = getGlobalServiceContext()->getOpObserver();
+    if (opObserver)
+        opObserver->onDropCollection(txn, nss);
+
     return Status::OK();
 }
 
@@ -442,6 +445,8 @@ Status Database::renameCollection(OperationContext* txn,
                                   bool stayTemp) {
     audit::logRenameCollection(&cc(), fromNS, toNS);
     invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
+    BackgroundOperation::assertNoBgOpInProgForNs(fromNS);
+    BackgroundOperation::assertNoBgOpInProgForNs(toNS);
 
     {  // remove anything cached
         Collection* coll = getCollection(fromNS);
@@ -484,7 +489,7 @@ Collection* Database::createCollection(OperationContext* txn,
     massertNamespaceNotIndex(ns, "createCollection");
     invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
 
-    if (serverGlobalParams.configsvr &&
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
         !(ns.startsWith("config.") || ns.startsWith("local.") || ns.startsWith("admin."))) {
         uasserted(14037, "can't create user databases on a --configsvr instance");
     }
@@ -499,6 +504,7 @@ Collection* Database::createCollection(OperationContext* txn,
 
     NamespaceString nss(ns);
     uassert(17316, "cannot create a blank collection", nss.coll() > 0);
+    uassert(28838, "cannot create a non-capped oplog collection", options.capped || !nss.isOplog());
 
     audit::logCreateCollection(&cc(), ns);
 
@@ -526,7 +532,9 @@ Collection* Database::createCollection(OperationContext* txn,
         }
     }
 
-    getGlobalServiceContext()->getOpObserver()->onCreateCollection(txn, nss, options);
+    auto opObserver = getGlobalServiceContext()->getOpObserver();
+    if (opObserver)
+        opObserver->onCreateCollection(txn, nss, options);
 
     return collection;
 }
@@ -557,7 +565,7 @@ void dropAllDatabasesExceptLocal(OperationContext* txn) {
                 if (db == nullptr) {
                     log() << "database disappeared after listDatabases but before drop: " << *i;
                 } else {
-                    dropDatabase(txn, db);
+                    Database::dropDatabase(txn, db);
                 }
             }
             MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "dropAllDatabasesExceptLocal", *i);
@@ -565,18 +573,18 @@ void dropAllDatabasesExceptLocal(OperationContext* txn) {
     }
 }
 
-void dropDatabase(OperationContext* txn, Database* db) {
+void Database::dropDatabase(OperationContext* txn, Database* db) {
     invariant(db);
 
     // Store the name so we have if for after the db object is deleted
     const string name = db->name();
-    LOG(1) << "dropDatabase " << name << endl;
+    LOG(1) << "dropDatabase " << name;
 
     invariant(txn->lockState()->isDbLockedForMode(name, MODE_X));
 
-    BackgroundOperation::assertNoBgOpInProgForDb(name.c_str());
+    BackgroundOperation::assertNoBgOpInProgForDb(name);
 
-    audit::logDropDatabase(&cc(), name);
+    audit::logDropDatabase(txn->getClient(), name);
 
     dbHolder().close(txn, name);
     db = NULL;  // d is now deleted
@@ -610,14 +618,20 @@ Status userCreateNS(OperationContext* txn,
     if (!status.isOK())
         return status;
 
-    status = validateStorageOptions(collectionOptions.storageEngine,
-                                    &StorageEngine::Factory::validateCollectionStorageOptions);
+    status =
+        validateStorageOptions(collectionOptions.storageEngine,
+                               stdx::bind(&StorageEngine::Factory::validateCollectionStorageOptions,
+                                          stdx::placeholders::_1,
+                                          stdx::placeholders::_2));
     if (!status.isOK())
         return status;
 
     if (auto indexOptions = collectionOptions.indexOptionDefaults["storageEngine"]) {
-        status = validateStorageOptions(indexOptions.Obj(),
-                                        &StorageEngine::Factory::validateIndexStorageOptions);
+        status =
+            validateStorageOptions(indexOptions.Obj(),
+                                   stdx::bind(&StorageEngine::Factory::validateIndexStorageOptions,
+                                              stdx::placeholders::_1,
+                                              stdx::placeholders::_2));
         if (!status.isOK()) {
             return status;
         }

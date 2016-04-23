@@ -36,7 +36,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/replication_executor_test_fixture.h"
-#include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/functional.h"
@@ -52,16 +51,16 @@ namespace repl {
 namespace {
 
 using executor::NetworkInterfaceMock;
+using unittest::assertGet;
 
 const int64_t prngSeed = 1;
 
 MONGO_INITIALIZER(ReplExecutorCommonTests)(InitializerContext*) {
-    mongo::executor::addTestsForExecutor(
-        "ReplicationExecutorCommon",
-        [](std::unique_ptr<executor::NetworkInterfaceMock>* net) {
-            return stdx::make_unique<ReplicationExecutor>(
-                net->release(), new StorageInterfaceMock(), prngSeed);
-        });
+    mongo::executor::addTestsForExecutor("ReplicationExecutorCommon",
+                                         [](std::unique_ptr<executor::NetworkInterfaceMock>* net) {
+                                             return stdx::make_unique<ReplicationExecutor>(
+                                                 net->release(), prngSeed);
+                                         });
     return Status::OK();
 }
 
@@ -149,6 +148,106 @@ TEST_F(ReplicationExecutorTest, ShutdownBeforeRunningSecondExclusiveLockOperatio
     ASSERT_OK(status1);
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status2.code());
 }
+
+TEST_F(ReplicationExecutorTest, CancelBeforeRunningFutureWork) {
+    ReplicationExecutor& executor = getReplExecutor();
+    using CallbackData = ReplicationExecutor::CallbackArgs;
+    Status status1 = getDetectableErrorStatus();
+    auto cbhWithStatus =
+        executor.scheduleWorkAt(executor.now() + Milliseconds(1000),
+                                [&](const CallbackData& cbData) {
+                                    status1 = cbData.status;
+                                    if (cbData.status != ErrorCodes::CallbackCanceled)
+                                        cbData.executor->shutdown();
+                                });
+    ASSERT_OK(cbhWithStatus.getStatus());
+
+    ASSERT_EQUALS(1, executor.getDiagnosticBSON().getFieldDotted("queues.sleepers").Int());
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
+    executor.cancel(cbhWithStatus.getValue());
+
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.sleepers").Int());
+    ASSERT_EQUALS(1, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
+}
+
+// Equivalent to EventChainAndWaitingTest::onGo
+TEST_F(ReplicationExecutorTest, ScheduleCallbackOnFutureEvent) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
+
+    ReplicationExecutor& executor = getReplExecutor();
+    // We signal this "ping" event and the executor will signal "pong" event in return.
+    auto ping = assertGet(executor.makeEvent());
+    auto pong = assertGet(executor.makeEvent());
+    auto fn = [&executor, pong](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(pong);
+    };
+
+    // Wait for a future event.
+    executor.onEvent(ping, fn);
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
+    executor.signalEvent(ping);
+    executor.waitForEvent(pong);
+}
+
+// Equivalent to EventChainAndWaitingTest::onGoAfterTriggered
+TEST_F(ReplicationExecutorTest, ScheduleCallbackOnSignaledEvent) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
+
+    ReplicationExecutor& executor = getReplExecutor();
+    // We signal this "ping" event and the executor will signal "pong" event in return.
+    auto ping = assertGet(executor.makeEvent());
+    auto pong = assertGet(executor.makeEvent());
+    auto fn = [&executor, pong](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(pong);
+    };
+
+    // Wait for a signaled event.
+    executor.signalEvent(ping);
+    executor.onEvent(ping, fn);
+    executor.waitForEvent(pong);
+}
+
+TEST_F(ReplicationExecutorTest, ScheduleCallbackAtNow) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
+
+    ReplicationExecutor& executor = getReplExecutor();
+    auto finishEvent = assertGet(executor.makeEvent());
+    auto fn = [&executor, finishEvent](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(finishEvent);
+    };
+
+    auto cb = executor.scheduleWorkAt(getNet()->now(), fn);
+    executor.waitForEvent(finishEvent);
+}
+
+TEST_F(ReplicationExecutorTest, ScheduleCallbackAtAFutureTime) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
+
+    ReplicationExecutor& executor = getReplExecutor();
+    auto finishEvent = assertGet(executor.makeEvent());
+    auto fn = [&executor, finishEvent](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(finishEvent);
+    };
+
+    auto now = getNet()->now();
+    now += Milliseconds(1000);
+    auto cb = executor.scheduleWorkAt(now, fn);
+
+    getNet()->enterNetwork();
+    getNet()->runUntil(now);
+    getNet()->exitNetwork();
+
+    executor.waitForEvent(finishEvent);
+}
+
 
 }  // namespace
 }  // namespace repl

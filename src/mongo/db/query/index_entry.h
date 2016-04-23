@@ -28,14 +28,17 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+class CollatorInterface;
 class MatchExpression;
 
 /**
@@ -97,9 +100,13 @@ struct IndexEntry {
         type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
     }
 
+    std::string toString() const;
+
     BSONObj keyPattern;
 
     bool multikey;
+
+    boost::optional<MultikeyPaths> multikeyPaths;
 
     bool sparse;
 
@@ -116,7 +123,9 @@ struct IndexEntry {
     // by the keyPattern?)
     IndexType type;
 
-    std::string toString() const;
+    // Null if this index orders strings according to the simple binary compare. If non-null,
+    // represents the collator used to generate index keys for indexed strings.
+    CollatorInterface* collator = nullptr;
 };
 
 }  // namespace mongo

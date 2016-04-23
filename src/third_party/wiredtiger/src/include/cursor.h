@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -31,22 +31,22 @@
 	NULL,				/* uri */			\
 	NULL,				/* key_format */		\
 	NULL,				/* value_format */		\
-	(int (*)(WT_CURSOR *, ...))(get_key),				\
-	(int (*)(WT_CURSOR *, ...))(get_value),				\
-	(void (*)(WT_CURSOR *, ...))(set_key),				\
-	(void (*)(WT_CURSOR *, ...))(set_value),			\
-	(int (*)(WT_CURSOR *, WT_CURSOR *, int *))(compare),		\
-	(int (*)(WT_CURSOR *, WT_CURSOR *, int *))(equals),		\
+	get_key,							\
+	get_value,							\
+	set_key,							\
+	set_value,							\
+	compare,							\
+	equals,								\
 	next,								\
 	prev,								\
 	reset,								\
 	search,								\
-	(int (*)(WT_CURSOR *, int *))(search_near),			\
+	search_near,							\
 	insert,								\
 	update,								\
 	remove,								\
 	close,								\
-	(int (*)(WT_CURSOR *, const char *))(reconfigure),		\
+	reconfigure,							\
 	{ NULL, NULL },			/* TAILQ_ENTRY q */		\
 	0,				/* recno key */			\
 	{ 0 },				/* recno raw buffer */		\
@@ -67,7 +67,7 @@ struct __wt_cursor_backup {
 	WT_CURSOR iface;
 
 	size_t next;			/* Cursor position */
-	FILE *bfp;			/* Backup file */
+	WT_FH *bfh;			/* Backup file */
 	uint32_t maxid;			/* Maximum log file ID seen */
 
 	WT_CURSOR_BACKUP_ENTRY *list;	/* List of files to be copied. */
@@ -102,6 +102,14 @@ struct __wt_cursor_btree {
 	uint32_t page_deleted_count;	/* Deleted items on the page */
 
 	uint64_t recno;			/* Record number */
+
+	/*
+	 * Next-random cursors can optionally be configured to step through a
+	 * percentage of the total leaf pages to their next value. Note the
+	 * configured value and the calculated number of leaf pages to skip.
+	 */
+	uint64_t next_random_leaf_skip;
+	u_int	 next_random_sample_size;
 
 	/*
 	 * The search function sets compare to:
@@ -192,45 +200,57 @@ struct __wt_cursor_btree {
 
 	uint8_t	append_tree;		/* Cursor appended to the tree */
 
+#ifdef HAVE_DIAGNOSTIC
+	/* Check that cursor next/prev never returns keys out-of-order. */
+	WT_ITEM *lastkey, _lastkey;
+	uint64_t lastrecno;
+#endif
+
 #define	WT_CBT_ACTIVE		0x01	/* Active in the tree */
 #define	WT_CBT_ITERATE_APPEND	0x02	/* Col-store: iterating append list */
 #define	WT_CBT_ITERATE_NEXT	0x04	/* Next iteration configuration */
 #define	WT_CBT_ITERATE_PREV	0x08	/* Prev iteration configuration */
-#define	WT_CBT_MAX_RECORD	0x10	/* Col-store: past end-of-table */
+#define	WT_CBT_NO_TXN   	0x10	/* Non-transactional cursor
+					   (e.g. on a checkpoint) */
 #define	WT_CBT_SEARCH_SMALLEST	0x20	/* Row-store: small-key insert list */
+#define	WT_CBT_VAR_ONPAGE_MATCH	0x40	/* Var-store: on-page recno match */
+
+#define	WT_CBT_POSITION_MASK		/* Flags associated with position */ \
+	(WT_CBT_ITERATE_APPEND | WT_CBT_ITERATE_NEXT | WT_CBT_ITERATE_PREV | \
+	WT_CBT_SEARCH_SMALLEST | WT_CBT_VAR_ONPAGE_MATCH)
+
 	uint8_t flags;
 };
 
 struct __wt_cursor_bulk {
 	WT_CURSOR_BTREE cbt;
 
-	WT_REF	*ref;			/* The leaf page */
-	WT_PAGE *leaf;
-
 	/*
 	 * Variable-length column store compares values during bulk load as
 	 * part of RLE compression, row-store compares keys during bulk load
 	 * to avoid corruption.
 	 */
-	WT_ITEM last;			/* Last key/value seen */
+	bool	first_insert;		/* First insert */
+	WT_ITEM	last;			/* Last key/value inserted */
 
 	/*
-	 * Variable-length column-store RLE counter (also overloaded to mean
-	 * the first time through the bulk-load insert routine, when set to 0).
+	 * Additional column-store bulk load support.
 	 */
-	uint64_t rle;
+	uint64_t recno;			/* Record number */
+	uint64_t rle;			/* Variable-length RLE counter */
 
 	/*
-	 * Fixed-length column-store current entry in memory chunk count, and
-	 * the maximum number of records per chunk.
+	 * Additional fixed-length column store bitmap bulk load support:
+	 * current entry in memory chunk count, and the maximum number of
+	 * records per chunk.
 	 */
+	bool	 bitmap;		/* Bitmap bulk load */
 	uint32_t entry;			/* Entry count */
 	uint32_t nrecs;			/* Max records per chunk */
 
-	/* Special bitmap bulk load for fixed-length column stores. */
-	int	bitmap;
-
-	void	*reconcile;		/* Reconciliation information */
+	void	*reconcile;		/* Reconciliation support */
+	WT_REF	*ref;			/* The leaf page */
+	WT_PAGE *leaf;
 };
 
 struct __wt_cursor_config {
@@ -261,6 +281,74 @@ struct __wt_cursor_index {
 
 	WT_CURSOR *child;
 	WT_CURSOR **cg_cursors;
+	uint8_t	*cg_needvalue;
+};
+
+struct __wt_cursor_join_iter {
+	WT_SESSION_IMPL		*session;
+	WT_CURSOR_JOIN		*cjoin;
+	WT_CURSOR_JOIN_ENTRY	*entry;
+	WT_CURSOR		*cursor;	/* has null projection */
+	WT_CURSOR		*main;		/* main table with projection */
+	WT_ITEM			*curkey;	/* primary key */
+	WT_ITEM			 idxkey;
+	bool			 positioned;
+	bool			 isequal;	/* advancing means we're done */
+};
+
+struct __wt_cursor_join_endpoint {
+	WT_ITEM			 key;
+	uint8_t			 recno_buf[10];	/* holds packed recno */
+	WT_CURSOR		*cursor;
+
+#define	WT_CURJOIN_END_LT	0x01		/* include values <  cursor */
+#define	WT_CURJOIN_END_EQ	0x02		/* include values == cursor */
+#define	WT_CURJOIN_END_GT	0x04		/* include values >  cursor */
+#define	WT_CURJOIN_END_GE	(WT_CURJOIN_END_GT | WT_CURJOIN_END_EQ)
+#define	WT_CURJOIN_END_LE	(WT_CURJOIN_END_LT | WT_CURJOIN_END_EQ)
+#define	WT_CURJOIN_END_OWN_CURSOR 0x08		/* must close cursor */
+	uint8_t			 flags;		/* range for this endpoint */
+};
+#define	WT_CURJOIN_END_RANGE(endp)					\
+	((endp)->flags &						\
+	    (WT_CURJOIN_END_GT | WT_CURJOIN_END_EQ | WT_CURJOIN_END_LT))
+
+struct __wt_cursor_join_entry {
+	WT_INDEX		*index;
+	WT_CURSOR		*main;		/* raw main table cursor */
+	WT_BLOOM		*bloom;		/* Bloom filter handle */
+	char			*repack_format; /* target format for repack */
+	uint32_t		 bloom_bit_count; /* bits per item in bloom */
+	uint32_t		 bloom_hash_count; /* hash functions in bloom */
+	uint64_t		 count;		/* approx number of matches */
+
+#define	WT_CURJOIN_ENTRY_BLOOM		0x01	/* use a bloom filter */
+#define	WT_CURJOIN_ENTRY_DISJUNCTION	0x02	/* endpoints are or-ed */
+#define	WT_CURJOIN_ENTRY_OWN_BLOOM	0x04	/* this entry owns the bloom */
+	uint8_t			 flags;
+
+	WT_CURSOR_JOIN_ENDPOINT	*ends;		/* reference endpoints */
+	size_t			 ends_allocated;
+	u_int			 ends_next;
+
+	WT_JOIN_STATS		 stats;		/* Join statistics */
+};
+
+struct __wt_cursor_join {
+	WT_CURSOR iface;
+
+	WT_TABLE		*table;
+	const char		*projection;
+	WT_CURSOR_JOIN_ITER	*iter;
+	WT_CURSOR_JOIN_ENTRY	*entries;
+	size_t			 entries_allocated;
+	u_int			 entries_next;
+	uint8_t			 recno_buf[10];	/* holds packed recno */
+
+#define	WT_CURJOIN_ERROR		0x01	/* Error in initialization */
+#define	WT_CURJOIN_INITIALIZED		0x02	/* Successful initialization */
+#define	WT_CURJOIN_SKIP_FIRST_LEFT	0x04	/* First check not needed */
+	uint8_t			 flags;
 };
 
 struct __wt_cursor_json {
@@ -297,23 +385,35 @@ struct __wt_cursor_metadata {
 	uint32_t flags;
 };
 
+struct __wt_join_stats_group {
+	const char *desc_prefix;	/* Prefix appears before description */
+	WT_CURSOR_JOIN *join_cursor;
+	ssize_t join_cursor_entry;	/* Position in entries */
+	WT_JOIN_STATS join_stats;
+};
+
 struct __wt_cursor_stat {
 	WT_CURSOR iface;
 
-	int	notinitialized;		/* Cursor not initialized */
-	int	notpositioned;		/* Cursor not positioned */
+	bool	notinitialized;		/* Cursor not initialized */
+	bool	notpositioned;		/* Cursor not positioned */
 
 	int64_t	     *stats;		/* Statistics */
 	int	      stats_base;	/* Base statistics value */
 	int	      stats_count;	/* Count of statistics values */
-	const char *(*stats_desc)(int);	/* Statistics descriptions */
+	int	     (*stats_desc)(WT_CURSOR_STAT *, int, const char **);
+					/* Statistics descriptions */
+	int	     (*next_set)(WT_SESSION_IMPL *, WT_CURSOR_STAT *, bool,
+			 bool);		/* Advance to next set */
 
 	union {				/* Copies of the statistics */
 		WT_DSRC_STATS dsrc_stats;
 		WT_CONNECTION_STATS conn_stats;
+		WT_JOIN_STATS_GROUP join_stats_group;
 	} u;
 
 	const char **cfg;		/* Original cursor configuration */
+	char	*desc_buf;		/* Saved description string */
 
 	int	 key;			/* Current stats key */
 	uint64_t v;			/* Current stats value */
@@ -369,11 +469,11 @@ struct __wt_cursor_table {
  */
 #define	WT_CURSOR_CHECKKEY(cursor) do {					\
 	if (!F_ISSET(cursor, WT_CURSTD_KEY_SET))			\
-		WT_ERR(__wt_cursor_kv_not_set(cursor, 1));		\
+		WT_ERR(__wt_cursor_kv_not_set(cursor, true));		\
 } while (0)
 #define	WT_CURSOR_CHECKVALUE(cursor) do {				\
 	if (!F_ISSET(cursor, WT_CURSTD_VALUE_SET))			\
-		WT_ERR(__wt_cursor_kv_not_set(cursor, 0));		\
+		WT_ERR(__wt_cursor_kv_not_set(cursor, false));		\
 } while (0)
 #define	WT_CURSOR_NEEDKEY(cursor) do {					\
 	if (F_ISSET(cursor, WT_CURSTD_KEY_INT)) {			\

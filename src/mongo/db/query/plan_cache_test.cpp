@@ -38,6 +38,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
@@ -45,6 +46,7 @@
 #include "mongo/db/query/query_solution.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
 
 using namespace mongo;
 
@@ -60,7 +62,8 @@ static const NamespaceString nss("test.collection");
  * Utility functions to create a CanonicalQuery
  */
 unique_ptr<CanonicalQuery> canonicalize(const BSONObj& queryObj) {
-    auto statusWithCQ = CanonicalQuery::canonicalize(nss, queryObj);
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(nss, queryObj, ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -76,7 +79,8 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     BSONObj queryObj = fromjson(queryStr);
     BSONObj sortObj = fromjson(sortStr);
     BSONObj projObj = fromjson(projStr);
-    auto statusWithCQ = CanonicalQuery::canonicalize(nss, queryObj, sortObj, projObj);
+    auto statusWithCQ = CanonicalQuery::canonicalize(
+        nss, queryObj, sortObj, projObj, ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -104,8 +108,9 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
                                                      hintObj,
                                                      minObj,
                                                      maxObj,
-                                                     false,   // snapshot
-                                                     false);  // explain
+                                                     false,  // snapshot
+                                                     false,  // explain
+                                                     ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -126,8 +131,18 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     BSONObj hintObj = fromjson(hintStr);
     BSONObj minObj = fromjson(minStr);
     BSONObj maxObj = fromjson(maxStr);
-    auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, queryObj, sortObj, projObj, skip, limit, hintObj, minObj, maxObj, snapshot, explain);
+    auto statusWithCQ = CanonicalQuery::canonicalize(nss,
+                                                     queryObj,
+                                                     sortObj,
+                                                     projObj,
+                                                     skip,
+                                                     limit,
+                                                     hintObj,
+                                                     minObj,
+                                                     maxObj,
+                                                     snapshot,
+                                                     explain,
+                                                     ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -136,7 +151,8 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
  * Utility function to create MatchExpression
  */
 unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions());
     if (!status.isOK()) {
         str::stream ss;
         ss << "failed to parse query: " << obj.toString()
@@ -506,7 +522,6 @@ protected:
 
         solns.clear();
 
-
         auto statusWithCQ = CanonicalQuery::canonicalize(nss,
                                                          query,
                                                          sort,
@@ -517,7 +532,8 @@ protected:
                                                          minObj,
                                                          maxObj,
                                                          snapshot,
-                                                         false);  // explain
+                                                         false,  // explain
+                                                         ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns);
         ASSERT_OK(s);
@@ -588,7 +604,8 @@ protected:
                                       const BSONObj& sort,
                                       const BSONObj& proj,
                                       const QuerySolution& soln) const {
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss, query, sort, proj);
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            nss, query, sort, proj, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
 
@@ -744,13 +761,17 @@ TEST_F(CachePlanSelectionTest, Basic2DSphereGeoNear) {
 
     query = fromjson("{a: {$nearSphere: [0,0], $maxDistance: 0.31 }}");
     runQuery(query);
-    assertPlanCacheRecoversSolution(query, "{geoNear2dsphere: {a: '2dsphere'}}");
+    assertPlanCacheRecoversSolution(query,
+                                    "{geoNear2dsphere: {pattern: {a: '2dsphere'}, "
+                                    "bounds: {a: [['MinKey', 'MaxKey', true, true]]}}}");
 
     query = fromjson(
         "{a: {$geoNear: {$geometry: {type: 'Point', coordinates: [0,0]},"
         "$maxDistance:100}}}");
     runQuery(query);
-    assertPlanCacheRecoversSolution(query, "{geoNear2dsphere: {a: '2dsphere'}}");
+    assertPlanCacheRecoversSolution(query,
+                                    "{geoNear2dsphere: {pattern: {a: '2dsphere'}, "
+                                    "bounds: {a: [['MinKey', 'MaxKey', true, true]]}}}");
 }
 
 TEST_F(CachePlanSelectionTest, Basic2DSphereGeoNearReverseCompound) {
@@ -759,7 +780,10 @@ TEST_F(CachePlanSelectionTest, Basic2DSphereGeoNearReverseCompound) {
                       << "2dsphere"));
     BSONObj query = fromjson("{x:1, a: {$nearSphere: [0,0], $maxDistance: 0.31 }}");
     runQuery(query);
-    assertPlanCacheRecoversSolution(query, "{geoNear2dsphere: {x: 1, a: '2dsphere'}}");
+    assertPlanCacheRecoversSolution(
+        query,
+        "{geoNear2dsphere: {pattern: {x: 1, a: '2dsphere'}, "
+        "bounds: {x: [[1, 1, true, true]], a: [['MinKey', 'MaxKey', true, true]]}}}");
 }
 
 TEST_F(CachePlanSelectionTest, TwoDSphereNoGeoPred) {
@@ -945,6 +969,108 @@ TEST_F(CachePlanSelectionTest, CollscanMergeSort) {
                                     BSONObj(),
                                     "{sort: {pattern: {c: 1}, limit: 0, node: {sortKeyGen: "
                                     "{node: {cscan: {dir: 1}}}}}}");
+}
+
+//
+// Caching plans that use multikey indexes.
+//
+
+TEST_F(CachePlanSelectionTest, CachedPlanForCompoundMultikeyIndexCanCompoundBounds) {
+    params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+
+    const bool multikey = true;
+    addIndex(BSON("a" << 1 << "b" << 1), multikey);
+
+    BSONObj query = fromjson("{a: 2, b: 3}");
+    runQuery(query);
+
+    assertPlanCacheRecoversSolution(
+        query,
+        "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, b: 1}, "
+        "bounds: {a: [[2, 2, true, true]], b: [[3, 3, true, true]]}}}}}");
+}
+
+TEST_F(CachePlanSelectionTest,
+       CachedPlanForSelfIntersectionOfMultikeyIndexPointRangesCannotIntersectBounds) {
+    params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+
+    const bool multikey = true;
+    addIndex(BSON("a" << 1), multikey);
+
+    BSONObj query = fromjson("{$and: [{a: 2}, {a: 3}]}");
+    runQuery(query);
+
+    assertPlanCacheRecoversSolution(
+        query,
+        "{fetch: {filter: null, node: {andSorted: {nodes: ["
+        "{ixscan: {pattern: {a: 1}, bounds: {a: [[2, 2, true, true]]}}}, "
+        "{ixscan: {pattern: {a: 1}, bounds: {a: [[3, 3, true, true]]}}}]}}}}");
+}
+
+TEST_F(CachePlanSelectionTest,
+       CachedPlanForSelfIntersectionOfMultikeyIndexNonPointRangesCannotIntersectBounds) {
+    // Enable a hash-based index intersection plan to be generated because we are scanning a
+    // non-point range on the "a" field.
+    bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection;
+    ON_BLOCK_EXIT([oldEnableHashIntersection] {
+        internalQueryPlannerEnableHashIntersection = oldEnableHashIntersection;
+    });
+    internalQueryPlannerEnableHashIntersection = true;
+    params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+
+    const bool multikey = true;
+    addIndex(BSON("a" << 1), multikey);
+
+    BSONObj query = fromjson("{$and: [{a: {$gte: 2}}, {a: {$lt: 3}}]}");
+    runQuery(query);
+
+    assertPlanCacheRecoversSolution(
+        query,
+        "{fetch: {filter: null, node: {andHash: {nodes: ["
+        "{ixscan: {pattern: {a: 1}, bounds: {a: [[2, Infinity, true, true]]}}}, "
+        "{ixscan: {pattern: {a: 1}, bounds: {a: [[-Infinity, 3, true, false]]}}}]}}}}");
+}
+
+
+TEST_F(CachePlanSelectionTest, CachedPlanForIntersectionOfMultikeyIndexesWhenUsingElemMatch) {
+    params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+
+    const bool multikey = true;
+    addIndex(BSON("a.b" << 1), multikey);
+    addIndex(BSON("a.c" << 1), multikey);
+
+    BSONObj query = fromjson("{a: {$elemMatch: {b: 2, c: 3}}}");
+    runQuery(query);
+
+    assertPlanCacheRecoversSolution(
+        query,
+        "{fetch: {filter: {a: {$elemMatch: {b: 2, c: 3}}}, node: {andSorted: {nodes: ["
+        "{ixscan: {pattern: {'a.b': 1}, bounds: {'a.b': [[2, 2, true, true]]}}},"
+        "{ixscan: {pattern: {'a.c': 1}, bounds: {'a.c': [[3, 3, true, true]]}}}]}}}}");
+}
+
+TEST_F(CachePlanSelectionTest, CachedPlanForIntersectionWithNonMultikeyIndexCanIntersectBounds) {
+    // Enable a hash-based index intersection plan to be generated because we are scanning a
+    // non-point range on the "a.c" field.
+    bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection;
+    ON_BLOCK_EXIT([oldEnableHashIntersection] {
+        internalQueryPlannerEnableHashIntersection = oldEnableHashIntersection;
+    });
+    internalQueryPlannerEnableHashIntersection = true;
+    params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+
+    const bool multikey = true;
+    addIndex(BSON("a.b" << 1), multikey);
+    addIndex(BSON("a.c" << 1), !multikey);
+
+    BSONObj query = fromjson("{'a.b': 2, 'a.c': {$gte: 0, $lt: 10}}}}");
+    runQuery(query);
+
+    assertPlanCacheRecoversSolution(
+        query,
+        "{fetch: {node: {andHash: {nodes: ["
+        "{ixscan: {pattern: {'a.b': 1}, bounds: {'a.b': [[2, 2, true, true]]}}},"
+        "{ixscan: {pattern: {'a.c': 1}, bounds: {'a.c': [[0, 10, true, false]]}}}]}}}}");
 }
 
 //

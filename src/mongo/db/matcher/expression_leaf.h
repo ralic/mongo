@@ -43,6 +43,8 @@ class RE;
 
 namespace mongo {
 
+class CollatorInterface;
+
 /**
  * This file contains leaves in the parse tree that are not array-based.
  *
@@ -83,7 +85,11 @@ private:
  */
 class ComparisonMatchExpression : public LeafMatchExpression {
 public:
-    ComparisonMatchExpression(MatchType type) : LeafMatchExpression(type) {}
+    /**
+     * 'collator' must outlive the ComparisonMatchExpression and any clones made of it.
+     */
+    ComparisonMatchExpression(MatchType type, CollatorInterface* collator)
+        : LeafMatchExpression(type), _collator(collator) {}
 
     Status init(StringData path, const BSONElement& rhs);
 
@@ -97,7 +103,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level = 0) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -105,8 +111,13 @@ public:
         return _rhs;
     }
 
+    CollatorInterface* getCollator() const {
+        return _collator;
+    }
+
 protected:
     BSONElement _rhs;
+    CollatorInterface* _collator;
 };
 
 //
@@ -115,9 +126,11 @@ protected:
 
 class EqualityMatchExpression : public ComparisonMatchExpression {
 public:
-    EqualityMatchExpression() : ComparisonMatchExpression(EQ) {}
+    EqualityMatchExpression(CollatorInterface* collator)
+        : ComparisonMatchExpression(EQ, collator) {}
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<ComparisonMatchExpression> e = stdx::make_unique<EqualityMatchExpression>();
+        std::unique_ptr<ComparisonMatchExpression> e =
+            stdx::make_unique<EqualityMatchExpression>(_collator);
         e->init(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
@@ -128,9 +141,10 @@ public:
 
 class LTEMatchExpression : public ComparisonMatchExpression {
 public:
-    LTEMatchExpression() : ComparisonMatchExpression(LTE) {}
+    LTEMatchExpression(CollatorInterface* collator) : ComparisonMatchExpression(LTE, collator) {}
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<ComparisonMatchExpression> e = stdx::make_unique<LTEMatchExpression>();
+        std::unique_ptr<ComparisonMatchExpression> e =
+            stdx::make_unique<LTEMatchExpression>(_collator);
         e->init(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
@@ -141,9 +155,10 @@ public:
 
 class LTMatchExpression : public ComparisonMatchExpression {
 public:
-    LTMatchExpression() : ComparisonMatchExpression(LT) {}
+    LTMatchExpression(CollatorInterface* collator) : ComparisonMatchExpression(LT, collator) {}
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<ComparisonMatchExpression> e = stdx::make_unique<LTMatchExpression>();
+        std::unique_ptr<ComparisonMatchExpression> e =
+            stdx::make_unique<LTMatchExpression>(_collator);
         e->init(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
@@ -154,9 +169,10 @@ public:
 
 class GTMatchExpression : public ComparisonMatchExpression {
 public:
-    GTMatchExpression() : ComparisonMatchExpression(GT) {}
+    GTMatchExpression(CollatorInterface* collator) : ComparisonMatchExpression(GT, collator) {}
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<ComparisonMatchExpression> e = stdx::make_unique<GTMatchExpression>();
+        std::unique_ptr<ComparisonMatchExpression> e =
+            stdx::make_unique<GTMatchExpression>(_collator);
         e->init(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
@@ -167,9 +183,10 @@ public:
 
 class GTEMatchExpression : public ComparisonMatchExpression {
 public:
-    GTEMatchExpression() : ComparisonMatchExpression(GTE) {}
+    GTEMatchExpression(CollatorInterface* collator) : ComparisonMatchExpression(GTE, collator) {}
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        std::unique_ptr<ComparisonMatchExpression> e = stdx::make_unique<GTEMatchExpression>();
+        std::unique_ptr<ComparisonMatchExpression> e =
+            stdx::make_unique<GTEMatchExpression>(_collator);
         e->init(path(), _rhs);
         if (getTag()) {
             e->setTag(getTag()->clone());
@@ -210,7 +227,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     void shortDebugString(StringBuilder& debug) const;
 
@@ -248,7 +265,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -283,7 +300,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     virtual bool equivalent(const MatchExpression* other) const;
 };
@@ -298,7 +315,7 @@ class ArrayFilterEntries {
     MONGO_DISALLOW_COPYING(ArrayFilterEntries);
 
 public:
-    ArrayFilterEntries();
+    ArrayFilterEntries(CollatorInterface* collator);
     ~ArrayFilterEntries();
 
     Status addEquality(const BSONElement& e);
@@ -331,19 +348,24 @@ public:
         return _equalities.size() + _regexes.size();
     }
 
+    CollatorInterface* getCollator() const {
+        return _collator;
+    }
+
     bool equivalent(const ArrayFilterEntries& other) const;
 
     void copyTo(ArrayFilterEntries& toFillIn) const;
 
     void debugString(StringBuilder& debug) const;
 
-    void toBSON(BSONArrayBuilder* out) const;
+    void serialize(BSONArrayBuilder* out) const;
 
 private:
     bool _hasNull;  // if _equalities has a jstNULL element in it
     bool _hasEmptyArray;
     BSONElementSet _equalities;
     std::vector<RegexMatchExpression*> _regexes;
+    CollatorInterface* _collator;
 };
 
 /**
@@ -351,7 +373,11 @@ private:
  */
 class InMatchExpression : public LeafMatchExpression {
 public:
-    InMatchExpression() : LeafMatchExpression(MATCH_IN) {}
+    /**
+     * 'collator' must outlive the InMatchExpression and any clones made of it.
+     */
+    InMatchExpression(CollatorInterface* collator)
+        : LeafMatchExpression(MATCH_IN), _arrayEntries(collator) {}
     Status init(StringData path);
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const;
@@ -364,7 +390,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -372,6 +398,10 @@ public:
 
     const ArrayFilterEntries& getData() const {
         return _arrayEntries;
+    }
+
+    CollatorInterface* getCollator() const {
+        return _arrayEntries.getCollator();
     }
 
 private:
@@ -396,8 +426,10 @@ public:
 
     /**
      * Initialize as matching against a specific BSONType.
+     *
+     * Returns a non-OK status if 'type' cannot be converted to a valid BSONType.
      */
-    Status initWithBSONType(StringData path, BSONType type);
+    Status initWithBSONType(StringData path, int type);
 
     /**
      * Initialize as matching against all number types (NumberDouble, NumberLong, and NumberInt).
@@ -423,7 +455,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -436,7 +468,7 @@ public:
 
     /**
      * Whether or not to match against all number types (NumberDouble, NumberLong, and NumberInt).
-     * Defaults to false. If this is true, _type is undefined.
+     * Defaults to false. If this is true, _type is EOO.
      */
     bool matchesAllNumbers() const {
         return _matchesAllNumbers;
@@ -452,7 +484,7 @@ private:
     StringData _path;
     ElementPath _elementPath;
     bool _matchesAllNumbers = false;
-    BSONType _type;
+    BSONType _type = BSONType::EOO;
 };
 
 /**
@@ -479,7 +511,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int level) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     virtual bool equivalent(const MatchExpression* other) const;
 

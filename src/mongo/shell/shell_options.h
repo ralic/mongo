@@ -61,23 +61,18 @@ struct ShellGlobalParams {
     bool runShell;
     bool nodb;
     bool norc;
+    bool nojit = false;
+    bool javascriptProtection = true;
 
     std::string script;
 
-    bool autoKillOp;
-    bool useWriteCommandsDefault;
-    std::string writeMode;
+    bool autoKillOp = false;
+    bool useWriteCommandsDefault = true;
 
-    std::string readMode;
+    std::string writeMode = "commands";
+    std::string readMode = "compatibility";
 
-    boost::optional<rpc::ProtocolSet> rpcProtocols;
-
-    ShellGlobalParams()
-        : autoKillOp(false),
-          useWriteCommandsDefault(true),
-          writeMode("commands"),
-          readMode("compatibility"),
-          rpcProtocols() {}
+    boost::optional<rpc::ProtocolSet> rpcProtocols = boost::none;
 };
 
 extern ShellGlobalParams shellGlobalParams;
@@ -95,6 +90,4 @@ bool handlePreValidationMongoShellOptions(const moe::Environment& params,
                                           const std::vector<std::string>& args);
 
 Status storeMongoShellOptions(const moe::Environment& params, const std::vector<std::string>& args);
-
-Status validateMongoShellOptions(const moe::Environment& params);
 }

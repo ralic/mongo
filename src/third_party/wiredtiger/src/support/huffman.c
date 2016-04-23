@@ -1,9 +1,31 @@
-/*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+/*
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
- * See the file LICENSE for redistribution information.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 4. Neither the name MongoDB or the name WiredTiger
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY MONGODB INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
 
 #include "wt_internal.h"
@@ -470,11 +492,12 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	uint8_t symbol;
 	uint32_t weighted_length;
 
-	printf("leaf depth %" PRIu16 "..%" PRIu16 ", memory use: "
-	    "codes %u# * %uB  + code2symbol %u# * %uB\n",
+	printf("leaf depth %" PRIu16 "..%" PRIu16
+	    ", memory use: codes %u# * %" WT_SIZET_FMT
+	    "B + code2symbol %u# * %" WT_SIZET_FMT "B\n",
 	    huffman->min_depth, huffman->max_depth,
-	    huffman->numSymbols, (u_int)sizeof(WT_HUFFMAN_CODE),
-	    1U << huffman->max_depth, (u_int)sizeof(uint16_t));
+	    huffman->numSymbols, sizeof(WT_HUFFMAN_CODE),
+	    1U << huffman->max_depth, sizeof(uint16_t));
 
 	/*
 	 * measure quality of computed Huffman codes, for different max bit
@@ -790,7 +813,18 @@ __wt_huffman_decode(WT_SESSION_IMPL *session, void *huffman_arg,
 		symbol = huffman->code2symbol[pattern & mask];
 		len = huffman->codes[symbol].length;
 		valid -= len;
-		WT_ASSERT(session, from_len_bits >= len);
+
+		/*
+		 * from_len_bits is the total number of input bits, reduced by
+		 * the number of bits we consume from input at each step.  For
+		 * all but the last step from_len_bits > len, then at the last
+		 * step from_len_bits == len (in other words, from_len_bits -
+		 * len = 0 input bits remaining). Generally, we cannot detect
+		 * corruption during huffman decompression, this is one place
+		 * where that's not true.
+		 */
+		if (from_len_bits < len)	/* corrupted */
+			WT_ERR(EINVAL);
 		from_len_bits -= len;
 
 		WT_ASSERT(session,

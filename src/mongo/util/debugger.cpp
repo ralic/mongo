@@ -31,22 +31,25 @@
 
 #include "mongo/util/debugger.h"
 
+#include <cstdlib>
+
 #if defined(USE_GDBSERVER)
 #include <unistd.h>
 #include <cstdio>
-#include <cstdlib>
 #endif
-
-#include "mongo/util/debug_util.h"
 
 #ifndef _WIN32
 #include <signal.h>
 #endif
 
+#include "mongo/util/debug_util.h"
+
 namespace mongo {
 void breakpoint() {
 #ifdef _WIN32
-    DEV DebugBreak();
+    if (IsDebuggerPresent()) {
+        DebugBreak();
+    };
 #endif
 #ifndef _WIN32
     // code to raise a breakpoint in GDB
@@ -54,7 +57,9 @@ void breakpoint() {
         // prevent SIGTRAP from crashing the program if default action is specified and we are not
         // in gdb
         struct sigaction current;
-        sigaction(SIGTRAP, nullptr, &current);
+        if (sigaction(SIGTRAP, nullptr, &current) != 0) {
+            std::abort();
+        }
         if (current.sa_handler == SIG_DFL) {
             signal(SIGTRAP, SIG_IGN);
         }

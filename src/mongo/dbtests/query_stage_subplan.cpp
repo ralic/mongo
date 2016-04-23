@@ -32,12 +32,14 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/dbtests/dbtests.h"
@@ -74,11 +76,13 @@ protected:
         auto lpq =
             unittest::assertGet(LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain));
 
-        auto cq = unittest::assertGet(CanonicalQuery::canonicalize(lpq.release()));
+        auto cq = unittest::assertGet(
+            CanonicalQuery::canonicalize(lpq.release(), ExtensionsCallbackNoop()));
         return cq;
     }
 
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
 
 private:
     DBDirectClient _client;
@@ -104,7 +108,8 @@ public:
             "{$or: [{a: {$geoWithin: {$centerSphere: [[0,0],10]}}},"
             "{a: {$geoWithin: {$centerSphere: [[1,1],10]}}}]}");
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss, query);
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -147,7 +152,8 @@ public:
 
         Collection* collection = ctx.getCollection();
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss, query);
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -202,7 +208,8 @@ public:
 
         Collection* collection = ctx.getCollection();
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss, query);
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -258,7 +265,8 @@ public:
 
         Collection* collection = ctx.getCollection();
 
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss, query);
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -385,23 +393,27 @@ public:
             ASSERT_TRUE(SubplanStage::canUseSubplanning(*cq2));
         }
 
-        // Can use subplanning for a single contained $or.
+        // Can't use subplanning for a single contained $or.
+        //
+        // TODO: Consider allowing this to use subplanning (see SERVER-13732).
         {
             std::string findCmd =
                 "{find: 'testns',"
                 "filter: {e: 1, $or: [{a:1, b:1}, {c:1, d:1}]}}";
             std::unique_ptr<CanonicalQuery> cq = cqFromFindCommand(findCmd);
-            ASSERT_TRUE(SubplanStage::canUseSubplanning(*cq));
+            ASSERT_FALSE(SubplanStage::canUseSubplanning(*cq));
         }
 
-        // Can use subplanning if the contained $or query has a geo predicate.
+        // Can't use subplanning if the contained $or query has a geo predicate.
+        //
+        // TODO: Consider allowing this to use subplanning (see SERVER-13732).
         {
             std::string findCmd =
                 "{find: 'testns',"
                 "filter: {loc: {$geoWithin: {$centerSphere: [[0,0], 1]}},"
                 "e: 1, $or: [{a:1, b:1}, {c:1, d:1}]}}";
             std::unique_ptr<CanonicalQuery> cq = cqFromFindCommand(findCmd);
-            ASSERT_TRUE(SubplanStage::canUseSubplanning(*cq));
+            ASSERT_FALSE(SubplanStage::canUseSubplanning(*cq));
         }
 
         // Can't use subplanning if the contained $or query also has a $text predicate.
@@ -435,7 +447,8 @@ public:
         // Rewrite (AND (OR a b) e) => (OR (AND a e) (AND b e))
         {
             BSONObj queryObj = fromjson("{$or:[{a:1}, {b:1}], e:1}");
-            StatusWithMatchExpression expr = MatchExpressionParser::parse(queryObj);
+            StatusWithMatchExpression expr =
+                MatchExpressionParser::parse(queryObj, ExtensionsCallbackDisallowExtensions());
             ASSERT_OK(expr.getStatus());
             std::unique_ptr<MatchExpression> rewrittenExpr =
                 SubplanStage::rewriteToRootedOr(std::move(expr.getValue()));
@@ -451,7 +464,8 @@ public:
         // Rewrite (AND (OR a b) e f) => (OR (AND a e f) (AND b e f))
         {
             BSONObj queryObj = fromjson("{$or:[{a:1}, {b:1}], e:1, f:1}");
-            StatusWithMatchExpression expr = MatchExpressionParser::parse(queryObj);
+            StatusWithMatchExpression expr =
+                MatchExpressionParser::parse(queryObj, ExtensionsCallbackDisallowExtensions());
             ASSERT_OK(expr.getStatus());
             std::unique_ptr<MatchExpression> rewrittenExpr =
                 SubplanStage::rewriteToRootedOr(std::move(expr.getValue()));
@@ -467,7 +481,8 @@ public:
         // Rewrite (AND (OR (AND a b) (AND c d) e f) => (OR (AND a b e f) (AND c d e f))
         {
             BSONObj queryObj = fromjson("{$or:[{a:1,b:1}, {c:1,d:1}], e:1,f:1}");
-            StatusWithMatchExpression expr = MatchExpressionParser::parse(queryObj);
+            StatusWithMatchExpression expr =
+                MatchExpressionParser::parse(queryObj, ExtensionsCallbackDisallowExtensions());
             ASSERT_OK(expr.getStatus());
             std::unique_ptr<MatchExpression> rewrittenExpr =
                 SubplanStage::rewriteToRootedOr(std::move(expr.getValue()));
@@ -501,7 +516,8 @@ public:
         insert(BSON("_id" << 3 << "a" << 1 << "c" << 3));
         insert(BSON("_id" << 4 << "a" << 1 << "c" << 4));
 
-        auto cq = unittest::assertGet(CanonicalQuery::canonicalize(nss, query));
+        auto cq = unittest::assertGet(
+            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions()));
 
         Collection* collection = ctx.getCollection();
 
@@ -560,7 +576,8 @@ public:
         BSONObj query = fromjson("{$or: [{a: 1}, {a: {$ne:1}}]}");
         BSONObj sort = BSON("d" << 1);
         BSONObj projection;
-        auto cq = unittest::assertGet(CanonicalQuery::canonicalize(nss, query, sort, projection));
+        auto cq = unittest::assertGet(CanonicalQuery::canonicalize(
+            nss, query, sort, projection, ExtensionsCallbackDisallowExtensions()));
 
         Collection* collection = ctx.getCollection();
 

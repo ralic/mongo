@@ -63,6 +63,85 @@ TEST(ClusterClientCursorImpl, NumReturnedSoFar) {
     ASSERT_EQ(cursor.getNumReturnedSoFar(), 9LL);
 }
 
+TEST(ClusterClientCursorImpl, QueueResult) {
+    auto mockStage = stdx::make_unique<RouterStageMock>();
+    mockStage->queueResult(BSON("a" << 1));
+    mockStage->queueResult(BSON("a" << 4));
+
+    ClusterClientCursorImpl cursor(std::move(mockStage));
+
+    auto firstResult = cursor.next();
+    ASSERT_OK(firstResult.getStatus());
+    ASSERT(firstResult.getValue());
+    ASSERT_EQ(*firstResult.getValue(), BSON("a" << 1));
+
+    cursor.queueResult(BSON("a" << 2));
+    cursor.queueResult(BSON("a" << 3));
+
+    auto secondResult = cursor.next();
+    ASSERT_OK(secondResult.getStatus());
+    ASSERT(secondResult.getValue());
+    ASSERT_EQ(*secondResult.getValue(), BSON("a" << 2));
+
+    auto thirdResult = cursor.next();
+    ASSERT_OK(thirdResult.getStatus());
+    ASSERT(thirdResult.getValue());
+    ASSERT_EQ(*thirdResult.getValue(), BSON("a" << 3));
+
+    auto fourthResult = cursor.next();
+    ASSERT_OK(fourthResult.getStatus());
+    ASSERT(fourthResult.getValue());
+    ASSERT_EQ(*fourthResult.getValue(), BSON("a" << 4));
+
+    auto fifthResult = cursor.next();
+    ASSERT_OK(fifthResult.getStatus());
+    ASSERT(!fifthResult.getValue());
+
+    ASSERT_EQ(cursor.getNumReturnedSoFar(), 4LL);
+}
+
+TEST(ClusterClientCursorImpl, RemotesExhausted) {
+    auto mockStage = stdx::make_unique<RouterStageMock>();
+    mockStage->queueResult(BSON("a" << 1));
+    mockStage->queueResult(BSON("a" << 2));
+    mockStage->markRemotesExhausted();
+
+    ClusterClientCursorImpl cursor(std::move(mockStage));
+    ASSERT_TRUE(cursor.remotesExhausted());
+
+    auto firstResult = cursor.next();
+    ASSERT_OK(firstResult.getStatus());
+    ASSERT(firstResult.getValue());
+    ASSERT_EQ(*firstResult.getValue(), BSON("a" << 1));
+    ASSERT_TRUE(cursor.remotesExhausted());
+
+    auto secondResult = cursor.next();
+    ASSERT_OK(secondResult.getStatus());
+    ASSERT(secondResult.getValue());
+    ASSERT_EQ(*secondResult.getValue(), BSON("a" << 2));
+    ASSERT_TRUE(cursor.remotesExhausted());
+
+    auto thirdResult = cursor.next();
+    ASSERT_OK(thirdResult.getStatus());
+    ASSERT(!thirdResult.getValue());
+    ASSERT_TRUE(cursor.remotesExhausted());
+
+    ASSERT_EQ(cursor.getNumReturnedSoFar(), 2LL);
+}
+
+TEST(ClusterClientCursorImpl, ForwardsAwaitDataTimeout) {
+    auto mockStage = stdx::make_unique<RouterStageMock>();
+    auto mockStagePtr = mockStage.get();
+    ASSERT_NOT_OK(mockStage->getAwaitDataTimeout().getStatus());
+
+    ClusterClientCursorImpl cursor(std::move(mockStage));
+    ASSERT_OK(cursor.setAwaitDataTimeout(Milliseconds(789)));
+
+    auto awaitDataTimeout = mockStagePtr->getAwaitDataTimeout();
+    ASSERT_OK(awaitDataTimeout.getStatus());
+    ASSERT_EQ(789, durationCount<Milliseconds>(awaitDataTimeout.getValue()));
+}
+
 }  // namespace
 
 }  // namespace mongo

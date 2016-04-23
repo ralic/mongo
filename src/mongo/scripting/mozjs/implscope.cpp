@@ -34,10 +34,13 @@
 
 #include <jscustomallocator.h>
 #include <jsfriendapi.h>
+#include <js/CharacterEncoding.h>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/platform/stack_locator.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
@@ -113,7 +116,14 @@ void MozJSImplScope::_reportError(JSContext* cx, const char* message, JSErrorRep
 
             ObjectWrapper(cx, excn).getValue("stack", &stack);
 
-            ss << " :\n" << ValueWriter(cx, stack).toString();
+            auto str = ValueWriter(cx, stack).toString();
+
+            if (str.empty()) {
+                ss << " @" << report->filename << ":" << report->lineno << ":" << report->column
+                   << "\n";
+            } else {
+                ss << " :\n" << str;
+            }
         }
 
         scope->_status = Status(
@@ -128,6 +138,12 @@ std::string MozJSImplScope::getError() {
 
 void MozJSImplScope::registerOperation(OperationContext* txn) {
     invariant(_opId == 0);
+
+    // getPooledScope may call registerOperation with a nullptr, so we have to
+    // check for that here.
+    if (!txn)
+        return;
+
     _opId = txn->getOpID();
 
     _engine->registerOperation(txn, this);
@@ -154,6 +170,10 @@ OperationContext* MozJSImplScope::getOpContext() const {
     return _opCtx;
 }
 
+bool MozJSImplScope::isJavaScriptProtectionEnabled() const {
+    return _engine->isJavaScriptProtectionEnabled();
+}
+
 bool MozJSImplScope::_interruptCallback(JSContext* cx) {
     auto scope = getScope(cx);
 
@@ -167,16 +187,18 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
         JS_MaybeGC(cx);
     }
 
-    bool kill = scope->isKillPending();
-
-    if (kill) {
-        scope->_engine->getDeadlineMonitor().stopDeadline(scope);
-        scope->unregisterOperation();
-
-        scope->_status = Status(ErrorCodes::JSInterpreterFailure, "Interrupted by the host");
+    if (scope->_hasOutOfMemoryException) {
+        scope->_status = Status(ErrorCodes::JSInterpreterFailure, "Out of memory");
+    } else if (scope->isKillPending()) {
+        scope->_status = Status(ErrorCodes::Interrupted, "Interrupted by the host");
     }
 
-    return !kill;
+    if (!scope->_status.isOK()) {
+        scope->_engine->getDeadlineMonitor().stopDeadline(scope);
+        scope->unregisterOperation();
+    }
+
+    return scope->_status.isOK();
 }
 
 void MozJSImplScope::_gcCallback(JSRuntime* rt, JSGCStatus status, void* data) {
@@ -190,8 +212,17 @@ void MozJSImplScope::_gcCallback(JSRuntime* rt, JSGCStatus status, void* data) {
           << std::endl;
 }
 
-MozJSImplScope::MozRuntime::MozRuntime() {
+MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
     mongo::sm::reset(kMallocMemoryLimit);
+
+    // If this runtime isn't running on an NSPR thread, then it is
+    // running on a mongo thread. In that case, we need to insert a
+    // fake NSPR thread so that the SM runtime can call PR functions
+    // without falling over.
+    auto thread = PR_GetCurrentThread();
+    if (!thread) {
+        PR_BindThread(_thread = PR_CreateFakeThread());
+    }
 
     {
         stdx::unique_lock<stdx::mutex> lk(gRuntimeCreationMutex);
@@ -206,9 +237,39 @@ MozJSImplScope::MozRuntime::MozRuntime() {
         }
 
         _runtime = JS_NewRuntime(kMaxBytesBeforeGC);
-    }
+        uassert(ErrorCodes::JSInterpreterFailure, "Failed to initialize JSRuntime", _runtime);
 
-    uassert(ErrorCodes::JSInterpreterFailure, "Failed to initialize JSRuntime", _runtime);
+        // We turn on a variety of optimizations if the jit is enabled
+        if (engine->isJITEnabled()) {
+            JS::RuntimeOptionsRef(_runtime)
+                .setAsmJS(true)
+                .setThrowOnAsmJSValidationFailure(true)
+                .setBaseline(true)
+                .setIon(true)
+                .setAsyncStack(false)
+                .setNativeRegExp(true);
+        }
+
+        const StackLocator locator;
+        const auto available = locator.available();
+        if (available) {
+            // We fudge by 64k for a two reasons. First, it appears
+            // that the internal recursion checks that SM performs can
+            // have stack usage between checks of more than 32k in
+            // some builds. Second, some platforms report the guard
+            // page (in the linux sense) as "part of the stack", even
+            // though accessing that page will fault the process. We
+            // don't have a good way of getting information about the
+            // guard page on those platforms.
+            //
+            // TODO: What if we are running on a platform with very
+            // large pages, like 4MB?
+            JS_SetNativeStackQuota(_runtime, available.get() - (64 * 1024));
+        }
+
+        // The memory limit is in megabytes
+        JS_SetGCParametersBasedOnAvailableMemory(_runtime, kMallocMemoryLimit / (1024 * 1024));
+    }
 
     _context = JS_NewContext(_runtime, kStackChunkSize);
     uassert(ErrorCodes::JSInterpreterFailure, "Failed to initialize JSContext", _context);
@@ -217,16 +278,23 @@ MozJSImplScope::MozRuntime::MozRuntime() {
 MozJSImplScope::MozRuntime::~MozRuntime() {
     JS_DestroyContext(_context);
     JS_DestroyRuntime(_runtime);
+
+    if (_thread) {
+        invariant(PR_GetCurrentThread() == _thread);
+        PR_DestroyFakeThread(_thread);
+        PR_BindThread(nullptr);
+    }
 }
 
 MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
     : _engine(engine),
-      _mr(),
+      _mr(engine),
       _runtime(_mr._runtime),
       _context(_mr._context),
       _globalProto(_context),
       _global(_globalProto.getProto()),
       _funcs(),
+      _internedStrings(_context),
       _pendingKill(false),
       _opId(0),
       _opCtx(nullptr),
@@ -234,8 +302,11 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _connectState(ConnectState::Not),
       _status(Status::OK()),
       _quickExit(false),
+      _generation(0),
+      _hasOutOfMemoryException(false),
       _binDataProto(_context),
       _bsonProto(_context),
+      _codeProto(_context),
       _countDownLatchProto(_context),
       _cursorProto(_context),
       _cursorHandleProto(_context),
@@ -278,6 +349,9 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
     _checkErrorState(JS_InitStandardClasses(_context, _global));
 
     installBSONTypes();
+
+    JS_FireOnNewGlobalObject(_context, _global);
+
     execSetup(JSFiles::assert);
     execSetup(JSFiles::types);
 
@@ -299,7 +373,7 @@ MozJSImplScope::~MozJSImplScope() {
 }
 
 bool MozJSImplScope::hasOutOfMemoryException() {
-    return false;
+    return _hasOutOfMemoryException;
 }
 
 void MozJSImplScope::init(const BSONObj* data) {
@@ -309,7 +383,7 @@ void MozJSImplScope::init(const BSONObj* data) {
     BSONObjIterator i(*data);
     while (i.more()) {
         BSONElement e = i.next();
-        setElement(e.fieldName(), e);
+        setElement(e.fieldName(), e, *data);
     }
 }
 
@@ -331,10 +405,10 @@ void MozJSImplScope::setBoolean(const char* field, bool val) {
     ObjectWrapper(_context, _global).setBoolean(field, val);
 }
 
-void MozJSImplScope::setElement(const char* field, const BSONElement& e) {
+void MozJSImplScope::setElement(const char* field, const BSONElement& e, const BSONObj& parent) {
     MozJSEntry entry(this);
 
-    ObjectWrapper(_context, _global).setBSONElement(field, e, false);
+    ObjectWrapper(_context, _global).setBSONElement(field, e, parent, false);
 }
 
 void MozJSImplScope::setObject(const char* field, const BSONObj& obj, bool readOnly) {
@@ -398,14 +472,20 @@ void MozJSImplScope::newFunction(StringData raw, JS::MutableHandleValue out) {
 
     JS::CompileOptions co(_context);
     setCompileOptions(&co);
-    _checkErrorState(JS::Evaluate(_context, _global, co, code.c_str(), code.length(), out));
+    _checkErrorState(JS::Evaluate(_context, co, code.c_str(), code.length(), out));
 }
 
 BSONObj MozJSImplScope::callThreadArgs(const BSONObj& args) {
     MozJSEntry entry(this);
 
     JS::RootedValue function(_context);
-    ValueReader(_context, &function).fromBSONElement(args.firstElement(), true);
+    auto firstElem = args.firstElement();
+
+    // The first argument must be the thread start function
+    if (firstElem.type() != mongo::Code)
+        uasserted(ErrorCodes::BadValue, "first thread argument must be a function");
+
+    getScope(_context)->newFunction(firstElem.valueStringData(), &function);
 
     int argc = args.nFields() - 1;
 
@@ -415,7 +495,7 @@ BSONObj MozJSImplScope::callThreadArgs(const BSONObj& args) {
     JS::RootedValue value(_context);
 
     for (int i = 0; i < argc; ++i) {
-        ValueReader(_context, &value).fromBSONElement(*it, true);
+        ValueReader(_context, &value).fromBSONElement(*it, args, true);
         argv.append(value);
         it.next();
     }
@@ -425,10 +505,11 @@ BSONObj MozJSImplScope::callThreadArgs(const BSONObj& args) {
 
     _checkErrorState(JS::Call(_context, thisv, function, argv, &out), false, true);
 
-    BSONObjBuilder b;
-    ValueWriter(_context, out).writeThis(&b, "ret");
+    JS::RootedObject rout(_context, JS_NewPlainObject(_context));
+    ObjectWrapper wout(_context, rout);
+    wout.setValue("ret", out);
 
-    return b.obj();
+    return wout.toBSON();
 }
 
 bool hasFunctionIdentifier(StringData code) {
@@ -447,7 +528,7 @@ void MozJSImplScope::_MozJSCreateFunction(const char* raw,
     JS::CompileOptions co(_context);
     setCompileOptions(&co);
 
-    _checkErrorState(JS::Evaluate(_context, _global, co, code.c_str(), code.length(), fun));
+    _checkErrorState(JS::Evaluate(_context, co, code.c_str(), code.length(), fun));
     uassert(10232,
             "not a function",
             fun.isObject() && JS_ObjectIsFunction(_context, fun.toObjectOrNull()));
@@ -502,7 +583,7 @@ int MozJSImplScope::invoke(ScriptingFunction func,
             BSONElement next = it.next();
 
             JS::RootedValue value(_context);
-            ValueReader(_context, &value).fromBSONElement(next, readOnlyArgs);
+            ValueReader(_context, &value).fromBSONElement(next, *argsObject, readOnlyArgs);
 
             args.append(value);
         }
@@ -510,7 +591,7 @@ int MozJSImplScope::invoke(ScriptingFunction func,
 
     JS::RootedValue smrecv(_context);
     if (recv)
-        ValueReader(_context, &smrecv).fromBSON(*recv, readOnlyRecv);
+        ValueReader(_context, &smrecv).fromBSON(*recv, nullptr, readOnlyRecv);
     else
         smrecv.setObjectOrNull(_global);
 
@@ -556,7 +637,7 @@ bool MozJSImplScope::exec(StringData code,
     co.setFile(name.c_str());
     JS::RootedScript script(_context);
 
-    bool success = JS::Compile(_context, _global, co, code.rawData(), code.size(), &script);
+    bool success = JS::Compile(_context, co, code.rawData(), code.size(), &script);
 
     if (_checkErrorState(success, reportError, assertOnError))
         return false;
@@ -566,7 +647,7 @@ bool MozJSImplScope::exec(StringData code,
 
     JS::RootedValue out(_context);
 
-    success = JS_ExecuteScript(_context, _global, script, &out);
+    success = JS_ExecuteScript(_context, script, &out);
 
     if (timeoutMs)
         _engine->getDeadlineMonitor().stopDeadline(this);
@@ -664,11 +745,13 @@ void MozJSImplScope::reset() {
     unregisterOperation();
     _pendingKill.store(false);
     _pendingGC.store(false);
+    advanceGeneration();
 }
 
 void MozJSImplScope::installBSONTypes() {
     _binDataProto.install(_global);
     _bsonProto.install(_global);
+    _codeProto.install(_global);
     _dbPointerProto.install(_global);
     _dbRefProto.install(_global);
     _errorProto.install(_global);
@@ -766,11 +849,20 @@ bool MozJSImplScope::getQuickExit(int* exitCode) {
 }
 
 void MozJSImplScope::setOOM() {
-    _status = Status(ErrorCodes::JSInterpreterFailure, "Out of memory");
+    _hasOutOfMemoryException = true;
+    JS_RequestInterruptCallback(_runtime);
 }
 
 void MozJSImplScope::setParentStack(std::string parentStack) {
     _parentStack = std::move(parentStack);
+}
+
+std::size_t MozJSImplScope::getGeneration() const {
+    return _generation;
+}
+
+void MozJSImplScope::advanceGeneration() {
+    _generation++;
 }
 
 const std::string& MozJSImplScope::getParentStack() const {

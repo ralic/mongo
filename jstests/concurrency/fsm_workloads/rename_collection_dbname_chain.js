@@ -7,7 +7,7 @@
  * command against it, specifying a different database name in the namespace.
  * The previous "to" namespace is used as the next "from" namespace.
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js'); // for dropDatabases
+load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropDatabases
 
 var $config = (function() {
 
@@ -24,14 +24,14 @@ var $config = (function() {
         }
 
         function init(db, collName) {
-            this.fromDBName = uniqueDBName(this.prefix, this.tid, 0);
+            this.fromDBName = db.getName() + uniqueDBName(this.prefix, this.tid, 0);
             this.num = 1;
             var fromDB = db.getSiblingDB(this.fromDBName);
             assertAlways.commandWorked(fromDB.createCollection(collName));
         }
 
         function rename(db, collName) {
-            var toDBName = uniqueDBName(this.prefix, this.tid, this.num++);
+            var toDBName = db.getName() + uniqueDBName(this.prefix, this.tid, this.num++);
             var renameCommand = {
                 renameCollection: this.fromDBName + '.' + collName,
                 to: toDBName + '.' + collName,
@@ -57,12 +57,12 @@ var $config = (function() {
     })();
 
     var transitions = {
-        init: { rename: 1 },
-        rename: { rename: 1 }
+        init: {rename: 1},
+        rename: {rename: 1}
     };
 
     function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '\\d+_\\d+$');
+        var pattern = new RegExp('^' + db.getName() + this.prefix + '\\d+_\\d+$');
         dropDatabases(db, pattern);
     }
 

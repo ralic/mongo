@@ -51,10 +51,7 @@ using std::vector;
 BatchWriteExec::BatchWriteExec(NSTargeter* targeter,
                                ShardResolver* resolver,
                                MultiCommandDispatch* dispatcher)
-    : _targeter(targeter),
-      _resolver(resolver),
-      _dispatcher(dispatcher),
-      _stats(new BatchWriteExecStats) {}
+    : _targeter(targeter), _resolver(resolver), _dispatcher(dispatcher) {}
 
 namespace {
 
@@ -82,19 +79,14 @@ static void noteStaleResponses(const vector<ShardError*>& staleErrors, NSTargete
     }
 }
 
-static bool isShardMetadataChanging(const vector<ShardError*>& staleErrors) {
-    if (!staleErrors.empty() && staleErrors.back()->error.isErrInfoSet())
-        return staleErrors.back()->error.getErrInfo()["inCriticalSection"].trueValue();
-    return false;
-}
-
 // The number of times we'll try to continue a batch op if no progress is being made
 // This only applies when no writes are occurring and metadata is not changing on reload
 static const int kMaxRoundsWithoutProgress(5);
 
 void BatchWriteExec::executeBatch(OperationContext* txn,
                                   const BatchedCommandRequest& clientRequest,
-                                  BatchedCommandResponse* clientResponse) {
+                                  BatchedCommandResponse* clientResponse,
+                                  BatchWriteExecStats* stats) {
     LOG(4) << "starting execution of write batch of size "
            << static_cast<int>(clientRequest.sizeWriteOps()) << " for " << clientRequest.getNS();
 
@@ -144,7 +136,7 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
             // Don't do anything until a targeter refresh
             _targeter->noteCouldNotTarget();
             refreshedTargeter = true;
-            ++_stats->numTargetErrors;
+            ++stats->numTargetErrors;
             dassert(childBatches.size() == 0u);
         }
 
@@ -154,7 +146,6 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
 
         size_t numSent = 0;
         size_t numToSend = childBatches.size();
-        bool remoteMetadataChanging = false;
         while (numSent != numToSend) {
             // Collect batches out on the network, mapped by endpoint
             OwnedHostBatchMap ownedPendingBatches;
@@ -182,7 +173,7 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
                 Status resolveStatus =
                     _resolver->chooseWriteHost(txn, nextBatch->getEndpoint().shardName, &shardHost);
                 if (!resolveStatus.isOK()) {
-                    ++_stats->numResolveErrors;
+                    ++stats->numResolveErrors;
 
                     // Record a resolve failure
                     // TODO: It may be necessary to refresh the cache if stale, or maybe just
@@ -269,21 +260,16 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
 
                     if (staleErrors.size() > 0) {
                         noteStaleResponses(staleErrors, _targeter);
-                        ++_stats->numStaleBatches;
-                    }
-
-                    // Remember if the shard is actively changing metadata right now
-                    if (isShardMetadataChanging(staleErrors)) {
-                        remoteMetadataChanging = true;
+                        ++stats->numStaleBatches;
                     }
 
                     // Remember that we successfully wrote to this shard
                     // NOTE: This will record lastOps for shards where we actually didn't update
                     // or delete any documents, which preserves old behavior but is conservative
-                    _stats->noteWriteAt(shardHost,
-                                        response.isLastOpSet() ? response.getLastOp() : Timestamp(),
-                                        response.isElectionIdSet() ? response.getElectionId()
-                                                                   : OID());
+                    stats->noteWriteAt(
+                        shardHost,
+                        response.isLastOpSet() ? response.getLastOp() : repl::OpTime(),
+                        response.isElectionIdSet() ? response.getElectionId() : OID());
                 } else {
                     // Error occurred dispatching, note it
 
@@ -303,7 +289,7 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
         }
 
         ++rounds;
-        ++_stats->numRounds;
+        ++stats->numRounds;
 
         // If we're done, get out
         if (batchOp.isFinished())
@@ -329,7 +315,7 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
         //
 
         int currCompletedOps = batchOp.numWriteOpsIn(WriteOpState_Completed);
-        if (currCompletedOps == numCompletedOps && !targeterChanged && !remoteMetadataChanging) {
+        if (currCompletedOps == numCompletedOps && !targeterChanged) {
             ++numRoundsWithoutProgress;
         } else {
             numRoundsWithoutProgress = 0;
@@ -360,16 +346,8 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
            << " for " << clientRequest.getNS();
 }
 
-const BatchWriteExecStats& BatchWriteExec::getStats() {
-    return *_stats;
-}
-
-BatchWriteExecStats* BatchWriteExec::releaseStats() {
-    return _stats.release();
-}
-
 void BatchWriteExecStats::noteWriteAt(const ConnectionString& host,
-                                      Timestamp opTime,
+                                      repl::OpTime opTime,
                                       const OID& electionId) {
     _writeOpTimes[host] = HostOpTime(opTime, electionId);
 }

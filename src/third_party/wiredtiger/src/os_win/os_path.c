@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -12,7 +12,7 @@
  * __wt_absolute_path --
  *	Return if a filename is an absolute path.
  */
-int
+bool
 __wt_absolute_path(const char *path)
 {
 	/*
@@ -21,7 +21,7 @@ __wt_absolute_path(const char *path)
 	 */
 	if (strlen(path) >= 3 && isalpha(path[0]) && path[1] == ':')
 		path += 2;
-	return (path[0] == '/' || path[0] == '\\' ? 1 : 0);
+	return (path[0] == '/' || path[0] == '\\');
 }
 
 /*

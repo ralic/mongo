@@ -1473,9 +1473,9 @@ const BSONElement Element::getValue() const {
 SafeNum Element::getValueSafeNum() const {
     switch (getType()) {
         case mongo::NumberInt:
-            return static_cast<int>(getValueInt());
+            return static_cast<int32_t>(getValueInt());
         case mongo::NumberLong:
-            return static_cast<long long int>(getValueLong());
+            return static_cast<int64_t>(getValueLong());
         case mongo::NumberDouble:
             return getValueDouble();
         case mongo::NumberDecimal:
@@ -1900,11 +1900,35 @@ Status Element::setValueSafeNum(const SafeNum value) {
         case mongo::NumberDouble:
             return setValueDouble(value._value.doubleVal);
         case mongo::NumberDecimal:
-            return setValueDecimal(value._value.decimalVal);
+            return setValueDecimal(Decimal128(value._value.decimalVal));
         default:
             return Status(ErrorCodes::UnsupportedFormat,
                           "Don't know how to handle unexpected SafeNum type");
     }
+}
+
+Status Element::setValueElement(ConstElement setFrom) {
+    verify(ok());
+
+    // Can't set to your own root element, since this would create a circular document.
+    if (_doc->root() == setFrom) {
+        return Status(ErrorCodes::IllegalOperation,
+                      "Attempt to set an element to its own document's root");
+    }
+
+    // Setting to self is a no-op.
+    //
+    // Setting the root is always an error so we want to fall through to the error handling in this
+    // case.
+    if (*this == setFrom && _repIdx != kRootRepIdx) {
+        return Status::OK();
+    }
+
+    Document::Impl& impl = getDocument().getImpl();
+    ElementRep thisRep = impl.getElementRep(_repIdx);
+    const StringData fieldName = impl.getFieldNameForNewElement(thisRep);
+    Element newValue = getDocument().makeElementWithNewFieldName(fieldName, setFrom);
+    return setValue(newValue._repIdx);
 }
 
 BSONType Element::getType() const {
@@ -2540,7 +2564,7 @@ Element Document::makeElementSafeNum(StringData fieldName, SafeNum value) {
         case mongo::NumberDouble:
             return makeElementDouble(fieldName, value._value.doubleVal);
         case mongo::NumberDecimal:
-            return makeElementDecimal(fieldName, value._value.decimalVal);
+            return makeElementDecimal(fieldName, Decimal128(value._value.decimalVal));
         default:
             // Return an invalid element to indicate that we failed.
             return end();

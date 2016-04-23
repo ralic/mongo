@@ -54,6 +54,10 @@ struct GroupRequest {
     // Empty is "keyPattern" is being used instead.
     std::string keyFunctionCode;
 
+    // The collation used for string comparisons. If empty, simple binary comparison with memcmp()
+    // is used.
+    BSONObj collation;
+
     // A Javascript function that takes a (input document, group result) pair and
     // updates the group result document.
     std::string reduceCode;
@@ -87,7 +91,7 @@ public:
                WorkingSet* workingSet,
                PlanStage* child);
 
-    StageState work(WorkingSetID* out) final;
+    StageState doWork(WorkingSetID* out) final;
     bool isEOF() final;
 
     StageType stageType() const final {
@@ -117,15 +121,15 @@ private:
     };
 
     // Initializes _scope, _reduceFunction and _keyFunction using the global scripting engine.
-    void initGroupScripting();
+    Status initGroupScripting();
 
     // Updates _groupMap and _scope to account for the group key associated with this object.
     // Returns an error status if an error occurred, else Status::OK().
     Status processObject(const BSONObj& obj);
 
-    // Finalize the results for this group operation.  Returns an owned BSONObj with the results
-    // array.
-    BSONObj finalizeResults();
+    // Finalize the results for this group operation. On success, returns with a BSONObj with
+    // the results array. On failure, returns a non-OK status. Does not throw.
+    StatusWith<BSONObj> finalizeResults();
 
     GroupRequest _request;
 

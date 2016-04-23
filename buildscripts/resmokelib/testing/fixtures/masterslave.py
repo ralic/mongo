@@ -53,16 +53,35 @@ class MasterSlaveFixture(interface.ReplFixture):
         self.slave = None
 
     def setup(self):
-        self.master = self._new_mongod_master()
+        if self.master is None:
+            self.master = self._new_mongod_master()
         self.master.setup()
         self.port = self.master.port
 
-        self.slave = self._new_mongod_slave()
+        if self.slave is None:
+            self.slave = self._new_mongod_slave()
         self.slave.setup()
 
     def await_ready(self):
         self.master.await_ready()
         self.slave.await_ready()
+
+        # Do a replicated write to ensure that the slave has finished with its initial sync before
+        # starting to run any tests.
+        client = utils.new_mongo_client(self.port)
+
+        # Keep retrying this until it times out waiting for replication.
+        def insert_fn(remaining_secs):
+            remaining_millis = int(round(remaining_secs * 1000))
+            write_concern = pymongo.WriteConcern(w=2, wtimeout=remaining_millis)
+            coll = client.resmoke.get_collection("await_ready", write_concern=write_concern)
+            coll.insert_one({"awaiting": "ready"})
+
+        try:
+            self.retry_until_wtimeout(insert_fn)
+        except pymongo.errors.WTimeoutError:
+            self.logger.info("Replication of write operation timed out.")
+            raise
 
     def teardown(self):
         running_at_start = self.is_running()
@@ -111,6 +130,11 @@ class MasterSlaveFixture(interface.ReplFixture):
 
         client = utils.new_mongo_client(self.port)
 
+        self.logger.info("Starting fsync on master on port %d to flush all pending writes",
+                         self.port)
+        client.fsync()
+        self.logger.info("fsync on master completed")
+
         # We verify that each database has replicated to the slave because in the case of an initial
         # sync, the slave may acknowledge writes to one database before it has finished syncing
         # others.
@@ -133,9 +157,9 @@ class MasterSlaveFixture(interface.ReplFixture):
             # Keep retrying this until it times out waiting for replication.
             def insert_fn(remaining_secs):
                 remaining_millis = int(round(remaining_secs * 1000))
-                client[db_name].resmoke_await_repl.insert({"awaiting": "repl"},
-                                                          w=2,
-                                                          wtimeout=remaining_millis)
+                write_concern = pymongo.WriteConcern(w=2, wtimeout=remaining_millis)
+                coll = client[db_name].get_collection("await_repl", write_concern=write_concern)
+                coll.insert_one({"awaiting": "repl"})
 
             try:
                 self.retry_until_wtimeout(insert_fn)

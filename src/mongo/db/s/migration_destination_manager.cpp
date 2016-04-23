@@ -42,24 +42,23 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_create.h"
-#include "mongo/db/client.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logger/ramlog.h"
-#include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/fail_point_service.h"
@@ -161,7 +160,31 @@ bool opReplicatedEnough(OperationContext* txn,
     return majorityStatus.isOK() && userStatus.isOK();
 }
 
-}  // namespace
+/**
+ * Create the migration clone request BSON object to send to the source
+ * shard.
+ *
+ * 'sessionId' unique identifier for this migration.
+ */
+BSONObj createMigrateCloneRequest(const MigrationSessionId& sessionId) {
+    BSONObjBuilder builder;
+    builder.append("_migrateClone", 1);
+    sessionId.append(&builder);
+    return builder.obj();
+}
+
+/**
+ * Create the migration transfer mods request BSON object to send to the source
+ * shard.
+ *
+ * 'sessionId' unique identifier for this migration.
+ */
+BSONObj createTransferModsRequest(const MigrationSessionId& sessionId) {
+    BSONObjBuilder builder;
+    builder.append("_transferMods", 1);
+    sessionId.append(&builder);
+    return builder.obj();
+}
 
 // Enabling / disabling these fail points pauses / resumes MigrateStatus::_go(), the thread which
 // receives a chunk migration from the donor.
@@ -170,15 +193,13 @@ MONGO_FP_DECLARE(migrateThreadHangAtStep2);
 MONGO_FP_DECLARE(migrateThreadHangAtStep3);
 MONGO_FP_DECLARE(migrateThreadHangAtStep4);
 MONGO_FP_DECLARE(migrateThreadHangAtStep5);
+MONGO_FP_DECLARE(migrateThreadHangAtStep6);
 
+MONGO_FP_DECLARE(failMigrationReceivedOutOfRangeOperation);
 
-MigrationDestinationManager::MigrationDestinationManager()
-    : _active(false),
-      _numCloned(0),
-      _clonedBytes(0),
-      _numCatchup(0),
-      _numSteady(0),
-      _state(READY) {}
+}  // namespace
+
+MigrationDestinationManager::MigrationDestinationManager() = default;
 
 MigrationDestinationManager::~MigrationDestinationManager() = default;
 
@@ -192,15 +213,19 @@ void MigrationDestinationManager::setState(State newState) {
     _state = newState;
 }
 
-bool MigrationDestinationManager::getActive() const {
+bool MigrationDestinationManager::isActive() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _active;
+    return _sessionId.is_initialized();
 }
 
 void MigrationDestinationManager::report(BSONObjBuilder& b) {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 
-    b.appendBool("active", _active);
+    b.appendBool("active", _sessionId.is_initialized());
+
+    if (_sessionId) {
+        b.append("sessionId", _sessionId->toString());
+    }
 
     b.append("ns", _ns);
     b.append("from", _from);
@@ -223,6 +248,7 @@ void MigrationDestinationManager::report(BSONObjBuilder& b) {
 }
 
 Status MigrationDestinationManager::start(const string& ns,
+                                          const MigrationSessionId& sessionId,
                                           const string& fromShard,
                                           const BSONObj& min,
                                           const BSONObj& max,
@@ -231,7 +257,7 @@ Status MigrationDestinationManager::start(const string& ns,
                                           const WriteConcernOptions& writeConcern) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
-    if (_active) {
+    if (_sessionId) {
         return Status(ErrorCodes::ConflictingOperationInProgress,
                       str::stream() << "Active migration already in progress "
                                     << "ns: " << _ns << ", from: " << _from << ", min: " << _min
@@ -247,12 +273,14 @@ Status MigrationDestinationManager::start(const string& ns,
     _max = max;
     _shardKeyPattern = shardKeyPattern;
 
+    _chunkMarkedPending = false;
+
     _numCloned = 0;
     _clonedBytes = 0;
     _numCatchup = 0;
     _numSteady = 0;
 
-    _active = true;
+    _sessionId = sessionId;
 
     // TODO: If we are here, the migrate thread must have completed, otherwise _active above would
     // be false, so this would never block. There is no better place with the current implementation
@@ -261,9 +289,10 @@ Status MigrationDestinationManager::start(const string& ns,
         _migrateThreadHandle.join();
     }
 
-    _migrateThreadHandle =
-        stdx::thread([this, ns, min, max, shardKeyPattern, fromShard, epoch, writeConcern]() {
-            _migrateThread(ns, min, max, shardKeyPattern, fromShard, epoch, writeConcern);
+    _migrateThreadHandle = stdx::thread(
+        [this, ns, sessionId, min, max, shardKeyPattern, fromShard, epoch, writeConcern]() {
+            _migrateThread(
+                ns, sessionId, min, max, shardKeyPattern, fromShard, epoch, writeConcern);
         });
 
     return Status::OK();
@@ -275,10 +304,23 @@ void MigrationDestinationManager::abort() {
     _errmsg = "aborted";
 }
 
-bool MigrationDestinationManager::startCommit() {
+bool MigrationDestinationManager::startCommit(const MigrationSessionId& sessionId) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
 
     if (_state != STEADY) {
+        return false;
+    }
+
+    // In STEADY state we must have active migration
+    invariant(_sessionId);
+
+    // This check guards against the (very unlikely) situation where the current donor shard has
+    // been stalled for some time, during which the recipient shard crashed or timed out and started
+    // serving as a recipient of chunks for another collection (note that it cannot be the same
+    // collection, because the old donor still holds the collection lock).
+    if (!_sessionId->matches(sessionId)) {
+        warning() << "startCommit received commit request from a stale session "
+                  << sessionId.toString() << ". Current session is " << _sessionId->toString();
         return false;
     }
 
@@ -286,7 +328,7 @@ bool MigrationDestinationManager::startCommit() {
 
     const auto deadline = stdx::chrono::system_clock::now() + Seconds(30);
 
-    while (_active) {
+    while (_sessionId) {
         if (stdx::cv_status::timeout == _isActiveCV.wait_until(lock, deadline)) {
             _state = FAIL;
             log() << "startCommit never finished!" << migrateLog;
@@ -303,6 +345,7 @@ bool MigrationDestinationManager::startCommit() {
 }
 
 void MigrationDestinationManager::_migrateThread(std::string ns,
+                                                 MigrationSessionId sessionId,
                                                  BSONObj min,
                                                  BSONObj max,
                                                  BSONObj shardKeyPattern,
@@ -310,16 +353,16 @@ void MigrationDestinationManager::_migrateThread(std::string ns,
                                                  OID epoch,
                                                  WriteConcernOptions writeConcern) {
     Client::initThread("migrateThread");
-
-    OperationContextImpl txn;
+    auto opCtx = getGlobalServiceContext()->makeOperationContext(&cc());
 
     if (getGlobalAuthorizationManager()->isAuthEnabled()) {
         ShardedConnectionInfo::addHook();
-        AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
+        AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization();
     }
 
     try {
-        _migrateDriver(&txn, ns, min, max, shardKeyPattern, fromShard, epoch, writeConcern);
+        _migrateDriver(
+            opCtx.get(), ns, sessionId, min, max, shardKeyPattern, fromShard, epoch, writeConcern);
     } catch (std::exception& e) {
         {
             stdx::lock_guard<stdx::mutex> sl(_mutex);
@@ -340,30 +383,27 @@ void MigrationDestinationManager::_migrateThread(std::string ns,
 
     if (getState() != DONE) {
         // Unprotect the range if needed/possible on unsuccessful TO migration
-        ScopedTransaction transaction(&txn, MODE_IX);
-        Lock::DBLock dbLock(txn.lockState(), nsToDatabaseSubstring(ns), MODE_IX);
-        Lock::CollectionLock collLock(txn.lockState(), ns, MODE_X);
-
-        string errMsg;
-        if (!ShardingState::get(&txn)->forgetPending(&txn, ns, min, max, epoch, &errMsg)) {
-            warning() << errMsg;
+        Status status = _forgetPending(opCtx.get(), NamespaceString(ns), min, max, epoch);
+        if (!status.isOK()) {
+            warning() << "Failed to remove pending range" << causedBy(status);
         }
     }
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _active = false;
+    _sessionId = boost::none;
     _isActiveCV.notify_all();
 }
 
 void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
                                                  const string& ns,
+                                                 const MigrationSessionId& sessionId,
                                                  const BSONObj& min,
                                                  const BSONObj& max,
                                                  const BSONObj& shardKeyPattern,
                                                  const std::string& fromShard,
                                                  const OID& epoch,
                                                  const WriteConcernOptions& writeConcern) {
-    invariant(getActive());
+    invariant(isActive());
     invariant(getState() == READY);
     invariant(!min.isEmpty());
     invariant(!max.isEmpty());
@@ -374,7 +414,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
           << " for collection " << ns << " from " << fromShard << " at epoch " << epoch.toString();
 
     string errmsg;
-    MoveTimingHelper timing(txn, "to", ns, min, max, 5 /* steps */, &errmsg, "", "");
+    MoveTimingHelper timing(txn, "to", ns, min, max, 6 /* steps */, &errmsg, "", "");
 
     ScopedDbConnection conn(fromShard);
 
@@ -430,7 +470,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
             indexSpecs.insert(indexSpecs.begin(), indexes.begin(), indexes.end());
         }
 
-        ScopedTransaction transaction(txn, MODE_IX);
+        ScopedTransaction scopedXact(txn, MODE_IX);
         Lock::DBLock lk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_X);
         OldClientContext ctx(txn, ns);
 
@@ -522,17 +562,11 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
             return;
         }
 
-        {
-            // Protect the range by noting that we're now starting a migration to it
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock dbLock(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
-            Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
-
-            if (!ShardingState::get(txn)->notePending(txn, ns, min, max, epoch, &errmsg)) {
-                warning() << errmsg;
-                setState(FAIL);
-                return;
-            }
+        Status status = _notePending(txn, NamespaceString(ns), min, max, epoch);
+        if (!status.isOK()) {
+            warning() << errmsg;
+            setState(FAIL);
+            return;
         }
 
         timing.done(2);
@@ -561,10 +595,12 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
         // 3. Initial bulk clone
         setState(CLONE);
 
+        const BSONObj migrateCloneRequest = createMigrateCloneRequest(sessionId);
+
         while (true) {
             BSONObj res;
             if (!conn->runCommand("admin",
-                                  BSON("_migrateClone" << 1),
+                                  migrateCloneRequest,
                                   res)) {  // gets array of objects to copy, in disk order
                 setState(FAIL);
                 errmsg = "_migrateClone failed: ";
@@ -643,13 +679,15 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
     // secondaries
     repl::OpTime lastOpApplied = repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
 
+    const BSONObj xferModsRequest = createTransferModsRequest(sessionId);
+
     {
         // 4. Do bulk of mods
         setState(CATCHUP);
 
         while (true) {
             BSONObj res;
-            if (!conn->runCommand("admin", BSON("_transferMods" << 1), res)) {
+            if (!conn->runCommand("admin", xferModsRequest, res)) {
                 setState(FAIL);
                 errmsg = "_transferMods failed: ";
                 errmsg += res.toString();
@@ -750,7 +788,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
             }
 
             BSONObj res;
-            if (!conn->runCommand("admin", BSON("_transferMods" << 1), res)) {
+            if (!conn->runCommand("admin", xferModsRequest, res)) {
                 log() << "_transferMods failed in STEADY state: " << res << migrateLog;
                 errmsg = res.toString();
                 setState(FAIL);
@@ -792,6 +830,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* txn,
     }
 
     setState(DONE);
+    timing.done(6);
+    MONGO_FAIL_POINT_PAUSE_WHILE_SET(migrateThreadHangAtStep6);
     conn.done();
 }
 
@@ -810,23 +850,24 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* txn,
     bool didAnything = false;
 
     if (xfer["deleted"].isABSONObj()) {
-        ScopedTransaction transaction(txn, MODE_IX);
+        ScopedTransaction scopedXact(txn, MODE_IX);
         Lock::DBLock dlk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
         Helpers::RemoveSaver rs("moveChunk", ns, "removedDuring");
 
-        BSONObjIterator i(xfer["deleted"].Obj());
+        BSONObjIterator i(xfer["deleted"].Obj());  // deleted documents
         while (i.more()) {
             Lock::CollectionLock clk(txn->lockState(), ns, MODE_X);
             OldClientContext ctx(txn, ns);
 
             BSONObj id = i.next().Obj();
 
-            // do not apply deletes if they do not belong to the chunk being migrated
+            // do not apply delete if doc does not belong to the chunk being migrated
             BSONObj fullObj;
             if (Helpers::findById(txn, ctx.db(), ns.c_str(), id, fullObj)) {
                 if (!isInRange(fullObj, min, max, shardKeyPattern)) {
-                    log() << "not applying out of range deletion: " << fullObj << migrateLog;
-
+                    if (MONGO_FAIL_POINT(failMigrationReceivedOutOfRangeOperation)) {
+                        invariant(0);
+                    }
                     continue;
                 }
             }
@@ -836,7 +877,7 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* txn,
             }
 
             deleteObjects(txn,
-                          ctx.db(),
+                          ctx.db() ? ctx.db()->getCollection(ns) : nullptr,
                           ns,
                           id,
                           PlanExecutor::YIELD_MANUAL,
@@ -849,12 +890,20 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* txn,
         }
     }
 
-    if (xfer["reload"].isABSONObj()) {
+    if (xfer["reload"].isABSONObj()) {  // modified documents (insert/update)
         BSONObjIterator i(xfer["reload"].Obj());
         while (i.more()) {
             OldClientWriteContext cx(txn, ns);
 
             BSONObj updatedDoc = i.next().Obj();
+
+            // do not apply insert/update if doc does not belong to the chunk being migrated
+            if (!isInRange(updatedDoc, min, max, shardKeyPattern)) {
+                if (MONGO_FAIL_POINT(failMigrationReceivedOutOfRangeOperation)) {
+                    invariant(0);
+                }
+                continue;
+            }
 
             BSONObj localDoc;
             if (willOverrideLocalId(
@@ -899,7 +948,7 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* txn,
 
     {
         // Get global lock to wait for write to be commited to journal.
-        ScopedTransaction transaction(txn, MODE_S);
+        ScopedTransaction scopedXact(txn, MODE_S);
         Lock::GlobalRead lk(txn->lockState());
 
         // if durability is on, force a write to journal
@@ -912,75 +961,79 @@ bool MigrationDestinationManager::_flushPendingWrites(OperationContext* txn,
     return true;
 }
 
-MoveTimingHelper::MoveTimingHelper(OperationContext* txn,
-                                   const string& where,
-                                   const string& ns,
-                                   const BSONObj& min,
-                                   const BSONObj& max,
-                                   int totalNumSteps,
-                                   string* cmdErrmsg,
-                                   const string& toShard,
-                                   const string& fromShard)
-    : _txn(txn),
-      _where(where),
-      _ns(ns),
-      _to(toShard),
-      _from(fromShard),
-      _totalNumSteps(totalNumSteps),
-      _cmdErrmsg(cmdErrmsg),
-      _nextStep(0) {
-    _b.append("min", min);
-    _b.append("max", max);
-}
+Status MigrationDestinationManager::_notePending(OperationContext* txn,
+                                                 const NamespaceString& nss,
+                                                 const BSONObj& min,
+                                                 const BSONObj& max,
+                                                 const OID& epoch) {
+    ScopedTransaction scopedXact(txn, MODE_IX);
+    AutoGetCollection autoColl(txn, nss, MODE_IX, MODE_X);
 
-MoveTimingHelper::~MoveTimingHelper() {
-    // even if logChange doesn't throw, bson does
-    // sigh
-    try {
-        if (!_to.empty()) {
-            _b.append("to", _to);
-        }
+    auto css = CollectionShardingState::get(txn, nss);
+    auto metadata = css->getMetadata();
 
-        if (!_from.empty()) {
-            _b.append("from", _from);
-        }
-
-        if (_nextStep != _totalNumSteps) {
-            _b.append("note", "aborted");
-        } else {
-            _b.append("note", "success");
-        }
-
-        if (!_cmdErrmsg->empty()) {
-            _b.append("errmsg", *_cmdErrmsg);
-        }
-
-        grid.catalogManager(_txn)->logChange(_txn,
-                                             _txn->getClient()->clientAddress(true),
-                                             (string) "moveChunk." + _where,
-                                             _ns,
-                                             _b.obj());
-    } catch (const std::exception& e) {
-        warning() << "couldn't record timing for moveChunk '" << _where << "': " << e.what()
-                  << migrateLog;
+    // This can currently happen because drops aren't synchronized with in-migrations.  The idea for
+    // checking this here is that in the future we shouldn't have this problem.
+    if (!metadata || metadata->getCollVersion().epoch() != epoch) {
+        return {ErrorCodes::StaleShardVersion,
+                str::stream() << "could not note chunk "
+                              << "[" << min << "," << max << ")"
+                              << " as pending because the epoch for " << nss.ns()
+                              << " has changed from " << epoch << " to "
+                              << (metadata ? metadata->getCollVersion().epoch()
+                                           : ChunkVersion::UNSHARDED().epoch())};
     }
+
+    ChunkType chunk;
+    chunk.setMin(min);
+    chunk.setMax(max);
+
+    css->setMetadata(metadata->clonePlusPending(chunk));
+
+    stdx::lock_guard<stdx::mutex> sl(_mutex);
+    invariant(!_chunkMarkedPending);
+    _chunkMarkedPending = true;
+
+    return Status::OK();
 }
 
-void MoveTimingHelper::done(int step) {
-    invariant(step == ++_nextStep);
-    invariant(step <= _totalNumSteps);
-
-    const string s = str::stream() << "step " << step << " of " << _totalNumSteps;
-
-    CurOp* op = CurOp::get(_txn);
-
+Status MigrationDestinationManager::_forgetPending(OperationContext* txn,
+                                                   const NamespaceString& nss,
+                                                   const BSONObj& min,
+                                                   const BSONObj& max,
+                                                   const OID& epoch) {
     {
-        stdx::lock_guard<Client> lk(*_txn->getClient());
-        op->setMessage_inlock(s.c_str());
+        stdx::lock_guard<stdx::mutex> sl(_mutex);
+        if (!_chunkMarkedPending) {
+            return Status::OK();
+        }
+
+        _chunkMarkedPending = false;
     }
 
-    _b.appendNumber(s, _t.millis());
-    _t.reset();
+    ScopedTransaction scopedXact(txn, MODE_IX);
+    AutoGetCollection autoColl(txn, nss, MODE_IX, MODE_X);
+
+    auto css = CollectionShardingState::get(txn, nss);
+    auto metadata = css->getMetadata();
+
+    // This can currently happen because drops aren't synchronized with in-migrations. The idea for
+    // checking this here is that in the future we shouldn't have this problem.
+    if (!metadata || metadata->getCollVersion().epoch() != epoch) {
+        return {ErrorCodes::StaleShardVersion,
+                str::stream() << "no need to forget pending chunk "
+                              << "[" << min << "," << max << ")"
+                              << " because the epoch for " << nss.ns() << " has changed from "
+                              << epoch << " to " << (metadata ? metadata->getCollVersion().epoch()
+                                                              : ChunkVersion::UNSHARDED().epoch())};
+    }
+
+    ChunkType chunk;
+    chunk.setMin(min);
+    chunk.setMax(max);
+
+    css->setMetadata(metadata->cloneMinusPending(chunk));
+    return Status::OK();
 }
 
 }  // namespace mongo

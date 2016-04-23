@@ -39,6 +39,7 @@
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
+#include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/config.h"
 #include "mongo/platform/decimal128.h"
@@ -54,8 +55,12 @@ typedef BSONElement be;
 typedef BSONObj bo;
 typedef BSONObjBuilder bob;
 
-/* l and r MUST have same type when called: check that first. */
-int compareElementValues(const BSONElement& l, const BSONElement& r);
+/** l and r MUST have same type when called: check that first.
+    If comparator is non-null, it is used for all comparisons between two strings.
+*/
+int compareElementValues(const BSONElement& l,
+                         const BSONElement& r,
+                         StringData::ComparatorInterface* comparator = nullptr);
 
 /** BSONElement represents an "element" in a BSONObj.  So for the object { a : 3, b : "abc" },
     'a : 3' is the first element (key+value).
@@ -485,8 +490,11 @@ public:
         @return <0: l<r. 0:l==r. >0:l>r
         order by type, field name, and field value.
         If considerFieldName is true, pay attention to the field name.
+        If comparator is non-null, it is used for all comparisons between two strings.
     */
-    int woCompare(const BSONElement& e, bool considerFieldName = true) const;
+    int woCompare(const BSONElement& e,
+                  bool considerFieldName = true,
+                  StringData::ComparatorInterface* comparator = nullptr) const;
 
     /**
      * Functor compatible with std::hash for std::unordered_{map,set}
@@ -666,9 +674,7 @@ inline bool BSONElement::isNumber() const {
     switch (type()) {
         case NumberLong:
         case NumberDouble:
-#ifdef MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT
         case NumberDecimal:
-#endif
         case NumberInt:
             return true;
         default:
@@ -699,11 +705,11 @@ inline Decimal128 BSONElement::numberDecimal() const {
         case NumberInt:
             return Decimal128(_numberInt());
         case NumberLong:
-            return Decimal128(_numberLong());
+            return Decimal128(static_cast<int64_t>(_numberLong()));
         case NumberDecimal:
             return _numberDecimal();
         default:
-            return 0;
+            return Decimal128::kNormalizedZero;
     }
 }
 
@@ -780,11 +786,11 @@ inline long long BSONElement::safeNumberLong() const {
             if (d.isNaN()) {
                 return 0;
             }
-            if (d.isGreater(Decimal128(std::numeric_limits<long long>::max()))) {
-                return std::numeric_limits<long long>::max();
+            if (d.isGreater(Decimal128(std::numeric_limits<int64_t>::max()))) {
+                return static_cast<long long>(std::numeric_limits<int64_t>::max());
             }
-            if (d.isLess(Decimal128(std::numeric_limits<long long>::min()))) {
-                return std::numeric_limits<long long>::min();
+            if (d.isLess(Decimal128(std::numeric_limits<int64_t>::min()))) {
+                return static_cast<long long>(std::numeric_limits<int64_t>::min());
             }
             return numberLong();
         }
@@ -794,7 +800,10 @@ inline long long BSONElement::safeNumberLong() const {
 }
 
 inline BSONElement::BSONElement() {
-    static const char kEooElement[] = "";
+    // This needs to be 2 elements because we check the strlen of data + 1 and GCC sees that as
+    // accessing beyond the end of a constant string, even though we always check whether the
+    // element is an eoo.
+    static const char kEooElement[2] = {'\0', '\0'};
     data = kEooElement;
     fieldNameSize_ = 0;
     totalSize = 1;

@@ -59,15 +59,16 @@ env.Library('authorization_manager_global',
                 '$BUILD_DIR/mongo/db/service_context',
             ])
 
-env.Library('authorization_manager_mock_init',
-            [
-                'authorization_manager_mock_init.cpp'
-            ],
-            LIBDEPS=[
-                'authcore',
-                'authmocks',
-                '$BUILD_DIR/mongo/db/service_context',
-            ])
+env.Library(
+    target='authorization_manager_mock_init',
+    source=[
+        'authorization_manager_mock_init.cpp'
+    ],
+    LIBDEPS=[
+        'authcore',
+        'authmocks',
+    ],
+)
 
 env.Library('authservercommon',
             [
@@ -76,7 +77,7 @@ env.Library('authservercommon',
                 'security_key.cpp',
             ],
             LIBDEPS=[
-                '$BUILD_DIR/mongo/db/coredb',
+                '$BUILD_DIR/mongo/db/commands/core',
                 'authcommon',
                 'authcore',
                 'authmocks',
@@ -112,12 +113,9 @@ env.Library('saslauth',
                 'authmocks', # Wat?
                 'sasl_options',
                 '$BUILD_DIR/mongo/crypto/scramauth',
+                '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
                 '$BUILD_DIR/mongo/util/net/network',
              ],
-            LIBDEPS_TAGS=[
-                # Depends on Commands::testCommandsEnabled, which is not uniquely defined
-                'incomplete',
-            ],
 )
 
 env.Library('authmongod',
@@ -146,10 +144,6 @@ env.Library('authmongos',
                 '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
                 '$BUILD_DIR/mongo/s/coreshard',
             ],
-            LIBDEPS_TAGS=[
-                # Depends on inShutdown
-                'incomplete',
-            ],
 )
 
 env.Library(
@@ -165,21 +159,17 @@ env.Library(
     ]
 )
 
-env.Library('sasltestcrutch',
-            ['sasl_test_crutch.cpp'],
-            LIBDEPS=[])
-
 env.CppUnitTest('action_set_test', 'action_set_test.cpp',
-                LIBDEPS=['authcore', 'authmocks', 'saslauth', 'sasltestcrutch'])
+                LIBDEPS=['authcore', 'authmocks', 'saslauth'])
 env.CppUnitTest('privilege_parser_test', 'privilege_parser_test.cpp',
-                LIBDEPS=['authcore', 'authmocks', 'saslauth', 'sasltestcrutch'])
+                LIBDEPS=['authcore', 'authmocks', 'saslauth'])
 env.CppUnitTest('role_graph_test', 'role_graph_test.cpp',
-                LIBDEPS=['authcore', 'authmocks', 'saslauth', 'sasltestcrutch'])
+                LIBDEPS=['authcore', 'authmocks', 'saslauth'])
 env.CppUnitTest('user_document_parser_test', 'user_document_parser_test.cpp',
-                LIBDEPS=['authcore', 'authmocks', 'saslauth', 'sasltestcrutch'])
+                LIBDEPS=['authcore', 'authmocks', 'saslauth'])
 env.CppUnitTest('user_set_test', 'user_set_test.cpp',
-                LIBDEPS=['authcore', 'authmocks', 'saslauth', 'sasltestcrutch'])
+                LIBDEPS=['authcore', 'authmocks', 'saslauth'])
 env.CppUnitTest('authorization_manager_test', 'authorization_manager_test.cpp',
-                LIBDEPS=['authcore', 'authmocks', 'saslauth', 'sasltestcrutch'])
+                LIBDEPS=['authcore', 'authmocks', 'saslauth'])
 env.CppUnitTest('authorization_session_test', 'authorization_session_test.cpp',
-                LIBDEPS=['authcore', 'authmocks', 'saslauth', 'sasltestcrutch'])
+                LIBDEPS=['authcore', 'authmocks', 'saslauth'])

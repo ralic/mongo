@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -33,19 +33,6 @@
 	uint8_t __orig;							\
 	do {								\
 		__orig = (p)->flags_atomic;				\
-	} while (!__wt_atomic_cas8(					\
-	    &(p)->flags_atomic, __orig, __orig | (uint8_t)(mask)));	\
-} while (0)
-
-#define	F_CAS_ATOMIC(p, mask, ret) do {					\
-	uint8_t __orig;							\
-	ret = 0;							\
-	do {								\
-		__orig = (p)->flags_atomic;				\
-		if ((__orig & (uint8_t)(mask)) != 0) {			\
-			ret = EBUSY;					\
-			break;						\
-		}							\
 	} while (!__wt_atomic_cas8(					\
 	    &(p)->flags_atomic, __orig, __orig | (uint8_t)(mask)));	\
 } while (0)

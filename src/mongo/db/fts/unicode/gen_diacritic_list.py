@@ -1,5 +1,5 @@
- #!/usr/bin/python
- # -*- coding: utf-8 -*-
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 import sys
 
 from gen_helper import getCopyrightNotice, openNamespaces, closeNamespaces, \
@@ -20,7 +20,7 @@ def generate(unicode_proplist_file, target):
 
     diacritics = set()
 
-    proplist_file = open(unicode_proplist_file, 'r')
+    proplist_file = open(unicode_proplist_file, 'rU')
 
     for line in proplist_file:
         # Filter out blank lines and lines that start with #

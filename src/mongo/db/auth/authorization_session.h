@@ -44,6 +44,11 @@
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
+
+namespace auth {
+
+struct CreateOrUpdateRoleArgs;
+}
 class ClientBasic;
 
 /**
@@ -139,14 +144,14 @@ public:
     // into a state where the first user can be created.
     PrivilegeVector getDefaultPrivileges();
 
-    // Checks if this connection has the privileges necessary to perform the given query on the
-    // given namespace.
-    Status checkAuthForQuery(const NamespaceString& ns, const BSONObj& query);
+    // Checks if this connection has the privileges necessary to perform a find operation
+    // on the supplied namespace identifier.
+    Status checkAuthForFind(const NamespaceString& ns, bool hasTerm);
 
     // Checks if this connection has the privileges necessary to perform a getMore operation on
     // the identified cursor, supposing that cursor is associated with the supplied namespace
     // identifier.
-    Status checkAuthForGetMore(const NamespaceString& ns, long long cursorID);
+    Status checkAuthForGetMore(const NamespaceString& ns, long long cursorID, bool hasTerm);
 
     // Checks if this connection has the privileges necessary to perform the given update on the
     // given namespace.
@@ -176,6 +181,9 @@ public:
     // Checks if this connection has the privileges necessary to revoke the given privilege
     // from a role.
     Status checkAuthorizedToRevokePrivilege(const Privilege& privilege);
+
+    // Checks if this connection has the privileges necessary to create a new role
+    bool isAuthorizedToCreateRole(const auth::CreateOrUpdateRoleArgs& args);
 
     // Utility function for isAuthorizedForActionsOnResource(
     //         ResourcePattern::forDatabaseName(role.getDB()), ActionType::grantAnyRole)

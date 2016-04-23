@@ -74,6 +74,11 @@ Status ModifierRename::init(const BSONElement& modExpr, const Options& opts, boo
                       str::stream() << "The 'to' field for $rename must be a string: " << modExpr);
     }
 
+    if (modExpr.valueStringData().find('\0') != std::string::npos) {
+        return Status(ErrorCodes::BadValue,
+                      "The 'to' field for $rename cannot contain an embedded null byte");
+    }
+
     // Extract the field names from the mod expression
 
     _fromFieldRef.parse(modExpr.fieldName());
@@ -221,10 +226,8 @@ Status ModifierRename::apply() const {
         (_preparedState->toIdxFound == (_toFieldRef.numParts() - 1));
 
     if (destExists) {
-        removeStatus = _preparedState->toElemFound.remove();
-        if (!removeStatus.isOK()) {
-            return removeStatus;
-        }
+        // Set destination element to the value of the source element.
+        return _preparedState->toElemFound.setValueElement(_preparedState->fromElemFound);
     }
 
     // Creates the final element that's going to be the in 'doc'.

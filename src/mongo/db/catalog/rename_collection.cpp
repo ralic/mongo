@@ -122,7 +122,6 @@ Status renameCollection(OperationContext* txn,
         // If target exists and dropTarget is not true, return false.
         if (targetDB->getCollection(target)) {
             if (!dropTarget) {
-                printStackTrace();
                 return Status(ErrorCodes::NamespaceExists, "target namespace exists");
             }
 
@@ -211,7 +210,7 @@ Status renameCollection(OperationContext* txn,
             // No logOp necessary because the entire renameCollection command is one logOp.
             bool shouldReplicateWrites = txn->writesAreReplicated();
             txn->setReplicatedWrites(false);
-            Status status = targetColl->insertDocument(txn, obj, &indexer, true).getStatus();
+            Status status = targetColl->insertDocument(txn, obj, &indexer, true);
             txn->setReplicatedWrites(shouldReplicateWrites);
             if (!status.isOK())
                 return status;

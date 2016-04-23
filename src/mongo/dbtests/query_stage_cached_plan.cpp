@@ -26,16 +26,19 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/queued_data_stage.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_cache.h"
@@ -90,14 +93,14 @@ public:
         WriteUnitOfWork wuow(&_txn);
 
         const bool enforceQuota = false;
-        StatusWith<RecordId> res = collection->insertDocument(&_txn, obj, enforceQuota);
-        ASSERT(res.isOK());
-
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT_OK(collection->insertDocument(&_txn, obj, nullOpDebug, enforceQuota));
         wuow.commit();
     }
 
 protected:
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     WorkingSet _ws;
 };
 
@@ -113,7 +116,8 @@ public:
         ASSERT(collection);
 
         // Query can be answered by either index on "a" or index on "b".
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss, fromjson("{a: {$gte: 8}, b: 1}"));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            nss, fromjson("{a: {$gte: 8}, b: 1}"), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -177,7 +181,8 @@ public:
         ASSERT(collection);
 
         // Query can be answered by either index on "a" or index on "b".
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss, fromjson("{a: {$gte: 8}, b: 1}"));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            nss, fromjson("{a: {$gte: 8}, b: 1}"), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 

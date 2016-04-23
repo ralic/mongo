@@ -5,11 +5,8 @@
 import itertools
 import os
 import re
-import subprocess
 import sys
 from buildscripts import utils
-
-import SCons.Action
 
 Import("env")
 Import("has_option")
@@ -80,14 +77,15 @@ baseSource=[
     'logger/log_component.cpp',
     'logger/log_component_settings.cpp',
     'logger/log_manager.cpp',
-    'logger/logger.cpp',
     'logger/log_severity.cpp',
+    'logger/logger.cpp',
     'logger/logstream_builder.cpp',
     'logger/message_event_utf8_encoder.cpp',
     'logger/message_log_domain.cpp',
     'logger/ramlog.cpp',
     'logger/rotatable_file_manager.cpp',
     'logger/rotatable_file_writer.cpp',
+    'platform/decimal128.cpp',
     'platform/random.cpp',
     'platform/strnlen.cpp',
     'util/allocator.cpp',
@@ -95,11 +93,13 @@ baseSource=[
     'util/base64.cpp',
     'util/concurrency/thread_name.cpp',
     'util/exception_filter_win32.cpp',
+    'util/exit.cpp',
     'util/hex.cpp',
+    'util/itoa.cpp',
     'util/log.cpp',
     'util/signal_handlers_synchronous.cpp',
-    'util/stacktrace_${TARGET_OS_FAMILY}.cpp',
     'util/stacktrace.cpp',
+    'util/stacktrace_${TARGET_OS_FAMILY}.cpp',
     'util/static_observer.cpp',
     'util/stringutils.cpp',
     'util/system_clock_source.cpp',
@@ -115,55 +115,16 @@ baseLibDeps=[
     '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
     '$BUILD_DIR/third_party/shim_boost',
     '$BUILD_DIR/third_party/shim_pcrecpp',
+    '$BUILD_DIR/third_party/shim_intel_decimal128',
     'util/debugger',
     'util/quick_exit',
 ]
-
-if GetOption('experimental-decimal-support') == 'on':
-    baseSource.append('platform/decimal128.cpp')
-    baseLibDeps.append('$BUILD_DIR/third_party/shim_intel_decimal128')
-else:
-    baseSource.append('platform/decimal128_dummy.cpp')
 
 env.Library(
     target='base',
     source=baseSource,
     LIBDEPS=baseLibDeps,
 )
-
-def get_toolchain_ver(tool):
-    # By default we don't know the version of each tool, and only report what
-    # command gets executed (gcc vs /opt/mongodbtoolchain/bin/gcc).
-    verstr = "version unknown"
-    proc = None
-    if env.ToolchainIs('clang', 'gcc'):
-        proc = SCons.Action._subproc(env,
-            env.subst("${%s} --version" % tool),
-            stdout=subprocess.PIPE,
-            stderr='devnull',
-            stdin='devnull',
-            universal_newlines=True,
-            error='raise',
-            shell=True)
-        verstr = proc.stdout.readline()
-
-    elif env.ToolchainIs('msvc') and env.TargetOSIs('windows'):
-        proc = SCons.Action._subproc(env,
-            env.subst("${%s}" % tool),
-            stdout='devnull',
-            stderr=subprocess.PIPE,
-            stdin='devnull',
-            universal_newlines=True,
-            error='raise',
-            shell=True)
-        verstr = proc.stderr.readline()
-
-    # If we started a process, we should drain its stdout/stderr and wait for
-    # it to end.
-    if proc:
-        proc.communicate()
-
-    return env.subst('${%s}: %s' % (tool, verstr))
 
 js_engine_ver = get_option("js-engine") if get_option("server-js") == "on" else "none"
 
@@ -198,10 +159,31 @@ version_extra = version_parts[3] if version_parts[3] else ""
 if version_parts[4] == 'rc':
     version_parts[3] = int(version_parts[5]) + -50
 elif version_parts[3]:
+    version_parts[2] = int(version_parts[2]) + 1
     version_parts[3] = -100
 else:
     version_parts[3] = 0
 version_parts = [ int(x) for x in version_parts[:4]]
+
+# This turns the MONGO_BUILDINFO_ENVIRONMENT_DATA tuples into a std::vector of
+# std::tuple<string, string, bool, bool>.
+buildInfoInitializer = []
+for tup in env['MONGO_BUILDINFO_ENVIRONMENT_DATA']:
+    def pyToCXXBool(val):
+        return "true" if val else "false"
+    def wrapInQuotes(val):
+        return '"{0}"'.format(val)
+    buildInfoInitializer.append(
+        'std::make_tuple({0})'.format(', '.join(
+            (
+                wrapInQuotes(tup[0]),
+                wrapInQuotes(env.subst(tup[1])),
+                pyToCXXBool(tup[2]),
+                pyToCXXBool(tup[3]),
+            )
+        ))
+    )
+buildInfoInitializer = '{{ {0} }}'.format(', '.join(buildInfoInitializer))
 
 generatedVersionFile = env.Substfile(
     'util/version.cpp.in',
@@ -214,24 +196,15 @@ generatedVersionFile = env.Substfile(
         ('@mongo_version_extra_str@', version_extra),
         ('@mongo_git_hash@', env['MONGO_GIT_HASH']),
         ('@buildinfo_js_engine@', js_engine_ver),
-        ('@buildinfo_allocator@', GetOption('allocator')),
-        ('@buildinfo_ccflags@', env['CCFLAGS']),
-        ('@buildinfo_cflags@', env['CFLAGS']),
-        ('@buildinfo_cxxflags@', env['CXXFLAGS']),
-        ('@buildinfo_linkflags@', env['LINKFLAGS']),
-        ('@buildinfo_cmdline@', ''),
+        ('@buildinfo_allocator@', env['MONGO_ALLOCATOR']),
         ('@buildinfo_modules@', module_list),
-        ('@buildinfo_target_arch@', env['TARGET_ARCH']),
-        ('@buildinfo_target_os@', env.GetTargetOSName()),
-        ('@buildinfo_cc_version@', get_toolchain_ver('CC')),
-        ('@buildinfo_cxx_version@', get_toolchain_ver('CXX')),
+        ('@buildinfo_environment_data@', buildInfoInitializer),
     ])
 env.Alias('generated-sources', generatedVersionFile)
 
 config_header_substs = (
     ('@mongo_config_byte_order@', 'MONGO_CONFIG_BYTE_ORDER'),
     ('@mongo_config_debug_build@', 'MONGO_CONFIG_DEBUG_BUILD'),
-    ('@mongo_config_experimental_decimal_support@', 'MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT'),
     ('@mongo_config_have_thread_local@', 'MONGO_CONFIG_HAVE_THREAD_LOCAL'),
     ('@mongo_config_have___declspec_thread@', 'MONGO_CONFIG_HAVE___DECLSPEC_THREAD'),
     ('@mongo_config_have___thread@', 'MONGO_CONFIG_HAVE___THREAD'),
@@ -241,7 +214,9 @@ config_header_substs = (
     ('@mongo_config_have_memset_s@', 'MONGO_CONFIG_HAVE_MEMSET_S'),
     ('@mongo_config_have_posix_monotonic_clock@', 'MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK'),
     ('@mongo_config_have_std_is_trivially_copyable@', 'MONGO_CONFIG_HAVE_STD_IS_TRIVIALLY_COPYABLE'),
+    ('@mongo_config_have_std_enable_if_t@', 'MONGO_CONFIG_HAVE_STD_ENABLE_IF_T'),
     ('@mongo_config_have_std_make_unique@', 'MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE'),
+    ('@mongo_config_have_std_align@', 'MONGO_CONFIG_HAVE_STD_ALIGN'),
     ('@mongo_config_have_strnlen@', 'MONGO_CONFIG_HAVE_STRNLEN'),
     ('@mongo_config_optimized_build@', 'MONGO_CONFIG_OPTIMIZED_BUILD'),
     ('@mongo_config_ssl@', 'MONGO_CONFIG_SSL'),
@@ -261,24 +236,30 @@ generateConfigHeaderFile = env.Substfile(
 )
 env.Alias('generated-sources', generateConfigHeaderFile)
 
+mongodLibDeps = [
+    "db/commands/core",
+    "db/conn_pool_options",
+    "db/mongod_options",
+    "db/mongodandmongos",
+    "db/mongodwebserver",
+    "db/serveronly",
+    "db/repl/storage_interface_impl",
+    "executor/network_interface_factory",
+    's/commands/shared_cluster_commands',
+    "util/clock_sources",
+    "util/ntservice",
+]
+
+if has_option('use-cpu-profiler'):
+    mongodLibDeps.append('db/cpuprofiler')
+
 mongod = env.Program(
     target="mongod",
     source=[
         "db/db.cpp",
         "db/mongod_options_init.cpp",
     ],
-    LIBDEPS=[
-        "db/coredb",
-        "db/conn_pool_options",
-        "db/mongod_options",
-        "db/mongodandmongos",
-        "db/mongodwebserver",
-        "db/serveronly",
-        "db/repl/storage_interface_impl",
-        "executor/network_interface_factory",
-        's/commands/shared_cluster_commands',
-        "util/ntservice",
-    ],
+    LIBDEPS=mongodLibDeps,
 )
 
 env.Default(env.Install('#/', mongod))
@@ -295,7 +276,6 @@ env.Install(
                         "client/examples/mongoperf.cpp",
                     ],
                     LIBDEPS=[
-                        "db/coredb",
                         "db/serveronly",
                         "util/ntservice_mock",
                     ]),
@@ -305,17 +285,18 @@ env.Install(
 env.Install(
     '#/',
     env.Program(
-        "mongos",
-        [
-            "s/server.cpp",
-            "s/mongos_options.cpp",
-            "s/mongos_options_init.cpp",
+        target='mongos',
+        source=[
+            's/client/sharding_connection_hook_for_mongos.cpp',
+            's/mongos_options_init.cpp',
+            's/server.cpp',
         ],
         LIBDEPS=[
             'db/conn_pool_options',
-            'db/coredb',
+            'db/commands/core',
             'db/mongodandmongos',
             's/client/sharding_connection_hook',
+            's/cluster_ops_impl',
             's/commands/cluster_commands',
             's/commands/shared_cluster_commands',
             's/coreshard',
@@ -345,7 +326,6 @@ if env.TargetOSIs('osx') or env["_HAVEPCAP"]:
     sniffEnv.Install( '#/', sniffEnv.Program( "mongosniff", "tools/sniffer.cpp",
                                               LIBDEPS = [
                                                  "db/serveronly",
-                                                 "db/coredb",
                                               ] ) )
 
 # --- shell ---
@@ -361,39 +341,28 @@ if not has_option('noshell') and usemozjs:
                     "shell/linenoise.cpp",
                     "shell/mk_wcwidth.cpp",
                     "shell/mongo-server.cpp",
+                    "shell/shell_options.cpp",
+                    "shell/shell_options_init.cpp",
                     "shell/shell_utils.cpp",
                     "shell/shell_utils_extended.cpp",
                     "shell/shell_utils_launcher.cpp",
-                    "shell/shell_options_init.cpp"
                 ],
                 LIBDEPS=[
-                    'db/index/external_key_generator',
                     'db/catalog/index_key_validate',
+                    'db/index/external_key_generator',
+                    'db/query/command_request_response',
+                    'db/query/lite_parsed_query',
+                    'db/server_options_core',
+                    'linenoise_utf8',
+                    'rpc/protocol',
                     'scripting/scripting',
+                    'shell/mongojs',
+                    'util/net/network',
+                    'util/options_parser/options_parser_init',
                     'util/processinfo',
                     'util/signal_handlers',
-                    'linenoise_utf8',
-                    'shell/mongojs',
-                ],
-                LIBDEPS_TAGS=[
-                    # Circular with shell_options below. It is unclear
-                    # why this is split into two libraries, or even
-                    # why these libraries exist at all, since it seems
-                    # that the only thing that links them is the shell
-                    # itself.
-                    'incomplete',
                 ],
     )
-
-    # mongo shell options
-    shell_core_env.Library("shell_options", ["shell/shell_options.cpp"],
-                LIBDEPS=[
-                    '$BUILD_DIR/mongo/db/server_options_core',
-                    '$BUILD_DIR/mongo/rpc/protocol',
-                    '$BUILD_DIR/mongo/util/net/network',
-                    '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
-                    'shell_core',
-                ])
 
     shellEnv = env.Clone()
     if env.TargetOSIs('windows'):
@@ -403,7 +372,6 @@ if not has_option('noshell') and usemozjs:
         "mongo",
         "shell/dbshell.cpp",
         LIBDEPS=["$BUILD_DIR/third_party/shim_pcrecpp",
-                 "shell_options",
                  "shell_core",
                  "db/server_options_core",
                  "client/clientdriver",
@@ -538,6 +506,9 @@ for full_dir, archive_dir in env["ARCHIVE_ADDITION_DIR_MAP"].items():
   archive_addition_transforms.append("--transform \"%s=$SERVER_DIST_BASENAME/%s\"" %
                                      (full_dir, archive_dir))
 
+for target in env["DIST_BINARIES"]:
+    installBinary(env, "db/modules/" + target)
+
 # "dist" target is valid only when --use-new-tools is specified
 # Attempts to build release artifacts without tools must fail
 if has_option("use-new-tools"):
@@ -549,6 +520,8 @@ if has_option("use-new-tools"):
             archive_addition_transforms +
             module_banner_transforms +
             [
+                '--transform $BUILD_DIR/mongo/db/modules/enterprise=$SERVER_DIST_BASENAME/bin',
+                '--transform $BUILD_DIR/mongo/stripped/db/modules/enterprise=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo/stripped=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME/bin',
                 '--transform $BUILD_DIR/mongo/stripped/src/mongo-tools=$SERVER_DIST_BASENAME/bin',
@@ -569,7 +542,14 @@ else:
 debug_symbols_dist = env.Command(
     target='#/${SERVER_DIST_BASENAME}-debugsymbols${DIST_ARCHIVE_SUFFIX}',
     source=['#buildscripts/make_archive.py'] + distDebugSymbols,
-    action='$PYTHON ${SOURCES[0]} -o $TARGET --transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME ${TEMPFILE(SOURCES[1:])}',
+    action=' '.join(
+        [
+            '$PYTHON ${SOURCES[0]} -o $TARGET',
+            '--transform $BUILD_DIR/mongo/db/modules/enterprise=$SERVER_DIST_BASENAME',
+            '--transform $BUILD_DIR/mongo=$SERVER_DIST_BASENAME',
+            '${TEMPFILE(SOURCES[1:])}',
+        ]
+    ),
     BUILD_DIR=env.Dir('$BUILD_DIR').path
 )
 env.Alias('dist-debugsymbols', debug_symbols_dist)

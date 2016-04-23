@@ -39,6 +39,7 @@
 #include "mongo/platform/compiler.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -188,6 +189,7 @@ void LockerImpl<IsForMMAPV1>::assertEmptyAndReset() {
     invariant(!inAWriteUnitOfWork());
     invariant(_resourcesToUnlockAtEndOfUnitOfWork.empty());
     invariant(_requests.empty());
+    invariant(_modeForTicket == MODE_NONE);
 
     // Reset the locking statistics so the object can be reused
     _stats.reset();
@@ -243,17 +245,25 @@ void CondVarLockGrantNotification::notify(ResourceId resId, LockResult result) {
     _cond.notify_all();
 }
 
+namespace {
+TicketHolder* ticketHolders[LockModesCount] = {};
+}  // namespace
+
 
 //
 // Locker
 //
 
+/* static */
+void Locker::setGlobalThrottling(class TicketHolder* reading, class TicketHolder* writing) {
+    ticketHolders[MODE_S] = reading;
+    ticketHolders[MODE_IS] = reading;
+    ticketHolders[MODE_IX] = writing;
+}
+
 template <bool IsForMMAPV1>
 LockerImpl<IsForMMAPV1>::LockerImpl()
-    : _id(idCounter.addAndFetch(1)),
-      _requestStartTime(0),
-      _wuowNestingLevel(0),
-      _batchWriter(false) {}
+    : _id(idCounter.addAndFetch(1)), _wuowNestingLevel(0), _batchWriter(false) {}
 
 template <bool IsForMMAPV1>
 LockerImpl<IsForMMAPV1>::~LockerImpl() {
@@ -261,6 +271,17 @@ LockerImpl<IsForMMAPV1>::~LockerImpl() {
     // LockManager may attempt to access deleted memory. Besides it is probably incorrect
     // to delete with unaccounted locks anyways.
     assertEmptyAndReset();
+}
+
+template <bool IsForMMAPV1>
+Locker::ClientState LockerImpl<IsForMMAPV1>::getClientState() const {
+    auto state = _clientState.load();
+    if (state == kActiveReader && hasLockPending())
+        state = kQueuedReader;
+    if (state == kActiveWriter && hasLockPending())
+        state = kQueuedWriter;
+
+    return state;
 }
 
 template <bool IsForMMAPV1>
@@ -279,6 +300,17 @@ LockResult LockerImpl<IsForMMAPV1>::lockGlobal(LockMode mode, unsigned timeoutMs
 
 template <bool IsForMMAPV1>
 LockResult LockerImpl<IsForMMAPV1>::lockGlobalBegin(LockMode mode) {
+    dassert(isLocked() == (_modeForTicket != MODE_NONE));
+    if (_modeForTicket == MODE_NONE) {
+        const bool reader = isSharedLockMode(mode);
+        auto holder = ticketHolders[mode];
+        if (holder) {
+            _clientState.store(reader ? kQueuedReader : kQueuedWriter);
+            holder->waitForTicket();
+        }
+        _clientState.store(reader ? kActiveReader : kActiveWriter);
+        _modeForTicket = mode;
+    }
     const LockResult result = lockBegin(resourceIdGlobal, mode);
     if (result == LOCK_OK)
         return LOCK_OK;
@@ -318,6 +350,10 @@ void LockerImpl<IsForMMAPV1>::downgradeGlobalXtoSForMMAPV1() {
     LockRequest* globalLockRequest = _requests.find(resourceIdGlobal).objAddr();
     invariant(globalLockRequest->mode == MODE_X);
     invariant(globalLockRequest->recursiveCount == 1);
+    invariant(_modeForTicket == MODE_X);
+    // Note that this locker will not actually have a ticket (as MODE_X has no TicketHolder) or
+    // acquire one now, but at most a single thread can be in this downgraded MODE_S situation,
+    // so it's OK.
 
     // Making this call here will record lock downgrades as acquisitions, which is acceptable
     globalStats.recordAcquisition(_id, resourceIdGlobal, MODE_S);
@@ -331,10 +367,12 @@ void LockerImpl<IsForMMAPV1>::downgradeGlobalXtoSForMMAPV1() {
 }
 
 template <bool IsForMMAPV1>
-bool LockerImpl<IsForMMAPV1>::unlockAll() {
+bool LockerImpl<IsForMMAPV1>::unlockGlobal() {
     if (!unlock(resourceIdGlobal)) {
         return false;
     }
+
+    invariant(!inAWriteUnitOfWork());
 
     LockRequestsMap::Iterator it = _requests.begin();
     while (!it.finished()) {
@@ -344,7 +382,7 @@ bool LockerImpl<IsForMMAPV1>::unlockAll() {
         if (it.key().getType() == RESOURCE_GLOBAL) {
             it.next();
         } else {
-            invariant(_unlockImpl(it));
+            invariant(_unlockImpl(&it));
         }
     }
 
@@ -408,7 +446,12 @@ void LockerImpl<IsForMMAPV1>::downgrade(ResourceId resId, LockMode newMode) {
 template <bool IsForMMAPV1>
 bool LockerImpl<IsForMMAPV1>::unlock(ResourceId resId) {
     LockRequestsMap::Iterator it = _requests.find(resId);
-    return _unlockImpl(it);
+    if (inAWriteUnitOfWork() && shouldDelayUnlock(it.key(), (it->mode))) {
+        _resourcesToUnlockAtEndOfUnitOfWork.push(it.key());
+        return false;
+    }
+
+    return _unlockImpl(&it);
 }
 
 template <bool IsForMMAPV1>
@@ -564,6 +607,7 @@ bool LockerImpl<IsForMMAPV1>::saveLockStateAndUnlock(Locker::LockSnapshot* state
 
         invariant(unlock(resId));
     }
+    invariant(!isLocked());
 
     // Sort locks by ResourceId. They'll later be acquired in this canonical locking order.
     std::sort(stateOut->locks.begin(), stateOut->locks.end());
@@ -575,6 +619,7 @@ template <bool IsForMMAPV1>
 void LockerImpl<IsForMMAPV1>::restoreLockState(const Locker::LockSnapshot& state) {
     // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork.
     invariant(!inAWriteUnitOfWork());
+    invariant(_modeForTicket == MODE_NONE);
 
     std::vector<OneLock>::const_iterator it = state.locks.begin();
     // If we locked the PBWM, it must be locked before the resourceIdGlobal resource.
@@ -593,6 +638,7 @@ void LockerImpl<IsForMMAPV1>::restoreLockState(const Locker::LockSnapshot& state
             invariant(LOCK_OK == lock(it->resourceId, it->mode));
         }
     }
+    invariant(_modeForTicket != MODE_NONE);
 }
 
 template <bool IsForMMAPV1>
@@ -648,8 +694,6 @@ LockResult LockerImpl<IsForMMAPV1>::lockBegin(ResourceId resId, LockMode mode) {
                               : globalLockManager.convert(resId, request, mode);
 
     if (result == LOCK_WAITING) {
-        // Start counting the wait time so that lockComplete can update that metric
-        _requestStartTime = curTimeMicros64();
         globalStats.recordWait(_id, resId, mode);
         _stats.recordWait(resId, mode);
     }
@@ -676,13 +720,19 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
     // Don't go sleeping without bound in order to be able to report long waits or wake up for
     // deadlock detection.
     unsigned waitTimeMs = std::min(timeoutMs, DeadlockTimeoutMs);
+    const uint64_t startOfTotalWaitTime = curTimeMicros64();
+    uint64_t startOfCurrentWaitTime = startOfTotalWaitTime;
+
     while (true) {
         // It is OK if this call wakes up spuriously, because we re-evaluate the remaining
         // wait time anyways.
         result = _notify.wait(waitTimeMs);
 
         // Account for the time spent waiting on the notification object
-        const uint64_t elapsedTimeMicros = curTimeMicros64() - _requestStartTime;
+        const uint64_t curTimeMicros = curTimeMicros64();
+        const uint64_t elapsedTimeMicros = curTimeMicros - startOfCurrentWaitTime;
+        startOfCurrentWaitTime = curTimeMicros;
+
         globalStats.recordWaitTime(_id, resId, mode, elapsedTimeMicros);
         _stats.recordWaitTime(resId, mode, elapsedTimeMicros);
 
@@ -707,9 +757,9 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
             continue;
         }
 
-        const unsigned elapsedTimeMs = elapsedTimeMicros / 1000;
-        waitTimeMs = (elapsedTimeMs < timeoutMs)
-            ? std::min(timeoutMs - elapsedTimeMs, DeadlockTimeoutMs)
+        const unsigned totalBlockTimeMs = (curTimeMicros - startOfTotalWaitTime) / 1000;
+        waitTimeMs = (totalBlockTimeMs < timeoutMs)
+            ? std::min(timeoutMs - totalBlockTimeMs, DeadlockTimeoutMs)
             : 0;
 
         if (waitTimeMs == 0) {
@@ -720,10 +770,7 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
     // Cleanup the state, since this is an unused lock now
     if (result != LOCK_OK) {
         LockRequestsMap::Iterator it = _requests.find(resId);
-        if (globalLockManager.unlock(it.objAddr())) {
-            scoped_spinlock scopedLock(_lock);
-            it.remove();
-        }
+        _unlockImpl(&it);
     }
 
     if (yieldFlushLock) {
@@ -736,15 +783,20 @@ LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
 }
 
 template <bool IsForMMAPV1>
-bool LockerImpl<IsForMMAPV1>::_unlockImpl(LockRequestsMap::Iterator& it) {
-    if (inAWriteUnitOfWork() && shouldDelayUnlock(it.key(), it->mode)) {
-        _resourcesToUnlockAtEndOfUnitOfWork.push(it.key());
-        return false;
-    }
+bool LockerImpl<IsForMMAPV1>::_unlockImpl(LockRequestsMap::Iterator* it) {
+    if (globalLockManager.unlock(it->objAddr())) {
+        if (it->key() == resourceIdGlobal) {
+            invariant(_modeForTicket != MODE_NONE);
+            auto holder = ticketHolders[_modeForTicket];
+            _modeForTicket = MODE_NONE;
+            if (holder) {
+                holder->release();
+            }
+            _clientState.store(kInactive);
+        }
 
-    if (globalLockManager.unlock(it.objAddr())) {
         scoped_spinlock scopedLock(_lock);
-        it.remove();
+        it->remove();
 
         return true;
     }
@@ -768,24 +820,6 @@ LockMode LockerImpl<IsForMMAPV1>::_getModeForMMAPV1FlushLock() const {
             invariant(false);
             return MODE_NONE;
     }
-}
-
-template <bool IsForMMAPV1>
-bool LockerImpl<IsForMMAPV1>::hasStrongLocks() const {
-    if (!isLocked())
-        return false;
-
-    stdx::lock_guard<SpinLock> lk(_lock);
-    LockRequestsMap::ConstIterator it = _requests.begin();
-    while (!it.finished()) {
-        if (it->mode == MODE_X || it->mode == MODE_S) {
-            return true;
-        }
-
-        it.next();
-    }
-
-    return false;
 }
 
 

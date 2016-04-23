@@ -1,11 +1,12 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
 
+#define	WT_PTRDIFFT_FMT	"td"			/* ptrdiff_t format string */
 #define	WT_SIZET_FMT	"zu"			/* size_t format string */
 
 #define	WT_COMPILER_TYPE_ALIGN(x)
@@ -49,14 +50,14 @@ __wt_atomic_sub##name(type *vp, type v)					\
 	*vp -= v;							\
 	return (*vp);							\
 }									\
-static inline int							\
+static inline bool							\
 __wt_atomic_cas##name(type *vp, type old, type new)			\
 {									\
 	if (*vp == old) {						\
 		*vp = new;						\
-		return (1);						\
+		return (true);						\
 	}								\
-	return (0);							\
+	return (false);							\
 }
 
 WT_ATOMIC_FUNC(8, uint8_t, uint8_t)
@@ -75,13 +76,13 @@ WT_ATOMIC_FUNC(size, size_t, size_t)
  * __wt_atomic_cas_ptr --
  *	Pointer compare and swap.
  */
-static inline int
+static inline bool
 __wt_atomic_cas_ptr(void *vp, void *old, void *new) {
 	if (*(void **)vp == old) {
 		*(void **)vp = new;
-		return (1);
+		return (true);
 	}
-	return (0);
+	return (false);
 }
 
 static inline void WT_BARRIER(void) { return; }

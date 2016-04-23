@@ -111,7 +111,7 @@ public:
     }
 
 private:
-    static const size_t maxLogLineSize = 16 * 1000;
+    static const size_t maxLogLineSize = 100 * 1000;
     char _buffer[maxLogLineSize];
 };
 
@@ -167,8 +167,10 @@ int MallocFreeOStreamGuard::terminateDepth = 0;
 
 // must hold MallocFreeOStreamGuard to call
 void writeMallocFreeStreamToLog() {
-    logger::globalLogDomain()->append(logger::MessageEventEphemeral(
-        Date_t::now(), logger::LogSeverity::Severe(), getThreadName(), mallocFreeOStream.str()));
+    logger::globalLogDomain()->append(
+        logger::MessageEventEphemeral(
+            Date_t::now(), logger::LogSeverity::Severe(), getThreadName(), mallocFreeOStream.str())
+            .setIsTruncatable(false));
     mallocFreeOStream.rewind();
 }
 
@@ -343,5 +345,14 @@ void reportOutOfMemoryErrorAndExit() {
     printStackTrace(mallocFreeOStream << "out of memory.\n");
     writeMallocFreeStreamToLog();
     quickExit(EXIT_ABRUPT);
+}
+
+void clearSignalMask() {
+#ifndef _WIN32
+    // We need to make sure that all signals are unmasked so signals are handled correctly
+    sigset_t unblockSignalMask;
+    invariant(sigemptyset(&unblockSignalMask) == 0);
+    invariant(sigprocmask(SIG_SETMASK, &unblockSignalMask, nullptr) == 0);
+#endif
 }
 }  // namespace mongo

@@ -52,10 +52,14 @@ public:
 
     ReplicationCoordinatorExternalStateMock();
     virtual ~ReplicationCoordinatorExternalStateMock();
-    void startThreads(executor::TaskExecutor* taskExecutor) override;
+    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startInitialSync(OnInitialSyncFinishedFn finished) override;
+    virtual void startSteadyStateReplication() override;
     virtual void startMasterSlave(OperationContext*);
     virtual void shutdown();
-    virtual void initiateOplog(OperationContext* txn, bool updateReplOpTime);
+    virtual Status initializeReplSetStorage(OperationContext* txn,
+                                            const BSONObj& config,
+                                            bool updateReplOpTime);
     virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext*);
@@ -67,16 +71,21 @@ public:
     virtual Status storeLocalLastVoteDocument(OperationContext* txn, const LastVote& lastVote);
     virtual void setGlobalTimestamp(const Timestamp& newTime);
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
+    virtual void cleanUpLastApplyBatch(OperationContext* txn);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* txn);
     virtual void clearShardingState();
+    virtual void recoverShardingState(OperationContext* txn);
     virtual void signalApplierToChooseNewSyncSource();
-    virtual OperationContext* createOperationContext(const std::string& threadName);
+    virtual void signalApplierToCancelFetcher();
     virtual void dropAllTempCollections(OperationContext* txn);
     virtual void dropAllSnapshots();
     virtual void updateCommittedSnapshot(SnapshotName newCommitPoint);
     virtual void forceSnapshotCreation();
     virtual bool snapshotsEnabled() const;
+    virtual void notifyOplogMetadataWaiters();
+    virtual double getElectionTimeoutOffsetLimitFraction() const;
+    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* txn) const;
 
     /**
      * Adds "host" to the list of hosts that this mock will match when responding to "isSelf"
@@ -128,6 +137,26 @@ public:
      */
     void setStoreLocalLastVoteDocumentToHang(bool hang);
 
+    /**
+     * Returns true if applier was signaled to cancel fetcher.
+     */
+    bool isApplierSignaledToCancelFetcher() const;
+
+    /**
+     * Returns true if startThreads() has been called.
+     */
+    bool threadsStarted() const;
+
+    /**
+     * Sets if the storage engine is configured to support ReadConcern::Majority (committed point).
+     */
+    void setIsReadCommittedEnabled(bool val);
+
+    /**
+     * Sets if we are taking snapshots for read concern majority use.
+     */
+    void setAreSnapshotsEnabled(bool val);
+
 private:
     StatusWith<BSONObj> _localRsConfigDocument;
     StatusWith<LastVote> _localRsLastVoteDocument;
@@ -144,8 +173,12 @@ private:
     stdx::condition_variable _shouldHangLastVoteCondVar;
     bool _storeLocalConfigDocumentShouldHang;
     bool _storeLocalLastVoteDocumentShouldHang;
+    bool _isApplierSignaledToCancelFetcher;
     bool _connectionsClosed;
     HostAndPort _clientHostAndPort;
+    bool _threadsStarted;
+    bool _isReadCommittedSupported = true;
+    bool _areSnapshotsEnabled = true;
 };
 
 }  // namespace repl

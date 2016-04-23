@@ -29,17 +29,21 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "mongo/db/repl/optime.h"
 #include "mongo/s/chunk.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/concurrency/ticketholder.h"
 
 namespace mongo {
 
 class CanonicalQuery;
+class Chunk;
 class ChunkManager;
 class CollectionType;
 struct QuerySolutionNode;
@@ -89,7 +93,6 @@ private:
 };
 
 typedef std::map<BSONObj, std::shared_ptr<ChunkRange>, BSONObjCmp> ChunkRangeMap;
-
 
 class ChunkRangeManager {
 public:
@@ -161,10 +164,10 @@ public:
     //
 
     // Creates new chunks based on info in chunk manager
-    void createFirstChunks(OperationContext* txn,
-                           const ShardId& primaryShardId,
-                           const std::vector<BSONObj>* initPoints,
-                           const std::set<ShardId>* initShardIds);
+    Status createFirstChunks(OperationContext* txn,
+                             const ShardId& primaryShardId,
+                             const std::vector<BSONObj>* initPoints,
+                             const std::set<ShardId>* initShardIds);
 
     // Loads existing ranges based on info in chunk manager
     void loadExistingRanges(OperationContext* txn, const ChunkManager* oldManager);
@@ -194,10 +197,15 @@ public:
      * when the shard key is {a : "hashed"}, you can call
      *  findIntersectingChunk() on {a : hash("foo") }
      */
-    ChunkPtr findIntersectingChunk(OperationContext* txn, const BSONObj& shardKey) const;
+    std::shared_ptr<Chunk> findIntersectingChunk(OperationContext* txn,
+                                                 const BSONObj& shardKey) const;
 
-    void getShardIdsForQuery(std::set<ShardId>& shardIds, const BSONObj& query) const;
+    void getShardIdsForQuery(OperationContext* txn,
+                             const BSONObj& query,
+                             std::set<ShardId>* shardIds) const;
+
     void getAllShardIds(std::set<ShardId>* all) const;
+
     /** @param shardIds set to the shard ids for shards
      *         covered by the interval [min, max], see SERVER-4791
      */
@@ -240,7 +248,7 @@ public:
 
     void _printChunks() const;
 
-    int getCurrentDesiredChunkSize() const;
+    uint64_t getCurrentDesiredChunkSize() const;
 
     std::shared_ptr<ChunkManager> reload(OperationContext* txn,
                                          bool force = true) const;  // doesn't modify self!

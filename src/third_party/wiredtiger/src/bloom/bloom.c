@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -130,8 +130,8 @@ __bloom_open_cursor(WT_BLOOM *bloom, WT_CURSOR *owner)
 	c = NULL;
 	WT_RET(__wt_open_cursor(session, bloom->uri, owner, cfg, &c));
 
-	/* XXX Layering violation: bump the cache priority for Bloom filters. */
-	((WT_CURSOR_BTREE *)c)->btree->evict_priority = WT_EVICT_INT_SKEW;
+	/* Bump the cache priority for Bloom filters. */
+	__wt_evict_priority_set(session, WT_EVICT_INT_SKEW);
 
 	bloom->c = c;
 	return (0);
@@ -311,6 +311,47 @@ __wt_bloom_get(WT_BLOOM *bloom, WT_ITEM *key)
 
 	WT_RET(__wt_bloom_hash(bloom, key, &bhash));
 	return (__wt_bloom_hash_get(bloom, &bhash));
+}
+
+/*
+ * __wt_bloom_inmem_get --
+ *	Tests whether the given key is in the Bloom filter.
+ *	This can be used in place of __wt_bloom_get
+ *	for Bloom filters that are memory only.
+ */
+int
+__wt_bloom_inmem_get(WT_BLOOM *bloom, WT_ITEM *key)
+{
+	uint64_t h1, h2;
+	uint32_t i;
+
+	h1 = __wt_hash_fnv64(key->data, key->size);
+	h2 = __wt_hash_city64(key->data, key->size);
+	for (i = 0; i < bloom->k; i++, h1 += h2) {
+		if (!__bit_test(bloom->bitstring, h1 % bloom->m))
+			return (WT_NOTFOUND);
+	}
+	return (0);
+}
+
+/*
+ * __wt_bloom_intersection --
+ *	Modify the Bloom filter to contain the intersection of this
+ *	filter with another.
+ */
+int
+__wt_bloom_intersection(WT_BLOOM *bloom, WT_BLOOM *other)
+{
+	uint64_t i, nbytes;
+
+	if (bloom->k != other->k || bloom->factor != other->factor ||
+	    bloom->m != other->m || bloom->n != other->n)
+		return (EINVAL);
+
+	nbytes = __bitstr_size(bloom->m);
+	for (i = 0; i < nbytes; i++)
+		bloom->bitstring[i] &= other->bitstring[i];
+	return (0);
 }
 
 /*

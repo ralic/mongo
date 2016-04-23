@@ -256,7 +256,7 @@ DiskLoc RecordStoreV1Base::_findFirstSpot(OperationContext* txn,
     DiskLoc emptyLoc = extDiskLoc;
     emptyLoc.inc(Extent::HeaderSize());
     int delRecLength = e->length - Extent::HeaderSize();
-    if (delRecLength >= 32 * 1024 && _ns.find('$') != string::npos && !isCapped()) {
+    if (delRecLength >= 32 * 1024 && NamespaceString::virtualized(_ns) && !isCapped()) {
         // probably an index. so skip forward to keep its records page aligned
         int& ofs = emptyLoc.GETOFS();
         int newOfs = (ofs + 0xfff) & ~0xfff;
@@ -367,50 +367,30 @@ StatusWith<RecordId> RecordStoreV1Base::_insertRecord(OperationContext* txn,
     return StatusWith<RecordId>(loc.getValue().toRecordId());
 }
 
-StatusWith<RecordId> RecordStoreV1Base::updateRecord(OperationContext* txn,
-                                                     const RecordId& oldLocation,
-                                                     const char* data,
-                                                     int dataSize,
-                                                     bool enforceQuota,
-                                                     UpdateNotifier* notifier) {
+Status RecordStoreV1Base::updateRecord(OperationContext* txn,
+                                       const RecordId& oldLocation,
+                                       const char* data,
+                                       int dataSize,
+                                       bool enforceQuota,
+                                       UpdateNotifier* notifier) {
     MmapV1RecordHeader* oldRecord = recordFor(DiskLoc::fromRecordId(oldLocation));
     if (oldRecord->netLength() >= dataSize) {
         // Make sure to notify other queries before we do an in-place update.
         if (notifier) {
             Status callbackStatus = notifier->recordStoreGoingToUpdateInPlace(txn, oldLocation);
             if (!callbackStatus.isOK())
-                return StatusWith<RecordId>(callbackStatus);
+                return callbackStatus;
         }
 
         // we fit
         memcpy(txn->recoveryUnit()->writingPtr(oldRecord->data(), dataSize), data, dataSize);
-        return StatusWith<RecordId>(oldLocation);
+        return Status::OK();
     }
 
-    if (isCapped())
-        return StatusWith<RecordId>(
-            ErrorCodes::InternalError, "failing update: objects in a capped ns cannot grow", 10003);
+    // We enforce the restriction of unchanging capped doc sizes above the storage layer.
+    invariant(!isCapped());
 
-    // we have to move
-    if (dataSize + MmapV1RecordHeader::HeaderSize > MaxAllowedAllocation) {
-        return StatusWith<RecordId>(ErrorCodes::InvalidLength, "record has to be <= 16.5MB");
-    }
-
-    StatusWith<RecordId> newLocation = _insertRecord(txn, data, dataSize, enforceQuota);
-    if (!newLocation.isOK())
-        return newLocation;
-
-    // insert worked, so we delete old record
-    if (notifier) {
-        Status moveStatus = notifier->recordStoreGoingToMove(
-            txn, oldLocation, oldRecord->data(), oldRecord->netLength());
-        if (!moveStatus.isOK())
-            return StatusWith<RecordId>(moveStatus);
-    }
-
-    deleteRecord(txn, oldLocation);
-
-    return newLocation;
+    return {ErrorCodes::NeedsDocumentMove, "Update requires document move"};
 }
 
 bool RecordStoreV1Base::updateWithDamagesSupported() const {
@@ -920,8 +900,13 @@ void RecordStoreV1Base::IntraExtentIterator::advance() {
     _curr = (nextOfs == DiskLoc::NullOfs ? DiskLoc() : DiskLoc(_curr.a(), nextOfs));
 }
 
-void RecordStoreV1Base::IntraExtentIterator::invalidate(const RecordId& rid) {
+void RecordStoreV1Base::IntraExtentIterator::invalidate(OperationContext* txn,
+                                                        const RecordId& rid) {
     if (rid == _curr.toRecordId()) {
+        const DiskLoc origLoc = _curr;
+
+        // Undo the advance on rollback, as the deletion that forced it "never happened".
+        txn->recoveryUnit()->onRollback([this, origLoc]() { this->_curr = origLoc; });
         advance();
     }
 }

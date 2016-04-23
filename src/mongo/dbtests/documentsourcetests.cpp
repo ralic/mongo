@@ -30,14 +30,17 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/dbtests/dbtests.h"
+
 namespace DocumentSourceCursorTests {
 
 using boost::intrusive_ptr;
@@ -64,7 +67,8 @@ public:
     }
 
 protected:
-    OperationContextImpl _opCtx;
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
     DBDirectClient client;
 };
 
@@ -85,7 +89,8 @@ protected:
         _exec.reset();
 
         OldClientWriteContext ctx(&_opCtx, nss.ns());
-        auto cq = uassertStatusOK(CanonicalQuery::canonicalize(nss, /*query=*/BSONObj()));
+        auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
+            nss, /*query=*/BSONObj(), ExtensionsCallbackDisallowExtensions()));
         _exec = uassertStatusOK(
             getExecutor(&_opCtx, ctx.getCollection(), std::move(cq), PlanExecutor::YIELD_MANUAL));
 
@@ -217,16 +222,25 @@ public:
         client.insert(nss.ns(), BSON("a" << 3));
         createSource();
 
+        Pipeline::SourceContainer container;
+        container.push_back(source());
+        container.push_back(mkLimit(10));
+        source()->optimizeAt(container.begin(), &container);
+
         // initial limit becomes limit of cursor
-        ASSERT(source()->coalesce(mkLimit(10)));
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(source()->getLimit(), 10);
 
+        container.push_back(mkLimit(2));
+        source()->optimizeAt(container.begin(), &container);
         // smaller limit lowers cursor limit
-        ASSERT(source()->coalesce(mkLimit(2)));
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(source()->getLimit(), 2);
 
+        container.push_back(mkLimit(3));
+        source()->optimizeAt(container.begin(), &container);
         // higher limit doesn't effect cursor limit
-        ASSERT(source()->coalesce(mkLimit(3)));
+        ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(source()->getLimit(), 2);
 
         // The cursor allows exactly 2 documents through

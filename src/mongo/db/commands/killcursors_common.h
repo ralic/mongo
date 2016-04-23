@@ -41,15 +41,12 @@ class KillCursorsCmdBase : public Command {
 public:
     KillCursorsCmdBase() : Command("killCursors") {}
 
-    bool isWriteCommandForConfigServer() const final {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
     bool slaveOk() const final {
-        return false;
-    }
-
-    bool slaveOverrideOk() const final {
         return true;
     }
 

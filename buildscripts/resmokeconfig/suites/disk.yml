@@ -14,12 +14,12 @@ executor:
             storageEngine: mmapv1
         readMode: commands
     hooks:
+    - class: ValidateCollections
     - class: CleanEveryN
       n: 20
     fixture:
       class: MongoDFixture
       mongod_options:
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1
         storageEngine: mmapv1

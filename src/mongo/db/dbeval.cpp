@@ -160,7 +160,7 @@ public:
              << "Evaluate javascript at the server.\n"
              << "http://dochub.mongodb.org/core/serversidecodeexecution";
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -184,7 +184,7 @@ public:
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite lk(txn->lockState());
 
-        OldClientContext ctx(txn, dbname);
+        OldClientContext ctx(txn, dbname, false /* no shard version checking */);
 
         return dbEval(txn, dbname, cmdObj, result, errmsg);
     }

@@ -10,7 +10,7 @@ assert.commandWorked(coll.getDB().runCommand({profile: 2}));
 
 var str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 var hugeStr = str;
-while (hugeStr.length < 2*1024*1024){
+while (hugeStr.length < 2 * 1024 * 1024) {
     hugeStr += str;
 }
 
@@ -21,10 +21,10 @@ assert.eq(1, results.length);
 var result = results[0];
 assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
-// TODO: re-enable assertions once SERVER-19566 is implemented.
-// assert(result.hasOwnProperty('query'));
-// assert.eq('string', typeof(result.query));
-// assert(result.query.match(/^{ a: "a+\.\.\." }$/)); // String value is truncated.
+assert(result.hasOwnProperty('query'));
+assert.eq('string', typeof(result.query));
+// String value is truncated.
+assert(result.query.match(/filter: { a: "a+\.\.\." } }$/));
 
 assert.commandWorked(coll.getDB().runCommand({profile: 0}));
 coll.getDB().system.profile.drop();
@@ -39,7 +39,7 @@ assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
 assert(result.hasOwnProperty('query'));
 assert.eq('string', typeof(result.query));
-assert(result.query.match(/^{ a: "a+\.\.\." }$/)); // String value is truncated.
+assert(result.query.match(/^{ a: "a+\.\.\." }$/));  // String value is truncated.
 
 assert.commandWorked(coll.getDB().runCommand({profile: 0}));
 coll.getDB().system.profile.drop();
@@ -54,7 +54,7 @@ assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
 assert(result.hasOwnProperty('updateobj'));
 assert.eq('string', typeof(result.updateobj));
-assert(result.updateobj.match(/^{ a: "a+\.\.\." }$/)); // String value is truncated.
+assert(result.updateobj.match(/^{ a: "a+\.\.\." }$/));  // String value is truncated.
 
 assert.commandWorked(coll.getDB().runCommand({profile: 0}));
 coll.getDB().system.profile.drop();
@@ -71,9 +71,9 @@ assert.eq(1, results.length);
 var result = results[0];
 assert(result.hasOwnProperty('ns'));
 assert(result.hasOwnProperty('millis'));
-// TODO: re-enable assertions once SERVER-19566 is implemented.
-// assert(result.hasOwnProperty('query'));
-// assert.eq('string', typeof(result.query));
-// assert(result.query.match(/^{ a0: 1\.0, a1: .*\.\.\.$/)); // Query object itself is truncated.
+assert(result.hasOwnProperty('query'));
+assert.eq('string', typeof(result.query));
+// Query object itself is truncated.
+assert(result.query.match(/filter: { a0: 1\.0, a1: .*\.\.\.$/));
 
 assert.commandWorked(coll.getDB().runCommand({profile: 0}));

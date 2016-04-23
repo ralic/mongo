@@ -98,10 +98,7 @@ bool MultiPlanStage::isEOF() {
     return bestPlan.results.empty() && bestPlan.root->isEOF();
 }
 
-PlanStage::StageState MultiPlanStage::work(WorkingSetID* out) {
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
     if (_failure) {
         *out = _statusMemberId;
         return PlanStage::FAILURE;
@@ -113,7 +110,6 @@ PlanStage::StageState MultiPlanStage::work(WorkingSetID* out) {
     if (!bestPlan.results.empty()) {
         *out = bestPlan.results.front();
         bestPlan.results.pop_front();
-        _commonStats.advanced++;
         return PlanStage::ADVANCED;
     }
 
@@ -142,15 +138,6 @@ PlanStage::StageState MultiPlanStage::work(WorkingSetID* out) {
     if (hasBackupPlan() && PlanStage::ADVANCED == state) {
         LOG(5) << "Best plan had a blocking stage, became unblocked\n";
         _backupPlanIdx = kNoSuchPlan;
-    }
-
-    // Increment stats.
-    if (PlanStage::ADVANCED == state) {
-        _commonStats.advanced++;
-    } else if (PlanStage::NEED_TIME == state) {
-        _commonStats.needTime++;
-    } else if (PlanStage::NEED_YIELD == state) {
-        _commonStats.needYield++;
     }
 
     return state;
@@ -342,24 +329,6 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     return Status::OK();
 }
 
-vector<PlanStageStats*> MultiPlanStage::generateCandidateStats() {
-    OwnedPointerVector<PlanStageStats> candidateStats;
-
-    for (size_t ix = 0; ix < _candidates.size(); ix++) {
-        if (ix == (size_t)_bestPlanIdx) {
-            continue;
-        }
-        if (ix == (size_t)_backupPlanIdx) {
-            continue;
-        }
-
-        unique_ptr<PlanStageStats> stats = _candidates[ix].root->getStats();
-        candidateStats.push_back(stats.release());
-    }
-
-    return candidateStats.release();
-}
-
 bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolicy) {
     bool doneWorking = false;
 
@@ -437,28 +406,21 @@ namespace {
 
 void invalidateHelper(OperationContext* txn,
                       WorkingSet* ws,  // may flag for review
-                      const RecordId& dl,
+                      const RecordId& recordId,
                       list<WorkingSetID>* idsToInvalidate,
                       const Collection* collection) {
-    for (list<WorkingSetID>::iterator it = idsToInvalidate->begin();
-         it != idsToInvalidate->end();) {
+    for (auto it = idsToInvalidate->begin(); it != idsToInvalidate->end(); ++it) {
         WorkingSetMember* member = ws->get(*it);
-        if (member->hasLoc() && member->loc == dl) {
-            list<WorkingSetID>::iterator next = it;
-            next++;
-            WorkingSetCommon::fetchAndInvalidateLoc(txn, member, collection);
-            ws->flagForReview(*it);
-            idsToInvalidate->erase(it);
-            it = next;
-        } else {
-            it++;
+        if (member->hasRecordId() && member->recordId == recordId) {
+            WorkingSetCommon::fetchAndInvalidateRecordId(txn, member, collection);
         }
     }
 }
-}
+
+}  // namespace
 
 void MultiPlanStage::doInvalidate(OperationContext* txn,
-                                  const RecordId& dl,
+                                  const RecordId& recordId,
                                   InvalidationType type) {
     if (_failure) {
         return;
@@ -466,14 +428,15 @@ void MultiPlanStage::doInvalidate(OperationContext* txn,
 
     if (bestPlanChosen()) {
         CandidatePlan& bestPlan = _candidates[_bestPlanIdx];
-        invalidateHelper(txn, bestPlan.ws, dl, &bestPlan.results, _collection);
+        invalidateHelper(txn, bestPlan.ws, recordId, &bestPlan.results, _collection);
         if (hasBackupPlan()) {
             CandidatePlan& backupPlan = _candidates[_backupPlanIdx];
-            invalidateHelper(txn, backupPlan.ws, dl, &backupPlan.results, _collection);
+            invalidateHelper(txn, backupPlan.ws, recordId, &backupPlan.results, _collection);
         }
     } else {
         for (size_t ix = 0; ix < _candidates.size(); ++ix) {
-            invalidateHelper(txn, _candidates[ix].ws, dl, &_candidates[ix].results, _collection);
+            invalidateHelper(
+                txn, _candidates[ix].ws, recordId, &_candidates[ix].results, _collection);
         }
     }
 }
@@ -498,15 +461,13 @@ QuerySolution* MultiPlanStage::bestSolution() {
 }
 
 unique_ptr<PlanStageStats> MultiPlanStage::getStats() {
-    if (bestPlanChosen()) {
-        return _candidates[_bestPlanIdx].root->getStats();
-    }
-    if (hasBackupPlan()) {
-        return _candidates[_backupPlanIdx].root->getStats();
-    }
     _commonStats.isEOF = isEOF();
-
-    return make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_PLAN);
+    unique_ptr<PlanStageStats> ret = make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_PLAN);
+    ret->specific = make_unique<MultiPlanStats>(_specificStats);
+    for (auto&& child : _children) {
+        ret->children.emplace_back(child->getStats());
+    }
+    return ret;
 }
 
 const SpecificStats* MultiPlanStage::getSpecificStats() const {

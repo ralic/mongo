@@ -37,6 +37,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/write_concern.h"
@@ -55,7 +56,7 @@ using std::stringstream;
 */
 class CmdResetError : public Command {
 public:
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -82,7 +83,7 @@ public:
 class CmdGetLastError : public Command {
 public:
     CmdGetLastError() : Command("getLastError", false, "getlasterror") {}
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -92,7 +93,6 @@ public:
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
     virtual void help(stringstream& help) const {
-        LastError::get(cc()).disable();  // SERVER-11492
         help << "return error status of the last operation on this connection\n"
              << "options:\n"
              << "  { fsync:true } - fsync before returning, or wait for journal commit if running "
@@ -138,42 +138,52 @@ public:
 
         // Always append lastOp and connectionId
         Client& c = *txn->getClient();
-        if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-            repl::ReplicationCoordinator::modeReplSet) {
+        auto replCoord = repl::getGlobalReplicationCoordinator();
+        if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
             const repl::OpTime lastOp = repl::ReplClientInfo::forClient(c).getLastOp();
             if (!lastOp.isNull()) {
-                result.append("lastOp", lastOp.getTimestamp());
-                // TODO(siyuan) Add "lastOpTerm"
+                if (replCoord->isV1ElectionProtocol()) {
+                    lastOp.append(&result, "lastOp");
+                } else {
+                    result.append("lastOp", lastOp.getTimestamp());
+                }
             }
         }
 
         // for sharding; also useful in general for debugging
         result.appendNumber("connectionId", c.getConnectionId());
 
-        Timestamp lastTimestamp;
-        BSONField<Timestamp> wOpTimeField("wOpTime");
-        FieldParser::FieldState extracted =
-            FieldParser::extract(cmdObj, wOpTimeField, &lastTimestamp, &errmsg);
-        if (!extracted) {
-            result.append("badGLE", cmdObj);
-            appendCommandStatus(result, false, errmsg);
-            return false;
+        repl::OpTime lastOpTime;
+        bool lastOpTimePresent = true;
+        const BSONElement opTimeElement = cmdObj["wOpTime"];
+        if (opTimeElement.eoo()) {
+            lastOpTimePresent = false;
+            lastOpTime = repl::ReplClientInfo::forClient(c).getLastOp();
+        } else if (opTimeElement.type() == bsonTimestamp) {
+            lastOpTime = repl::OpTime(opTimeElement.timestamp(), repl::OpTime::kUninitializedTerm);
+        } else if (opTimeElement.type() == Date) {
+            lastOpTime =
+                repl::OpTime(Timestamp(opTimeElement.date()), repl::OpTime::kUninitializedTerm);
+        } else if (opTimeElement.type() == Object) {
+            Status status = bsonExtractOpTimeField(cmdObj, "wOpTime", &lastOpTime);
+            if (!status.isOK()) {
+                result.append("badGLE", cmdObj);
+                return appendCommandStatus(result, status);
+            }
+        } else {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::TypeMismatch,
+                       str::stream() << "Expected \"wOpTime\" field in getLastError to "
+                                        "have type Date, Timestamp, or OpTime but found type "
+                                     << typeName(opTimeElement.type())));
         }
 
-        repl::OpTime lastOpTime;
-        bool lastOpTimePresent = extracted != FieldParser::FIELD_NONE;
-        if (!lastOpTimePresent) {
-            // Use the client opTime if no wOpTime is specified
-            lastOpTime = repl::ReplClientInfo::forClient(c).getLastOp();
-            // TODO(siyuan) Fix mongos to supply wOpTimeTerm, then parse out that value here
-        } else {
-            // TODO(siyuan) Don't use the default term after fixing mongos.
-            lastOpTime = repl::OpTime(lastTimestamp, repl::OpTime::kInitialTerm);
-        }
 
         OID electionId;
         BSONField<OID> wElectionIdField("wElectionId");
-        extracted = FieldParser::extract(cmdObj, wElectionIdField, &electionId, &errmsg);
+        FieldParser::FieldState extracted =
+            FieldParser::extract(cmdObj, wElectionIdField, &electionId, &errmsg);
         if (!extracted) {
             result.append("badGLE", cmdObj);
             appendCommandStatus(result, false, errmsg);
@@ -213,7 +223,7 @@ public:
 
         if (status.isOK()) {
             // Ensure options are valid for this host
-            status = validateWriteConcern(writeConcern);
+            status = validateWriteConcern(txn, writeConcern, dbname);
         }
 
         if (!status.isOK()) {
@@ -260,7 +270,7 @@ public:
         }
 
         WriteConcernResult wcResult;
-        status = waitForWriteConcern(txn, lastOpTime, &wcResult);
+        status = waitForWriteConcern(txn, lastOpTime, txn->getWriteConcern(), &wcResult);
         wcResult.appendTo(writeConcern, &result);
 
         // For backward compatibility with 2.4, wtimeout returns ok : 1.0
@@ -279,7 +289,7 @@ public:
 
 class CmdGetPrevError : public Command {
 public:
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void help(stringstream& help) const {

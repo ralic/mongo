@@ -36,6 +36,8 @@
 
 namespace mongo {
 
+class CollatorInterface;
+
 struct QueryPlannerParams {
     QueryPlannerParams()
         : options(DEFAULT),
@@ -58,10 +60,9 @@ struct QueryPlannerParams {
         // shouldn't be on this shard" stage before projection.
         //
         // In order to set this, you must check
-        // ShardingState::get(getGlobalServiceContext())->needCollectionMetadata(current_namespace)
-        // in the same lock that you use
-        // to build the query executor. You must also wrap the PlanExecutor in a ClientCursor
-        // within the same lock. See the comment on ShardFilterStage for details.
+        // ShardingState::needCollectionMetadata(current_namespace) in the same lock that you use to
+        // build the query executor. You must also wrap the PlanExecutor in a ClientCursor within
+        // the same lock. See the comment on ShardFilterStage for details.
         INCLUDE_SHARD_FILTER = 1 << 2,
 
         // Set this if you don't want any plans with a blocking sort stage.  All sorts must be
@@ -75,9 +76,9 @@ struct QueryPlannerParams {
         // of the query in the query results.
         KEEP_MUTATIONS = 1 << 5,
 
-        // Nobody should set this above the getExecutor interface.  Internal flag set as a hint
-        // to the planner that the caller is actually the count command.
-        PRIVATE_IS_COUNT = 1 << 6,
+        // Indicate to the planner that the caller is requesting a count operation, possibly through
+        // a count command, or as part of an aggregation pipeline.
+        IS_COUNT = 1 << 6,
 
         // Set this if you want to handle batchSize properly with sort(). If limits on SORT
         // stages are always actually limits, then this should be left off. If they are
@@ -116,6 +117,11 @@ struct QueryPlannerParams {
     // plans via the MultiPlanStage, and the set of possible plans is very large for certain
     // index+query combinations.
     size_t maxIndexedSolutions;
+
+    // The collation which this query must respect. Distinct from the CollatorInterfaces attached to
+    // the IndexEntry instances, which give the physical properties of the indices rather than the
+    // logical collation which the query must use.
+    CollatorInterface* collator = nullptr;
 };
 
 }  // namespace mongo

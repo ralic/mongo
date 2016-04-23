@@ -29,15 +29,25 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <memory>
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
+class OperationContext;
+
 struct ClusterClientCursorParams {
+    // When mongos has to do a merge in order to return results to the client in the correct sort
+    // order, it requests a sortKey meta-projection using this field name.
+    static const char kSortKeyField[];
+
     /**
      * Contains any CCC parameters that are specified per-remote node.
      */
@@ -45,8 +55,7 @@ struct ClusterClientCursorParams {
         /**
          * Use when a new cursor should be created on the remote.
          */
-        Remote(HostAndPort hostAndPort, BSONObj cmdObj)
-            : hostAndPort(std::move(hostAndPort)), cmdObj(std::move(cmdObj)) {}
+        Remote(ShardId sid, BSONObj cmdObj) : shardId(std::move(sid)), cmdObj(std::move(cmdObj)) {}
 
         /**
          * Use when an a cursor already exists on the remote.  The resulting CCC will take ownership
@@ -59,8 +68,16 @@ struct ClusterClientCursorParams {
         Remote(HostAndPort hostAndPort, CursorId cursorId)
             : hostAndPort(std::move(hostAndPort)), cursorId(cursorId) {}
 
-        // How the networking layer should contact this remote.
-        HostAndPort hostAndPort;
+        // If this is a regular query cursor, this value will be set and shard id retargeting may
+        // occur on certain networking or replication errors.
+        //
+        // If this is an externally-prepared cursor (as is in the case of aggregation cursors),
+        // this value will never be set and no retargeting will occur.
+        boost::optional<ShardId> shardId;
+
+        // If this is an externally-specified cursor (e.g. aggregation), this value will be set and
+        // used directly and no re-targeting may happen on errors.
+        boost::optional<HostAndPort> hostAndPort;
 
         // The raw command parameters to send to this remote (e.g. the find command specification).
         //
@@ -73,10 +90,20 @@ struct ClusterClientCursorParams {
         boost::optional<CursorId> cursorId;
     };
 
-    ClusterClientCursorParams() {}
+    /**
+     * Constructor used for cases where initial shard host targeting is necessary (i.e., we don't
+     * know yet the remote cursor id).
+     */
+    ClusterClientCursorParams(NamespaceString nss, ReadPreferenceSetting readPref)
+        : nsString(std::move(nss)), readPreference(std::move(readPref)) {}
 
+    /**
+     * Constructor used for cases, where the remote cursor ids are already known and no resolution
+     * or retargeting needs to happen.
+     */
     ClusterClientCursorParams(NamespaceString nss) : nsString(std::move(nss)) {}
 
+    // Namespace against which to query.
     NamespaceString nsString;
 
     // Per-remote node data.
@@ -99,6 +126,17 @@ struct ClusterClientCursorParams {
 
     // Whether this cursor is tailing a capped collection.
     bool isTailable = false;
+
+    // Whether this cursor has the awaitData option set.
+    bool isAwaitData = false;
+
+    // Read preference for where to target the query. This value is only set if initial shard host
+    // targeting is necessary and not used if using externally prepared cursor ids.
+    boost::optional<ReadPreferenceSetting> readPreference;
+
+    // Whether the client indicated that it is willing to receive partial results in the case of an
+    // unreachable host.
+    bool isAllowPartialResults = false;
 };
 
 }  // mongo

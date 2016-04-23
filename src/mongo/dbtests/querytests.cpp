@@ -34,18 +34,18 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/global_timestamp.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/timer.h"
 
@@ -99,21 +99,23 @@ protected:
 
     void insert(const BSONObj& o) {
         WriteUnitOfWork wunit(&_txn);
+        OpDebug* const nullOpDebug = nullptr;
         if (o["_id"].eoo()) {
             BSONObjBuilder b;
             OID oid;
             oid.init();
             b.appendOID("_id", &oid);
             b.appendElements(o);
-            _collection->insertDocument(&_txn, b.obj(), false);
+            _collection->insertDocument(&_txn, b.obj(), nullOpDebug, false);
         } else {
-            _collection->insertDocument(&_txn, o, false);
+            _collection->insertDocument(&_txn, o, nullOpDebug, false);
         }
         wunit.commit();
     }
 
 
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     ScopedTransaction _scopedXact;
     Lock::GlobalWrite _lk;
     OldClientContext _context;
@@ -232,7 +234,8 @@ protected:
         return !_client.getPrevError().getField("err").isNull();
     }
 
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     DBDirectClient _client;
 };
 
@@ -621,6 +624,11 @@ public:
     }
     void run() {
         const char* ns = "unittests.querytests.OplogReplayMode";
+
+        // Create a capped collection of size 10.
+        _client.dropCollection(ns);
+        _client.createCollection(ns, 10, true);
+
         insert(ns, BSON("ts" << 0));
         insert(ns, BSON("ts" << 1));
         insert(ns, BSON("ts" << 2));
@@ -655,6 +663,11 @@ public:
     }
     void run() {
         const char* ns = "unittests.querytests.OplogReplaySlaveReadTill";
+
+        // Create a capped collection of size 10.
+        _client.dropCollection(ns);
+        _client.createCollection(ns, 10, true);
+
         ScopedTransaction transaction(&_txn, MODE_IX);
         Lock::DBLock lk(_txn.lockState(), "unittests", MODE_X);
         OldClientContext ctx(&_txn, ns);
@@ -695,6 +708,11 @@ public:
     }
     void run() {
         const char* ns = "unittests.querytests.OplogReplayExplain";
+
+        // Create a capped collection of size 10.
+        _client.dropCollection(ns);
+        _client.createCollection(ns, 10, true);
+
         insert(ns, BSON("ts" << 0));
         insert(ns, BSON("ts" << 1));
         insert(ns, BSON("ts" << 2));

@@ -2,6 +2,7 @@
 
 Import([
     'env',
+    'get_option',
     'serverJs',
     'usemozjs',
 ])
@@ -85,6 +86,12 @@ if usemozjs:
         'STATIC_JS_API=1',
     ])
 
+    if get_option('spider-monkey-dbg') == "on":
+        scriptingEnv.Prepend(CPPDEFINES=[
+            'DEBUG',
+            'JS_DEBUG',
+        ])
+
     scriptingEnv.JSHeader(
         target='mozjs/mongohelpers_js.cpp',
         source=[
@@ -92,12 +99,15 @@ if usemozjs:
         ]
     )
 
+    env.Alias('generated-sources', 'mozjs/mongohelpers_js.cpp')
+
     scriptingEnv.Library(
         target='scripting',
         source=[
             'mozjs/base.cpp',
             'mozjs/bindata.cpp',
             'mozjs/bson.cpp',
+            'mozjs/code.cpp',
             'mozjs/countdownlatch.cpp',
             'mozjs/cursor.cpp',
             'mozjs/cursor_handle.cpp',
@@ -112,6 +122,7 @@ if usemozjs:
             'mozjs/global.cpp',
             'mozjs/idwrapper.cpp',
             'mozjs/implscope.cpp',
+            'mozjs/internedstring.cpp',
             'mozjs/jscustomallocator.cpp',
             'mozjs/jsstringwrapper.cpp',
             'mozjs/jsthread.cpp',

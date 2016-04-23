@@ -34,20 +34,23 @@
 
 #include <string>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
+#include "mongo/scripting/engine.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -58,30 +61,27 @@ int runDbTests(int argc, char** argv) {
     frameworkGlobalParams.seed = time(0);
     frameworkGlobalParams.runsPerTest = 1;
 
+    registerShutdownTask([] {
+        // We drop the scope cache because leak sanitizer can't see across the
+        // thread we use for proxying MozJS requests. Dropping the cache cleans up
+        // the memory and makes leak sanitizer happy.
+        ScriptEngine::dropScopeCache();
+
+        // We may be shut down before we have a global storage
+        // engine.
+        if (!getGlobalServiceContext()->getGlobalStorageEngine())
+            return;
+
+        getGlobalServiceContext()->shutdownGlobalStorageEngineCleanly();
+    });
+
     Client::initThread("testsuite");
 
     srand((unsigned)frameworkGlobalParams.seed);
-    printGitVersion();
-    printOpenSSLVersion();
+    printBuildInfo();
 
+    checked_cast<ServiceContextMongoD*>(getGlobalServiceContext())->createLockFile();
     getGlobalServiceContext()->initializeGlobalStorageEngine();
-
-    {
-        auto txn = cc().makeOperationContext();
-        // Initialize the sharding state so we can run sharding tests in isolation
-        ShardingState::get(getGlobalServiceContext())->initialize(txn.get(), "$dummy:10000");
-    }
-
-    // Note: ShardingState::initialize also initializes the distLockMgr.
-    {
-        auto txn = cc().makeOperationContext();
-        auto distLockMgr = dynamic_cast<LegacyDistLockManager*>(
-            grid.catalogManager(txn.get())->getDistLockManager());
-        if (distLockMgr) {
-            distLockMgr->enablePinger(false);
-        }
-    }
-
 
     int ret = unittest::Suite::run(frameworkGlobalParams.suites,
                                    frameworkGlobalParams.filter,

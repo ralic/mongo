@@ -31,15 +31,19 @@
 #include <cctype>
 
 #include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/matcher.h"
+#include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/util/stringutils.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
+using std::pair;
+using std::unique_ptr;
 using std::string;
 using std::vector;
 
@@ -64,41 +68,59 @@ boost::optional<Document> DocumentSourceMatch::getNext() {
     massert(17309, "Should never call getNext on a $match stage with $text clause", !_isTextQuery);
 
     while (boost::optional<Document> next = pSource->getNext()) {
-        // The matcher only takes BSON documents, so we have to make one.
-        if (matcher->matches(next->toBson()))
+        // MatchExpression only takes BSON documents, so we have to make one. As an optimization,
+        // only serialize the fields we need to do the match.
+        if (_dependencies.needWholeDocument) {
+            if (_expression->matchesBSON(next->toBson())) {
+                return next;
+            }
+        } else if (_expression->matchesBSON(getObjectForMatch(*next, _dependencies.fields))) {
             return next;
+        }
     }
 
-    // Nothing matched
+    // We have exhausted the previous source.
     return boost::none;
 }
 
-bool DocumentSourceMatch::coalesce(const intrusive_ptr<DocumentSource>& nextSource) {
-    DocumentSourceMatch* otherMatch = dynamic_cast<DocumentSourceMatch*>(nextSource.get());
-    if (!otherMatch)
-        return false;
+Pipeline::SourceContainer::iterator DocumentSourceMatch::optimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    invariant(*itr == this);
 
-    if (otherMatch->_isTextQuery) {
-        // Non-initial text queries are disallowed (enforced by setSource below). This prevents
-        // "hiding" a non-initial text query by combining it with another match.
-        return false;
+    auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
 
-        // The rest of this block is for once we support non-initial text queries.
+    // Since a text search must use an index, it must be the first stage in the pipeline. We cannot
+    // combine a non-text stage with a text stage, as that may turn an invalid pipeline into a
+    // valid one, unbeknownst to the user.
+    if (nextMatch && !nextMatch->_isTextQuery) {
+        _predicate = BSON("$and" << BSON_ARRAY(getQuery() << nextMatch->getQuery()));
 
-        if (_isTextQuery) {
-            // The score should only come from the last $match. We can't combine since then this
-            // match's score would impact otherMatch's.
-            return false;
+        StatusWithMatchExpression status =
+            uassertStatusOK(MatchExpressionParser::parse(_predicate, ExtensionsCallbackNoop()));
+        _expression = std::move(status.getValue());
+
+        container->erase(std::next(itr));
+        return itr;
+    }
+    return std::next(itr);
+}
+
+BSONObj DocumentSourceMatch::getObjectForMatch(const Document& input,
+                                               const std::set<std::string>& fields) {
+    BSONObjBuilder matchObject;
+
+    for (auto&& field : fields) {
+        // getNestedField does not handle dotted paths correctly, so instead of retrieving the
+        // entire path, we just extract the first element of the path.
+        FieldPath path(field);
+        auto prefix = path.getFieldName(0);
+        if (!matchObject.hasField(prefix)) {
+            // Avoid adding the same prefix twice.
+            input.getField(prefix).addToBsonObj(&matchObject, prefix);
         }
-
-        _isTextQuery = true;
     }
 
-    // Replace our matcher with the $and of ours and theirs.
-    matcher.reset(new Matcher(BSON("$and" << BSON_ARRAY(getQuery() << otherMatch->getQuery())),
-                              MatchExpressionParser::WhereCallback()));
-
-    return true;
+    return matchObject.obj();
 }
 
 namespace {
@@ -139,7 +161,7 @@ bool isTypeRedactSafeInComparison(BSONType type) {
     if (type == jstNULL)
         return false;
     if (type == Undefined)
-        return false;  // Currently a Matcher parse error.
+        return false;  // Currently a parse error.
 
     return true;
 }
@@ -154,6 +176,13 @@ Document redactSafePortionDollarOps(BSONObj expr) {
     BSONForEach(field, expr) {
         if (field.fieldName()[0] != '$')
             continue;
+
+        if (field.fieldNameStringData() == "$eq") {
+            if (isTypeRedactSafeInComparison(field.type())) {
+                output[field.fieldNameStringData()] = Value(field);
+            }
+            continue;
+        }
 
         switch (BSONObj::MatchType(field.getGtLtOp(BSONObj::Equality))) {
             // These are always ok
@@ -283,7 +312,7 @@ Document redactSafePortionTopLevel(BSONObj query) {
             case jstNULL:
                 continue;  // can't look for missing fields
             case Undefined:
-                continue;  // Currently a Matcher parse error.
+                continue;  // Currently a parse error.
 
             case Object: {
                 Document sub = redactSafePortionDollarOps(field.Obj());
@@ -309,7 +338,6 @@ BSONObj DocumentSourceMatch::redactSafePortion() const {
 
 void DocumentSourceMatch::setSource(DocumentSource* source) {
     uassert(17313, "$match with $text is only allowed as the first pipeline stage", !_isTextQuery);
-
     DocumentSource::setSource(source);
 }
 
@@ -325,9 +353,46 @@ bool DocumentSourceMatch::isTextQuery(const BSONObj& query) {
     return false;
 }
 
+pair<intrusive_ptr<DocumentSource>, intrusive_ptr<DocumentSource>>
+DocumentSourceMatch::splitSourceBy(const std::set<std::string>& fields) {
+    pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> newExpr(
+        expression::splitMatchExpressionBy(std::move(_expression), fields));
+
+    invariant(newExpr.first || newExpr.second);
+
+    if (!newExpr.first) {
+        // The entire $match dependends on 'fields'.
+        _expression = std::move(newExpr.second);
+        return {nullptr, this};
+    } else if (!newExpr.second) {
+        // This $match is entirely independent of 'fields'.
+        _expression = std::move(newExpr.first);
+        return {this, nullptr};
+    }
+
+    // A MatchExpression requires that it is outlived by the BSONObj it is parsed from. Since the
+    // original BSONObj this $match was created from is no longer equivalent to either of the
+    // MatchExpressions we return, we instead take each of these expressions, serialize them, and
+    // then re-parse them, constructing new BSON that is owned by the DocumentSourceMatch.
+
+    // Build an expression for a new $match stage.
+    BSONObjBuilder firstBob;
+    newExpr.first->serialize(&firstBob);
+
+    intrusive_ptr<DocumentSource> firstMatch(new DocumentSourceMatch(firstBob.obj(), pExpCtx));
+
+    // This $match stage is still needed, so update the MatchExpression as needed.
+    BSONObjBuilder secondBob;
+    newExpr.second->serialize(&secondBob);
+
+    intrusive_ptr<DocumentSource> secondMatch(new DocumentSourceMatch(secondBob.obj(), pExpCtx));
+
+    return {firstMatch, secondMatch};
+}
+
 static void uassertNoDisallowedClauses(BSONObj query) {
     BSONForEach(e, query) {
-        // can't use the Matcher API because this would segfault the constructor
+        // can't use the MatchExpression API because this would segfault the constructor
         uassert(16395,
                 "$where is not allowed inside of a $match aggregation expression",
                 !str::equals(e.fieldName(), "$where"));
@@ -353,12 +418,53 @@ intrusive_ptr<DocumentSource> DocumentSourceMatch::createFromBson(
 }
 
 BSONObj DocumentSourceMatch::getQuery() const {
-    return *(matcher->getQuery());
+    return _predicate;
+}
+
+DocumentSource::GetDepsReturn DocumentSourceMatch::getDependencies(DepsTracker* deps) const {
+    if (isTextQuery()) {
+        // A $text aggregation field should return EXHAUSTIVE_ALL, since we don't necessarily know
+        // what field it will be searching without examining indices.
+        deps->needWholeDocument = true;
+        return EXHAUSTIVE_ALL;
+    }
+
+    addDependencies(_expression.get(), deps, "");
+    return SEE_NEXT;
+}
+
+void DocumentSourceMatch::addDependencies(MatchExpression* expression,
+                                          DepsTracker* deps,
+                                          std::string prefix) const {
+    if (!expression->path().empty()) {
+        if (!prefix.empty()) {
+            prefix += ".";
+        }
+
+        prefix += expression->path().toString();
+    }
+
+    if (expression->numChildren()) {
+        for (size_t i = 0; i < expression->numChildren(); i++) {
+            addDependencies(expression->getChild(i), deps, prefix);
+        }
+    }
+
+    if (!expression->path().empty() &&
+        (expression->numChildren() == 0 ||
+         expression->matchType() == MatchExpression::ELEM_MATCH_VALUE ||
+         expression->matchType() == MatchExpression::ELEM_MATCH_OBJECT)) {
+        deps->fields.insert(prefix);
+    }
 }
 
 DocumentSourceMatch::DocumentSourceMatch(const BSONObj& query,
                                          const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx),
-      matcher(new Matcher(query.getOwned(), MatchExpressionParser::WhereCallback())),
-      _isTextQuery(isTextQuery(query)) {}
+    : DocumentSource(pExpCtx), _predicate(query.getOwned()), _isTextQuery(isTextQuery(query)) {
+    StatusWithMatchExpression status =
+        uassertStatusOK(MatchExpressionParser::parse(_predicate, ExtensionsCallbackNoop()));
+
+    _expression = std::move(status.getValue());
+    getDependencies(&_dependencies);
 }
+}  // namespace mongo

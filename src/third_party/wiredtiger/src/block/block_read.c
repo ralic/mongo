@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,45 +13,55 @@
  *	Pre-load a page.
  */
 int
-__wt_bm_preload(WT_BM *bm,
-    WT_SESSION_IMPL *session, const uint8_t *addr, size_t addr_size)
+__wt_bm_preload(
+    WT_BM *bm, WT_SESSION_IMPL *session, const uint8_t *addr, size_t addr_size)
 {
 	WT_BLOCK *block;
+	WT_DECL_ITEM(tmp);
 	WT_DECL_RET;
 	wt_off_t offset;
 	uint32_t cksum, size;
-	int mapped;
+	bool mapped;
 
 	WT_UNUSED(addr_size);
 	block = bm->block;
-	ret = EINVAL;		/* Play games due to conditional compilation */
-
-	/* Crack the cookie. */
-	WT_RET(__wt_block_buffer_to_addr(block, addr, &offset, &size, &cksum));
-
-	/* Check for a mapped block. */
-	mapped = bm->map != NULL && offset + size <= (wt_off_t)bm->maplen;
-	if (mapped)
-		WT_RET(__wt_mmap_preload(
-		    session, (uint8_t *)bm->map + offset, size));
-	else {
-#ifdef HAVE_POSIX_FADVISE
-		ret = posix_fadvise(block->fh->fd,
-		    (wt_off_t)offset, (wt_off_t)size, POSIX_FADV_WILLNEED);
-#endif
-		if (ret != 0) {
-			WT_DECL_ITEM(tmp);
-			WT_RET(__wt_scr_alloc(session, size, &tmp));
-			ret = __wt_block_read_off(
-			    session, block, tmp, offset, size, cksum);
-			__wt_scr_free(session, &tmp);
-			WT_RET(ret);
-		}
-	}
 
 	WT_STAT_FAST_CONN_INCR(session, block_preload);
 
-	return (0);
+	/* Preload the block. */
+	if (block->preload_available) {
+		/* Crack the cookie. */
+		WT_RET(__wt_block_buffer_to_addr(
+		    block, addr, &offset, &size, &cksum));
+
+		mapped = bm->map != NULL &&
+		    offset + size <= (wt_off_t)bm->maplen;
+		if (mapped)
+			ret = block->fh->fh_map_preload(session,
+			    block->fh, (uint8_t *)bm->map + offset, size);
+		else
+			ret = block->fh->fh_advise(session,
+			    block->fh, (wt_off_t)offset,
+			    (wt_off_t)size, POSIX_FADV_WILLNEED);
+		if (ret == 0)
+			return (0);
+
+		/* Ignore ENOTSUP, but don't try again. */
+		if (ret != ENOTSUP)
+			return (ret);
+		block->preload_available = false;
+	}
+
+	/*
+	 * If preload isn't supported, do it the slow way; don't call the
+	 * underlying read routine directly, we don't know for certain if
+	 * this is a mapped range.
+	 */
+	WT_RET(__wt_scr_alloc(session, 0, &tmp));
+	ret = __wt_bm_read(bm, session, tmp, addr, addr_size);
+	__wt_scr_free(session, &tmp);
+
+	return (ret);
 }
 
 /*
@@ -63,9 +73,10 @@ __wt_bm_read(WT_BM *bm, WT_SESSION_IMPL *session,
     WT_ITEM *buf, const uint8_t *addr, size_t addr_size)
 {
 	WT_BLOCK *block;
-	int mapped;
+	WT_DECL_RET;
 	wt_off_t offset;
 	uint32_t cksum, size;
+	bool mapped;
 
 	WT_UNUSED(addr_size);
 	block = bm->block;
@@ -80,7 +91,15 @@ __wt_bm_read(WT_BM *bm, WT_SESSION_IMPL *session,
 	if (mapped) {
 		buf->data = (uint8_t *)bm->map + offset;
 		buf->size = size;
-		WT_RET(__wt_mmap_preload(session, buf->data, buf->size));
+		if (block->preload_available) {
+			ret = block->fh->fh_map_preload(
+			    session, block->fh, buf->data, buf->size);
+
+			/* Ignore ENOTSUP, but don't try again. */
+			if (ret != ENOTSUP)
+				return (ret);
+			block->preload_available = false;
+		}
 
 		WT_STAT_FAST_CONN_INCR(session, block_map_read);
 		WT_STAT_FAST_CONN_INCRV(session, block_byte_map_read, size);
@@ -98,21 +117,9 @@ __wt_bm_read(WT_BM *bm, WT_SESSION_IMPL *session,
 	/* Read the block. */
 	WT_RET(__wt_block_read_off(session, block, buf, offset, size, cksum));
 
-#ifdef HAVE_POSIX_FADVISE
 	/* Optionally discard blocks from the system's buffer cache. */
-	if (block->os_cache_max != 0 &&
-	    (block->os_cache += size) > block->os_cache_max) {
-		WT_DECL_RET;
+	WT_RET(__wt_block_discard(session, block, (size_t)size));
 
-		block->os_cache = 0;
-		/* Ignore EINVAL - some file systems don't support the flag. */
-		if ((ret = posix_fadvise(block->fh->fd,
-		    (wt_off_t)0, (wt_off_t)0, POSIX_FADV_DONTNEED)) != 0 &&
-		    ret != EINVAL)
-			WT_RET_MSG(
-			    session, ret, "%s: posix_fadvise", block->name);
-	}
-#endif
 	return (0);
 }
 
@@ -137,6 +144,7 @@ __wt_block_read_off_blind(
 	WT_RET(__wt_read(
 	    session, block->fh, offset, (size_t)block->allocsize, buf->mem));
 	blk = WT_BLOCK_HEADER_REF(buf->mem);
+	__wt_block_header_byteswap(blk);
 
 	/*
 	 * Copy out the size and checksum (we're about to re-use the buffer),
@@ -161,7 +169,7 @@ int
 __wt_block_read_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
     WT_ITEM *buf, wt_off_t offset, uint32_t size, uint32_t cksum)
 {
-	WT_BLOCK_HEADER *blk;
+	WT_BLOCK_HEADER *blk, swap;
 	size_t bufsize;
 	uint32_t page_cksum;
 
@@ -191,14 +199,26 @@ __wt_block_read_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	WT_RET(__wt_read(session, block->fh, offset, size, buf->mem));
 	buf->size = size;
 
+	/*
+	 * We incrementally read through the structure before doing a checksum,
+	 * do little- to big-endian handling early on, and then select from the
+	 * original or swapped structure as needed.
+	 */
 	blk = WT_BLOCK_HEADER_REF(buf->mem);
-	if (blk->cksum == cksum) {
+	__wt_block_header_byteswap_copy(blk, &swap);
+	if (swap.cksum == cksum) {
 		blk->cksum = 0;
 		page_cksum = __wt_cksum(buf->mem,
-		    F_ISSET(blk, WT_BLOCK_DATA_CKSUM) ?
+		    F_ISSET(&swap, WT_BLOCK_DATA_CKSUM) ?
 		    size : WT_BLOCK_COMPRESS_SKIP);
-		if (page_cksum == cksum)
+		if (page_cksum == cksum) {
+			/*
+			 * Swap the page-header as needed; this doesn't belong
+			 * here, but it's the best place to catch all callers.
+			 */
+			__wt_page_header_byteswap(buf->mem);
 			return (0);
+		}
 
 		if (!F_ISSET(session, WT_SESSION_QUIET_CORRUPT_FILE))
 			__wt_errx(session,
@@ -214,7 +234,7 @@ __wt_block_read_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 			    "offset %" PRIuMAX ": block header checksum "
 			    "of %" PRIu32 " doesn't match expected checksum "
 			    "of %" PRIu32,
-			    size, (uintmax_t)offset, blk->cksum, cksum);
+			    size, (uintmax_t)offset, swap.cksum, cksum);
 
 	/* Panic if a checksum fails during an ordinary read. */
 	return (block->verify ||

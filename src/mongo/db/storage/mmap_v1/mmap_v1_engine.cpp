@@ -46,7 +46,7 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/mmap_v1/file_allocator.h"
 #include "mongo/util/log.h"
 
@@ -59,13 +59,15 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
+MMAPV1Options mmapv1GlobalOptions;
+
 namespace {
 
 #if !defined(__sun)
 // if doingRepair is true don't consider unclean shutdown an error
-void acquirePathLock(MMAPV1Engine* storageEngine,
-                     bool doingRepair,
-                     const StorageEngineLockFile& lockFile) {
+void checkForUncleanShutdown(MMAPV1Engine* storageEngine,
+                             bool doingRepair,
+                             const StorageEngineLockFile& lockFile) {
     string name = lockFile.getFilespec();
     bool oldFile = lockFile.createdByUncleanShutdown();
 
@@ -137,9 +139,9 @@ void acquirePathLock(MMAPV1Engine* storageEngine,
     }
 }
 #else
-void acquirePathLock(MMAPV1Engine* storageEngine,
-                     bool doingRepair,
-                     const StorageEngineLockFile& lockFile) {
+void checkForUncleanShutdown(MMAPV1Engine* storageEngine,
+                             bool doingRepair,
+                             const StorageEngineLockFile& lockFile) {
     // TODO - this is very bad that the code above not running here.
 
     // Not related to lock file, but this is where we handle unclean shutdown
@@ -218,15 +220,23 @@ void clearTmpFiles() {
 }
 }  // namespace
 
-MMAPV1Engine::MMAPV1Engine(const StorageEngineLockFile& lockFile) {
+MMAPV1Engine::MMAPV1Engine(const StorageEngineLockFile* lockFile)
+    : MMAPV1Engine(lockFile, stdx::make_unique<MmapV1ExtentManager::Factory>()) {}
+
+MMAPV1Engine::MMAPV1Engine(const StorageEngineLockFile* lockFile,
+                           std::unique_ptr<ExtentManager::Factory> extentManagerFactory)
+    : _extentManagerFactory(std::move(extentManagerFactory)) {
     // TODO check non-journal subdirs if using directory-per-db
     checkReadAhead(storageGlobalParams.dbpath);
 
-    acquirePathLock(this, storageGlobalParams.repair, lockFile);
+    if (!storageGlobalParams.readOnly) {
+        invariant(lockFile);
+        checkForUncleanShutdown(this, storageGlobalParams.repair, *lockFile);
 
-    FileAllocator::get()->start();
+        FileAllocator::get()->start();
 
-    MONGO_ASSERT_ON_EXCEPTION_WITH_MSG(clearTmpFiles(), "clear tmp files");
+        MONGO_ASSERT_ON_EXCEPTION_WITH_MSG(clearTmpFiles(), "clear tmp files");
+    }
 }
 
 void MMAPV1Engine::finishInit() {
@@ -267,7 +277,13 @@ DatabaseCatalogEntry* MMAPV1Engine::getDatabaseCatalogEntry(OperationContext* op
     // can be creating the same database concurrenty. We need to create the database outside of
     // the _entryMapMutex so we do not deadlock (see SERVER-15880).
     MMAPV1DatabaseCatalogEntry* entry = new MMAPV1DatabaseCatalogEntry(
-        opCtx, db, storageGlobalParams.dbpath, storageGlobalParams.directoryperdb, false);
+        opCtx,
+        db,
+        storageGlobalParams.dbpath,
+        storageGlobalParams.directoryperdb,
+        false,
+        _extentManagerFactory->create(
+            db, storageGlobalParams.dbpath, storageGlobalParams.directoryperdb));
 
     stdx::lock_guard<stdx::mutex> lk(_entryMapMutex);
 
@@ -323,8 +339,20 @@ int MMAPV1Engine::flushAllFiles(bool sync) {
     return MongoFile::flushAll(sync);
 }
 
+Status MMAPV1Engine::beginBackup(OperationContext* txn) {
+    return Status::OK();
+}
+
+void MMAPV1Engine::endBackup(OperationContext* txn) {
+    return;
+}
+
 bool MMAPV1Engine::isDurable() const {
     return getDur().isDurable();
+}
+
+bool MMAPV1Engine::isEphemeral() const {
+    return false;
 }
 
 RecordAccessTracker& MMAPV1Engine::getRecordAccessTracker() {
@@ -348,5 +376,9 @@ void MMAPV1Engine::cleanShutdown() {
     stringstream ss3;
     MemoryMappedFile::closeAllFiles(ss3);
     log() << ss3.str() << endl;
+}
+
+void MMAPV1Engine::setJournalListener(JournalListener* jl) {
+    dur::setJournalListener(jl);
 }
 }

@@ -78,12 +78,9 @@ const char* DocumentSource::getSourceName() const {
 }
 
 void DocumentSource::setSource(DocumentSource* pTheSource) {
+    verify(!isValidInitialSource());
     verify(!pSource);
     pSource = pTheSource;
-}
-
-bool DocumentSource::coalesce(const intrusive_ptr<DocumentSource>& pNextSource) {
-    return false;
 }
 
 intrusive_ptr<DocumentSource> DocumentSource::optimize() {
@@ -101,5 +98,20 @@ void DocumentSource::serializeToArray(vector<Value>& array, bool explain) const 
     if (!entry.missing()) {
         array.push_back(entry);
     }
+}
+
+BSONObjSet DocumentSource::allPrefixes(BSONObj obj) {
+    BSONObjSet out;
+
+    BSONObj last = {};
+    for (auto&& field : obj) {
+        BSONObjBuilder builder(last.objsize() + field.size());
+        builder.appendElements(last);
+        builder.append(field);
+        last = builder.obj();
+        out.insert(last);
+    }
+
+    return out;
 }
 }

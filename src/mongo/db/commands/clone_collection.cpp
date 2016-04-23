@@ -50,9 +50,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/isself.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -70,8 +69,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
@@ -154,8 +154,7 @@ public:
 
         cloner.setConnection(myconn.release());
 
-        return cloner.copyCollection(
-            txn, collection, query, errmsg, true, true /* interruptable */, copyIndexes);
+        return cloner.copyCollection(txn, collection, query, errmsg, copyIndexes);
     }
 
 } cmdCloneCollection;

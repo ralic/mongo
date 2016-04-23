@@ -140,7 +140,7 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
     // Command Line Option | Resulting Verbosity
     // _________________________________________
     // (none)              | 0
-    // --verbose ""        | 0
+    // --verbose ""        | Error after Boost 1.59
     // --verbose           | 1
     // --verbose v         | 1
     // --verbose vv        | 2 (etc.)
@@ -272,6 +272,13 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
                                moe::String,
                                "private key for cluster authentication").incompatibleWith("noauth");
 
+    options->addOptionChaining("noauth", "noauth", moe::Switch, "run without security")
+        .setSources(moe::SourceAllLegacy)
+        .incompatibleWith("auth")
+        .incompatibleWith("keyFile")
+        .incompatibleWith("transitionToAuth")
+        .incompatibleWith("clusterAuthMode");
+
     options->addOptionChaining(
                  "setParameter", "setParameter", moe::StringMap, "Set a configurable parameter")
         .composing();
@@ -287,6 +294,16 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
     options->addOptionChaining(
                  "net.http.port", "", moe::Switch, "port to listen on for http interface")
         .setSources(moe::SourceYAMLConfig);
+
+    options->addOptionChaining(
+                 "security.transitionToAuth",
+                 "transitionToAuth",
+                 moe::Switch,
+                 "For rolling access control upgrade. Attempt to authenticate over outgoing "
+                 "connections and proceed regardless of success. Accept incoming connections "
+                 "with or without authentication.")
+        .setSources(moe::SourceAllLegacy)
+        .incompatibleWith("noauth");
 
     options->addOptionChaining(
                  "security.clusterAuthMode",
@@ -689,6 +706,19 @@ Status canonicalizeServerOptions(moe::Environment* params) {
         }
     }
 
+    if (params->count("noauth")) {
+        Status ret =
+            params->set("security.authorization",
+                        (*params)["noauth"].as<bool>() ? moe::Value(std::string("disabled"))
+                                                       : moe::Value(std::string("enabled")));
+        if (!ret.isOK()) {
+            return ret;
+        }
+        ret = params->remove("noauth");
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
     return Status::OK();
 }
 
@@ -768,6 +798,10 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
         serverGlobalParams.isHttpInterfaceEnabled = params["net.http.enabled"].as<bool>();
     }
 
+    if (params.count("security.transitionToAuth")) {
+        serverGlobalParams.transitionToAuth = params["security.transitionToAuth"].as<bool>();
+    }
+
     if (params.count("security.clusterAuthMode")) {
         std::string clusterAuthMode = params["security.clusterAuthMode"].as<std::string>();
 
@@ -784,6 +818,7 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
             return Status(ErrorCodes::BadValue,
                           "unsupported value for clusterAuthMode " + clusterAuthMode);
         }
+        serverGlobalParams.authState = ServerGlobalParams::AuthState::kEnabled;
     } else {
         serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_undefined);
     }
@@ -806,15 +841,6 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
 
     if (params.count("net.wireObjectCheck")) {
         serverGlobalParams.objcheck = params["net.wireObjectCheck"].as<bool>();
-    }
-
-    if (params.count("net.bindIp")) {
-        // passing in wildcard is the same as default behavior; remove and warn
-        if (serverGlobalParams.bind_ip == "0.0.0.0") {
-            std::cout << "warning: bind_ip of 0.0.0.0 is unnecessary; "
-                      << "listens on all ips by default" << endl;
-            serverGlobalParams.bind_ip = "";
-        }
     }
 
 #ifndef _WIN32
@@ -939,6 +965,16 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
     if (params.count("security.keyFile")) {
         serverGlobalParams.keyFile =
             boost::filesystem::absolute(params["security.keyFile"].as<string>()).generic_string();
+        serverGlobalParams.authState = ServerGlobalParams::AuthState::kEnabled;
+    }
+
+    if (serverGlobalParams.transitionToAuth ||
+        (params.count("security.authorization") &&
+         params["security.authorization"].as<std::string>() == "disabled")) {
+        serverGlobalParams.authState = ServerGlobalParams::AuthState::kDisabled;
+    } else if (params.count("security.authorization") &&
+               params["security.authorization"].as<std::string>() == "enabled") {
+        serverGlobalParams.authState = ServerGlobalParams::AuthState::kEnabled;
     }
 
     if (params.count("processManagement.pidFilePath")) {
@@ -975,10 +1011,17 @@ Status storeServerOptions(const moe::Environment& params, const std::vector<std:
             }
         }
     }
+
     if (!params.count("security.clusterAuthMode") && params.count("security.keyFile")) {
         serverGlobalParams.clusterAuthMode.store(ServerGlobalParams::ClusterAuthMode_keyFile);
     }
-
+    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    if (serverGlobalParams.transitionToAuth &&
+        (clusterAuthMode != ServerGlobalParams::ClusterAuthMode_keyFile &&
+         clusterAuthMode != ServerGlobalParams::ClusterAuthMode_x509)) {
+        return Status(ErrorCodes::BadValue,
+                      "--transitionToAuth must be used with keyFile or x509 authentication");
+    }
 #ifdef MONGO_CONFIG_SSL
     ret = storeSSLServerOptions(params);
     if (!ret.isOK()) {

@@ -196,6 +196,10 @@ bool GeoNearExpression::parseLegacyQuery(const BSONObj& obj) {
             uassert(16896, "$maxDistance must be non-negative", maxDistance >= 0.0);
         } else if (equals(e.fieldName(), "$uniqueDocs")) {
             warning() << "ignoring deprecated option $uniqueDocs";
+        } else {
+            // In a query document, $near queries can have no non-geo sibling parameters.
+            uasserted(34413,
+                      str::stream() << "invalid argument in geo near query: " << e.fieldName());
         }
     }
 
@@ -258,6 +262,10 @@ Status GeoNearExpression::parseNewQuery(const BSONObj& obj) {
             uassert(16899, "$maxDistance must be a number", e.isNumber());
             maxDistance = e.Number();
             uassert(16900, "$maxDistance must be non-negative", maxDistance >= 0.0);
+        } else {
+            // Return an error if a bad argument was passed inside the query document.
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "invalid argument in geo near query: " << e.fieldName());
         }
     }
 
@@ -361,7 +369,7 @@ void GeoMatchExpression::debugString(StringBuilder& debug, int level) const {
     debug << "\n";
 }
 
-void GeoMatchExpression::toBSON(BSONObjBuilder* out) const {
+void GeoMatchExpression::serialize(BSONObjBuilder* out) const {
     out->appendElements(_rawObj);
 }
 
@@ -418,7 +426,7 @@ void GeoNearMatchExpression::debugString(StringBuilder& debug, int level) const 
     debug << "\n";
 }
 
-void GeoNearMatchExpression::toBSON(BSONObjBuilder* out) const {
+void GeoNearMatchExpression::serialize(BSONObjBuilder* out) const {
     out->appendElements(_rawObj);
 }
 

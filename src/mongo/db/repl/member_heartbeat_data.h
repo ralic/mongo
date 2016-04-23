@@ -68,8 +68,11 @@ public:
     const HostAndPort& getSyncSource() const {
         return _lastResponse.getSyncingTo();
     }
-    OpTime getOpTime() const {
-        return _lastResponse.getOpTime();
+    OpTime getAppliedOpTime() const {
+        return _lastResponse.getAppliedOpTime();
+    }
+    OpTime getDurableOpTime() const {
+        return _lastResponse.hasDurableOpTime() ? _lastResponse.getDurableOpTime() : OpTime();
     }
     int getConfigVersion() const {
         return _lastResponse.getConfigVersion();
@@ -80,6 +83,10 @@ public:
 
     Timestamp getElectionTime() const {
         return _lastResponse.getElectionTime();
+    }
+
+    long long getTerm() const {
+        return _lastResponse.getTerm();
     }
 
     // Returns true if the last heartbeat data explicilty stated that the node
@@ -101,7 +108,7 @@ public:
     /**
      * Sets values in this object from the results of a successful heartbeat command.
      */
-    void setUpValues(Date_t now, const HostAndPort& host, ReplSetHeartbeatResponse hbResponse);
+    void setUpValues(Date_t now, const HostAndPort& host, ReplSetHeartbeatResponse&& hbResponse);
 
     /**
      * Sets values in this object from the results of a erroring/failed heartbeat command.

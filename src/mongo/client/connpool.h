@@ -39,7 +39,12 @@
 
 namespace mongo {
 
+class BSONObjBuilder;
 class DBConnectionPool;
+
+namespace executor {
+struct ConnectionPoolStats;
+}  // namespace executor
 
 /**
  * not thread safe
@@ -54,13 +59,15 @@ public:
         : _created(0),
           _minValidCreationTimeMicroSec(0),
           _type(ConnectionString::INVALID),
-          _maxPoolSize(kPoolSizeUnlimited) {}
+          _maxPoolSize(kPoolSizeUnlimited),
+          _checkedOut(0) {}
 
     PoolForHost(const PoolForHost& other)
         : _created(other._created),
           _minValidCreationTimeMicroSec(other._minValidCreationTimeMicroSec),
           _type(other._type),
-          _maxPoolSize(other._maxPoolSize) {
+          _maxPoolSize(other._maxPoolSize),
+          _checkedOut(other._checkedOut) {
         verify(_created == 0);
         verify(other._pool.size() == 0);
     }
@@ -83,6 +90,10 @@ public:
 
     int numAvailable() const {
         return (int)_pool.size();
+    }
+
+    int numInUse() const {
+        return _checkedOut;
     }
 
     void createdOne(DBClientBase* base);
@@ -145,6 +156,9 @@ private:
 
     // The maximum number of connections we'll save in the pool
     int _maxPoolSize;
+
+    // The number of currently active connections from this pool
+    int _checkedOut;
 };
 
 class DBConnectionHook {
@@ -214,7 +228,7 @@ public:
     void release(const std::string& host, DBClientBase* c);
 
     void addHook(DBConnectionHook* hook);  // we take ownership
-    void appendInfo(BSONObjBuilder& b);
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) const;
 
     /**
      * Clears all connections for all host.
@@ -264,7 +278,7 @@ private:
 
     typedef std::map<PoolKey, PoolForHost, poolKeyCompare> PoolMap;  // servername -> pool
 
-    stdx::mutex _mutex;
+    mutable stdx::mutex _mutex;
     std::string _name;
 
     // The maximum number of connections we'll save in the pool per-host

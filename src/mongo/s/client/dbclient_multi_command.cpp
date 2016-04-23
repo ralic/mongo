@@ -88,15 +88,17 @@ static void sayAsCmd(DBClientBase* conn, StringData dbName, const BSONObj& cmdOb
     BSONObjBuilder metadataBob;
     metadataBob.appendElements(upconvertedMetadata);
     if (conn->getRequestMetadataWriter()) {
-        conn->getRequestMetadataWriter()(&metadataBob);
+        conn->getRequestMetadataWriter()(&metadataBob, conn->getServerAddress());
     }
 
     requestBuilder->setDatabase(dbName);
     requestBuilder->setCommandName(upconvertedCmd.firstElementFieldName());
-    requestBuilder->setMetadata(metadataBob.done());
     requestBuilder->setCommandArgs(upconvertedCmd);
+    requestBuilder->setMetadata(metadataBob.done());
+
     // Send our command
-    conn->say(*requestBuilder->done());
+    auto requestMsg = requestBuilder->done();
+    conn->say(requestMsg);
 }
 
 // THROWS

@@ -30,7 +30,6 @@
 
 #include "mongo/db/pipeline/document_source.h"
 
-
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -38,8 +37,7 @@
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
-#include "mongo/db/storage_options.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
 
@@ -94,7 +92,9 @@ void DocumentSourceCursor::loadBatch() {
     BSONObj obj;
     PlanExecutor::ExecState state;
     while ((state = _exec->getNext(&obj, NULL)) == PlanExecutor::ADVANCED) {
-        if (_dependencies) {
+        if (_shouldProduceEmptyDocs) {
+            _currentBatch.push_back(Document());
+        } else if (_dependencies) {
             _currentBatch.push_back(_dependencies->extractFields(obj));
         } else {
             _currentBatch.push_back(Document::fromBsonWithMetaData(obj));
@@ -135,29 +135,29 @@ void DocumentSourceCursor::loadBatch() {
             state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);
 }
 
-void DocumentSourceCursor::setSource(DocumentSource* pSource) {
-    /* this doesn't take a source */
-    verify(false);
-}
-
 long long DocumentSourceCursor::getLimit() const {
     return _limit ? _limit->getLimit() : -1;
 }
 
-bool DocumentSourceCursor::coalesce(const intrusive_ptr<DocumentSource>& nextSource) {
-    // Note: Currently we assume the $limit is logically after any $sort or
-    // $match. If we ever pull in $match or $sort using this method, we
-    // will need to keep track of the order of the sub-stages.
+Pipeline::SourceContainer::iterator DocumentSourceCursor::optimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    invariant(*itr == this);
 
-    if (!_limit) {
-        _limit = dynamic_cast<DocumentSourceLimit*>(nextSource.get());
-        return _limit.get();  // false if next is not a $limit
-    } else {
-        return _limit->coalesce(nextSource);
+    auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
+
+    if (nextLimit) {
+        if (_limit) {
+            // We already have an internal limit, set it to the more restrictive of the two.
+            _limit->setLimit(std::min(_limit->getLimit(), nextLimit->getLimit()));
+        } else {
+            _limit = nextLimit;
+        }
+        container->erase(std::next(itr));
+        return itr;
     }
-
-    return false;
+    return std::next(itr);
 }
+
 
 Value DocumentSourceCursor::serialize(bool explain) const {
     // we never parse a documentSourceCursor, so we only serialize for explain

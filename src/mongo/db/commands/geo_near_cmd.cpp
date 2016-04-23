@@ -30,6 +30,7 @@
 
 #include <vector>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
@@ -39,14 +40,18 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/geoparser.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/platform/unordered_map.h"
 #include "mongo/util/log.h"
@@ -60,7 +65,7 @@ class Geo2dFindNearCmd : public Command {
 public:
     Geo2dFindNearCmd() : Command("geoNear") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     bool slaveOk() const {
@@ -71,6 +76,10 @@ public:
     }
     bool supportsReadConcern() const final {
         return true;
+    }
+
+    std::size_t reserveBytesForReply() const override {
+        return FindCommon::kInitReplyBufferSize;
     }
 
     void help(stringstream& h) const {
@@ -157,7 +166,21 @@ public:
         }
         BSONObj rewritten = queryBob.obj();
 
-        // cout << "rewritten query: " << rewritten.toString() << endl;
+        // Extract the collation, if it exists.
+        // TODO SERVER-23473: Pass this collation spec object down so that it can be converted into
+        // a CollatorInterface.
+        BSONObj collation;
+        {
+            BSONElement collationElt;
+            Status collationEltStatus =
+                bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElt);
+            if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
+                return appendCommandStatus(result, collationEltStatus);
+            }
+            if (collationEltStatus.isOK()) {
+                collation = collationElt.Obj();
+            }
+        }
 
         long long numWanted = 100;
         const char* limitName = !cmdObj["num"].eoo() ? "num" : "limit";
@@ -184,9 +207,9 @@ public:
         BSONObj projObj = BSON("$pt" << BSON("$meta" << LiteParsedQuery::metaGeoNearPoint) << "$dis"
                                      << BSON("$meta" << LiteParsedQuery::metaGeoNearDistance));
 
-        const WhereCallbackReal whereCallback(txn, nss.db());
+        const ExtensionsCallbackReal extensionsCallback(txn, &nss);
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), whereCallback);
+            nss, rewritten, BSONObj(), projObj, 0, numWanted, BSONObj(), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             errmsg = "Can't parse filter / create query";
             return false;
@@ -212,7 +235,8 @@ public:
 
         BSONObj currObj;
         long long results = 0;
-        while ((results < numWanted) && PlanExecutor::ADVANCED == exec->getNext(&currObj, NULL)) {
+        PlanExecutor::ExecState state;
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&currObj, NULL))) {
             // Come up with the correct distance.
             double dist = currObj["$dis"].number() * distanceMultiplier;
             totalDistance += dist;
@@ -249,24 +273,48 @@ public:
             }
             oneResultBuilder.append("obj", resObj);
             oneResultBuilder.done();
+
             ++results;
+
+            // Break if we have the number of requested result documents.
+            if (results >= numWanted) {
+                break;
+            }
         }
 
         resultBuilder.done();
 
+        // Return an error if execution fails for any reason.
+        if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
+            log() << "Plan executor error during geoNear command: " << PlanExecutor::statestr(state)
+                  << ", stats: " << Explain::getWinningPlanStats(exec.get());
+
+            return appendCommandStatus(result,
+                                       Status(ErrorCodes::OperationFailed,
+                                              str::stream()
+                                                  << "Executor error during geoNear command: "
+                                                  << WorkingSetCommon::toStatusString(currObj)));
+        }
+
+        PlanSummaryStats summary;
+        Explain::getSummaryStats(*exec, &summary);
+
         // Fill out the stats subobj.
         BSONObjBuilder stats(result.subobjStart("stats"));
 
-        // Fill in nscanned from the explain.
-        PlanSummaryStats summary;
-        Explain::getSummaryStats(*exec, &summary);
         stats.appendNumber("nscanned", summary.totalKeysExamined);
         stats.appendNumber("objectsLoaded", summary.totalDocsExamined);
 
-        stats.append("avgDistance", totalDistance / results);
+        if (results > 0) {
+            stats.append("avgDistance", totalDistance / results);
+        }
         stats.append("maxDistance", farthestDist);
         stats.append("time", CurOp::get(txn)->elapsedMillis());
         stats.done();
+
+        collection->infoCache()->notifyOfQuery(txn, summary.indexesUsed);
+
+        CurOp::get(txn)->debug().setPlanSummaryMetrics(summary);
 
         return true;
     }

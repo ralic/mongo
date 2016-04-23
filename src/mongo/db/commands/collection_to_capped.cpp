@@ -39,7 +39,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -56,7 +55,7 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
     virtual void help(stringstream& help) const {
@@ -112,7 +111,7 @@ public:
         if (!db) {
             return appendCommandStatus(
                 result,
-                Status(ErrorCodes::DatabaseNotFound,
+                Status(ErrorCodes::NamespaceNotFound,
                        str::stream() << "database " << dbname << " not found"));
         }
 
@@ -132,7 +131,7 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
     virtual void help(stringstream& help) const {

@@ -31,6 +31,7 @@
 #include "mongo/db/ops/modifier_push.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 #include "mongo/base/error_codes.h"
@@ -103,9 +104,9 @@ Status parseEachMode(ModifierPush::ModifierPushMode pushMode,
     *eachElem = modExpr.embeddedObject()[kEach];
     if (eachElem->type() != Array) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "The argument to $each in $push must be"
-                                       " an array but it was of type "
-                                    << typeName(eachElem->type()));
+                      str::stream()
+                          << "The argument to $each in $push must be"
+                             " an array but it was of type: " << typeName(eachElem->type()));
     }
 
     // There must be only one $each clause.
@@ -263,7 +264,7 @@ Status ModifierPush::init(const BSONElement& modExpr, const Options& opts, bool*
             if (_pushMode == PUSH_ALL) {
                 return Status(ErrorCodes::BadValue,
                               str::stream() << "$pushAll requires an array of values "
-                                               "but was given an " << typeName(modExpr.type()));
+                                               "but was given type: " << typeName(modExpr.type()));
             }
 
             _val = modExpr;
@@ -279,7 +280,7 @@ Status ModifierPush::init(const BSONElement& modExpr, const Options& opts, bool*
         if (!sliceElem.isNumber()) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "The value for $slice must "
-                                           "be a numeric value not a "
+                                           "be a numeric value but was given type: "
                                         << typeName(sliceElem.type()));
         }
 
@@ -302,38 +303,41 @@ Status ModifierPush::init(const BSONElement& modExpr, const Options& opts, bool*
             return Status(ErrorCodes::BadValue, "cannot use $position in $pushAll");
         }
 
-        if (!positionElem.isNumber()) {
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "The value for $position must "
-                                           "be a positive numeric value not a "
-                                        << typeName(positionElem.type()));
+        // Check that $position can be represented by a 32-bit integer.
+        switch (positionElem.type()) {
+            case NumberInt:
+                break;
+            case NumberLong:
+                if (positionElem.numberInt() != positionElem.numberLong()) {
+                    return Status(
+                        ErrorCodes::BadValue,
+                        "The $position value in $push must be representable as a 32-bit integer.");
+                }
+                break;
+            case NumberDouble: {
+                const auto doubleVal = positionElem.numberDouble();
+                if (doubleVal != 0.0) {
+                    if (!std::isnormal(doubleVal) || (doubleVal != positionElem.numberInt())) {
+                        return Status(ErrorCodes::BadValue,
+                                      "The $position value in $push must be representable as a "
+                                      "32-bit integer.");
+                    }
+                }
+                break;
+            }
+            default:
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The value for $position must "
+                                               "be a non-negative numeric value, not of type: "
+                                            << typeName(positionElem.type()));
         }
 
-        // TODO: Cleanup and unify numbers wrt getting int32/64 bson values (from doubles)
-
-        // If the value of position is not fraction, even if it's a double, we allow it. The
-        // reason here is that the shell will use doubles by default unless told otherwise.
-        const double doubleVal = positionElem.numberDouble();
-        if (doubleVal - static_cast<int64_t>(doubleVal) != 0) {
-            return Status(ErrorCodes::BadValue,
-                          "The $position value in $push cannot be fractional");
+        if (positionElem.numberInt() < 0) {
+            return {
+                Status(ErrorCodes::BadValue, "The $position value in $push must be non-negative.")};
         }
 
-        if (static_cast<double>(numeric_limits<int64_t>::max()) < doubleVal) {
-            return Status(ErrorCodes::BadValue,
-                          "The $position value in $push is too large a number.");
-        }
-
-        if (static_cast<double>(numeric_limits<int64_t>::min()) > doubleVal) {
-            return Status(ErrorCodes::BadValue,
-                          "The $position value in $push is too small a number.");
-        }
-
-        const int64_t tempVal = positionElem.numberLong();
-        if (tempVal < 0)
-            return Status(ErrorCodes::BadValue, "The $position value in $push must be positive.");
-
-        _startPosition = size_t(tempVal);
+        _startPosition = size_t(positionElem.numberInt());
     }
 
     // Is sort present and correct?
@@ -490,7 +494,7 @@ Status ModifierPush::apply() const {
     // 1. Create the doc array we'll push into, if it is not there
     // 2. Add the items in the $each array (or the simple $push) to the doc array
     // 3. Sort the resulting array according to $sort clause, if present
-    // 4. Trim the resulting array according the $slice clasue, if present
+    // 4. Trim the resulting array according the $slice clause, if present
     //
     // TODO There are _lots_ of optimization opportunities that we'll consider once the
     // test coverage is adequate.

@@ -56,7 +56,7 @@ class BasicDriverHelper : public Command {
 public:
     BasicDriverHelper(const char* name) : Command(name) {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {

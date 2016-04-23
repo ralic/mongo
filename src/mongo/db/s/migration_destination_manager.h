@@ -34,6 +34,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
+#include "mongo/db/s/migration_session_id.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
@@ -41,6 +42,7 @@
 
 namespace mongo {
 
+class NamespaceString;
 class OperationContext;
 class Status;
 struct WriteConcernOptions;
@@ -64,7 +66,7 @@ public:
     State getState() const;
     void setState(State newState);
 
-    bool getActive() const;
+    bool isActive() const;
 
     /**
      * Reports the state of the migration manager as a BSON document.
@@ -75,6 +77,7 @@ public:
      * Returns OK if migration started successfully.
      */
     Status start(const std::string& ns,
+                 const MigrationSessionId& sessionId,
                  const std::string& fromShard,
                  const BSONObj& min,
                  const BSONObj& max,
@@ -84,13 +87,14 @@ public:
 
     void abort();
 
-    bool startCommit();
+    bool startCommit(const MigrationSessionId& sessionId);
 
 private:
     /**
      * Thread which drives the migration apply process on the recipient side.
      */
     void _migrateThread(std::string ns,
+                        MigrationSessionId sessionId,
                         BSONObj min,
                         BSONObj max,
                         BSONObj shardKeyPattern,
@@ -100,6 +104,7 @@ private:
 
     void _migrateDriver(OperationContext* txn,
                         const std::string& ns,
+                        const MigrationSessionId& sessionId,
                         const BSONObj& min,
                         const BSONObj& max,
                         const BSONObj& shardKeyPattern,
@@ -122,12 +127,45 @@ private:
                              const repl::OpTime& lastOpApplied,
                              const WriteConcernOptions& writeConcern);
 
+    /**
+     * Remembers a chunk range between 'min' and 'max' as a range which will have data migrated
+     * into it.  This data can then be protected against cleanup of orphaned data.
+     *
+     * Overlapping pending ranges will be removed, so it is only safe to use this when you know
+     * your metadata view is definitive, such as at the start of a migration.
+     *
+     * TODO: Because migrations may currently be active when a collection drops, an epoch is
+     * necessary to ensure the pending metadata change is still applicable.
+     */
+    Status _notePending(OperationContext* txn,
+                        const NamespaceString& nss,
+                        const BSONObj& min,
+                        const BSONObj& max,
+                        const OID& epoch);
+
+    /**
+     * Stops tracking a chunk range between 'min' and 'max' that previously was having data
+     * migrated into it.  This data is no longer protected against cleanup of orphaned data.
+     *
+     * To avoid removing pending ranges of other operations, ensure that this is only used when
+     * a migration is still active.
+     *
+     * TODO: Because migrations may currently be active when a collection drops, an epoch is
+     * necessary to ensure the pending metadata change is still applicable.
+     */
+    Status _forgetPending(OperationContext* txn,
+                          const NamespaceString& nss,
+                          const BSONObj& min,
+                          const BSONObj& max,
+                          const OID& epoch);
+
     // Mutex to guard all fields
     mutable stdx::mutex _mutex;
 
-    // Whether the prepare method has been called along with a condition variable on which to wait
-    // for prepare to be called
-    bool _active;
+    // Migration session ID uniquely identifies the migration and indicates whether the prepare
+    // method has been called.
+    boost::optional<MigrationSessionId> _sessionId{boost::none};
+    // A condition variable on which to wait for the prepare method to be called.
     stdx::condition_variable _isActiveCV;
 
     stdx::thread _migrateThreadHandle;
@@ -139,44 +177,17 @@ private:
     BSONObj _max;
     BSONObj _shardKeyPattern;
 
-    long long _numCloned;
-    long long _clonedBytes;
-    long long _numCatchup;
-    long long _numSteady;
+    // Set to true once we have accepted the chunk as pending into our metadata. Used so that on
+    // failure we can perform the appropriate cleanup.
+    bool _chunkMarkedPending{false};
 
-    State _state;
+    long long _numCloned{0};
+    long long _clonedBytes{0};
+    long long _numCatchup{0};
+    long long _numSteady{0};
+
+    State _state{READY};
     std::string _errmsg;
-};
-
-class MoveTimingHelper {
-public:
-    MoveTimingHelper(OperationContext* txn,
-                     const std::string& where,
-                     const std::string& ns,
-                     const BSONObj& min,
-                     const BSONObj& max,
-                     int totalNumSteps,
-                     std::string* cmdErrmsg,
-                     const std::string& toShard,
-                     const std::string& fromShard);
-    ~MoveTimingHelper();
-
-    void done(int step);
-
-private:
-    // Measures how long the receiving of a chunk takes
-    Timer _t;
-
-    OperationContext* const _txn;
-    const std::string _where;
-    const std::string _ns;
-    const std::string _to;
-    const std::string _from;
-    const int _totalNumSteps;
-    const std::string* _cmdErrmsg;
-
-    int _nextStep;
-    BSONObjBuilder _b;
 };
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -7,22 +7,6 @@
  */
 
 #include "wt_internal.h"
-
-/*
- * __wt_seconds --
- *	Return the seconds since the Epoch.
- */
-int
-__wt_seconds(WT_SESSION_IMPL *session, time_t *timep)
-{
-	struct timespec t;
-
-	WT_RET(__wt_epoch(session, &t));
-
-	*timep = t.tv_sec;
-
-	return (0);
-}
 
 /*
  * __wt_epoch --

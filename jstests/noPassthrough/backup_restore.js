@@ -8,57 +8,48 @@
  * - fsyncUnlock (or start) Secondary
  * - Start mongod as hidden secondary
  * - Wait until new hidden node becomes secondary
+ *
+ * Some methods for backup used in this test checkpoint the files in the dbpath. This technique will
+ * not work for ephemeral storage engines, as they do not store any data in the dbpath.
+ * @tags: [requires_persistence]
  */
 
 (function() {
     "use strict";
 
-    function runCmd (cmd) {
-        runProgram('bash', '-c',  cmd);
+    function runCmd(cmd) {
+        runProgram('bash', '-c', cmd);
     }
 
     function crudClient(host, dbName, coll) {
         // Launch CRUD client
-        var crudClientCmds = "var bulkNum = 1000;" +
-            "var baseNum = 100000;" +
+        var crudClientCmds = "var bulkNum = 1000;" + "var baseNum = 100000;" +
             "var coll = db.getSiblingDB('" + dbName + "')." + coll + ";" +
-            "coll.ensureIndex({x: 1});" +
-            "var largeValue = new Array(1024).join('L');" +
+            "coll.ensureIndex({x: 1});" + "var largeValue = new Array(1024).join('L');" +
             "Random.setRandomSeed();" +
             // run indefinitely
-            "while (true) {" +
-            "   try {" +
-            "       var op = Random.rand();" +
-            "       var match = Math.floor(Random.rand() * baseNum);" +
-            "       if (op < 0.2) {" +
+            "while (true) {" + "   try {" + "       var op = Random.rand();" +
+            "       var match = Math.floor(Random.rand() * baseNum);" + "       if (op < 0.2) {" +
             // 20% of the operations: bulk insert bulkNum docs
             "           var bulk = coll.initializeUnorderedBulkOp();" +
             "           for (var i = 0; i < bulkNum; i++) {" +
             "               bulk.insert({x: (match * i) % baseNum," +
             "                   doc: largeValue.substring(0, match % largeValue.length)});" +
-            "           }" +
-            "           assert.writeOK(bulk.execute());" +
+            "           }" + "           assert.writeOK(bulk.execute());" +
             "       } else if (op < 0.4) {" +
             // 20% of the operations: update docs;
             "           var updateOpts = {upsert: true, multi: true};" +
-            "           assert.writeOK(coll.update(" +
-            "               {x: {$gte: match}}," +
+            "           assert.writeOK(coll.update(" + "               {x: {$gte: match}}," +
             "               {$inc: {x: baseNum}, $set: {n: 'hello'}}," +
-            "               updateOpts));" +
-            "       } else if (op < 0.9) {" +
+            "               updateOpts));" + "       } else if (op < 0.9) {" +
             // 50% of the operations: find matchings docs
             // itcount() consumes the cursor
-            "           coll.find({x: {$gte: match}}).itcount();" +
-            "       } else {" +
+            "           coll.find({x: {$gte: match}}).itcount();" + "       } else {" +
             // 10% of the operations: remove matching docs
-            "           assert.writeOK(coll.remove({x: {$gte: match}}));" +
-            "       }" +
+            "           assert.writeOK(coll.remove({x: {$gte: match}}));" + "       }" +
             "   } catch(e) {" +
             "       if (e instanceof ReferenceError || e instanceof TypeError) {" +
-            "           throw e;" +
-            "       }" +
-            "   }" +
-            "}";
+            "           throw e;" + "       }" + "   }" + "}";
 
         // Returns the pid of the started mongo shell so the CRUD test client can be terminated
         // without waiting for its execution to finish.
@@ -71,25 +62,17 @@
         // started without any cluster options. Since the shell running this test was started with
         // --nodb, another mongo shell is used to allow implicit connections to be made to the
         // primary of the replica set.
-        var fsmClientCmds = "'use strict';" +
-            "load('jstests/concurrency/fsm_libs/runner.js');" +
-            "var dir = 'jstests/concurrency/fsm_workloads';" +
-            "var blacklist = [" +
-            "    'agg_group_external.js'," +
-            "    'agg_sort_external.js'," +
-            "    'auth_create_role.js'," +
-            "    'auth_create_user.js'," +
-            "    'auth_drop_role.js'," +
-            "    'auth_drop_user.js'," +
-            "    'reindex_background.js'," +
-            "    'yield_sort.js'," +
-            "].map(function(file) { return dir + '/' + file; });" +
+        var fsmClientCmds = "'use strict';" + "load('jstests/concurrency/fsm_libs/runner.js');" +
+            "var dir = 'jstests/concurrency/fsm_workloads';" + "var blacklist = [" +
+            "    'agg_group_external.js'," + "    'agg_sort_external.js'," +
+            "    'auth_create_role.js'," + "    'auth_create_user.js'," +
+            "    'auth_drop_role.js'," + "    'auth_drop_user.js'," +
+            "    'reindex_background.js'," + "    'yield_sort.js'," +
+            "].map(function(file) { return dir + '/' + file; });" + "Random.setRandomSeed();" +
             // run indefinitely
-            "while (true) {" +
-            "   try {" +
+            "while (true) {" + "   try {" +
             "       var workloads = Array.shuffle(ls(dir).filter(function(file) {" +
-            "           return !Array.contains(blacklist, file);" +
-            "       }));" +
+            "           return !Array.contains(blacklist, file);" + "       }));" +
             // Run workloads one at a time, so we ensure replication completes
             "       workloads.forEach(function(workload) {" +
             "           runWorkloadsSerially([workload]," +
@@ -99,14 +82,10 @@
             "           var result = db.getSiblingDB('test').fsm_teardown.insert({ a: 1 }, wc);" +
             "           assert.writeOK(result, 'teardown insert failed: ' + tojson(result));" +
             "           result = db.getSiblingDB('test').fsm_teardown.drop();" +
-            "           assert(result, 'teardown drop failed');" +
-            "       });" +
+            "           assert(result, 'teardown drop failed');" + "       });" +
             "   } catch(e) {" +
             "       if (e instanceof ReferenceError || e instanceof TypeError) {" +
-            "           throw e;" +
-            "       }" +
-            "   }" +
-            "}";
+            "           throw e;" + "       }" + "   }" + "}";
 
         // Returns the pid of the started mongo shell so the FSM test client can be terminated
         // without waiting for its execution to finish.
@@ -127,9 +106,10 @@
         // Backup type (must be specified)
         var allowedBackupKeys = ['fsyncLock', 'stopStart', 'rolling'];
         assert(options.backup, "Backup option not supplied");
-        assert.contains(options.backup, allowedBackupKeys,
-                        'invalid option: ' + tojson(options.backup) +
-                        '; valid options are: ' + tojson(allowedBackupKeys));
+        assert.contains(options.backup,
+                        allowedBackupKeys,
+                        'invalid option: ' + tojson(options.backup) + '; valid options are: ' +
+                            tojson(allowedBackupKeys));
 
         // Number of nodes in initial replica set (default 3)
         var numNodes = options.nodes || 3;
@@ -147,14 +127,13 @@
         var rst = new ReplSetTest({
             name: replSetName,
             nodes: numNodes,
-            nodeOptions: {
-                oplogSize: 1024,
-                storageEngine: storageEngine,
-                dbpath: dbpathFormat
-            }
+            nodeOptions: {oplogSize: 1024, storageEngine: storageEngine, dbpath: dbpathFormat}
         });
         var nodes = rst.startSet();
-        rst.initiate();
+
+        // Wait up to 5 minutes for the replica set to initiate. We allow extra time because
+        // allocating 1GB oplogs on test hosts can be slow with mmapv1.
+        rst.initiate(null, null, 5 * 60 * 1000);
         var primary = rst.getPrimary();
         var secondary = rst.getSecondary();
 
@@ -169,8 +148,16 @@
         // Let clients run for specified time before backing up secondary
         sleep(clientTime);
 
-        // Perform fsync to create checkpoint
-        assert.commandWorked(primary.adminCommand({fsync : 1}), testName + ' failed to fsync');
+        // Perform fsync to create checkpoint. We doublecheck if the storage engine
+        // supports fsync here.
+        var ret = primary.adminCommand({fsync: 1});
+
+        if (!ret.ok) {
+            assert.commandFailedWithCode(ret, ErrorCodes.CommandNotSupported);
+            jsTestLog("Skipping test of " + options.backup + " for " + storageEngine +
+                      ' as it does not support fsync');
+            return;
+        }
 
         // Configure new hidden secondary
         var dbpathSecondary = secondary.dbpath;
@@ -191,9 +178,15 @@
 
         // Perform the data backup to new secondary
         if (options.backup == 'fsyncLock') {
-            // Lock the DB for write, get dbhash & copy DB files for hidden secondary
-            assert.commandWorked(secondary.getDB("admin").fsyncLock(), testName +
-                                 ' failed to fsyncLock');
+            // Test that the secondary supports fsyncLock
+            var ret = secondary.getDB("admin").fsyncLock();
+            if (!ret.ok) {
+                assert.commandFailedWithCode(ret, ErrorCodes.CommandNotSupported);
+                jsTestLog("Skipping test of " + options.backup + " for " + storageEngine +
+                          ' as it does not support fsync');
+                return;
+            }
+
             dbHash = secondary.getDB(crudDb).runCommand({dbhash: 1}).md5;
             copyDbpath(dbpathSecondary, hiddenDbpath);
             removeFile(hiddenDbpath + '/mongod.lock');
@@ -201,8 +194,8 @@
             copiedFiles = ls(hiddenDbpath);
             print("Copied files:", tojson(copiedFiles));
             assert.gt(copiedFiles.length, 0, testName + ' no files copied');
-            assert.commandWorked(secondary.getDB("admin").fsyncUnlock(), testName +
-                                 ' failed to fsyncUnlock');
+            assert.commandWorked(secondary.getDB("admin").fsyncUnlock(),
+                                 testName + ' failed to fsyncUnlock');
         } else if (options.backup == 'rolling') {
             var rsyncCmd = "rsync -aKkz --del " + sourcePath + " " + destPath;
             // Simulate a rolling rsync, do it 3 times before stopping process
@@ -233,7 +226,7 @@
         }
 
         // Wait up to 60 seconds until restarted node is in state secondary
-        rst.waitForState(rst.getSecondaries(), rst.SECONDARY, 60 * 1000);
+        rst.waitForState(rst.getSecondaries(), ReplSetTest.State.SECONDARY, 60 * 1000);
 
         // Add new hidden node to replSetTest
         var hiddenCfg = {
@@ -249,8 +242,16 @@
         // Note the dbhash can only run when the DB is inactive to get a result
         // that can be compared, which is only in the fsyncLock/fsynUnlock case
         if (dbHash !== undefined) {
-            assert(dbHash, rst.nodes[numNodes].getDB(crudDb).runCommand({dbhash: 1}).md5,
-                   testName + ' dbHash');
+            assert.soon(function() {
+                try {
+                    // Need to hammer this since the node can disconnect connections as it is
+                    // starting up into REMOVED replication state.
+                    return (dbHash ===
+                            rst.nodes[numNodes].getDB(crudDb).runCommand({dbhash: 1}).md5);
+                } catch (e) {
+                    return false;
+                }
+            });
         }
 
         // Add new hidden secondary to replica set
@@ -263,17 +264,24 @@
             hidden: true
         };
         rsConfig.members.push(hiddenMember);
-        assert.commandWorked(primary.adminCommand({replSetReconfig : rsConfig}), testName +
-                             ' failed to reconfigure replSet ' + tojson(rsConfig));
+        assert.commandWorked(primary.adminCommand({replSetReconfig: rsConfig}),
+                             testName + ' failed to reconfigure replSet ' + tojson(rsConfig));
 
-        // Wait up to 60 seconds until the new hidden node is in state secondary
-        rst.waitForState(rst.nodes[numNodes], rst.SECONDARY, 60 * 1000);
+        // Wait up to 60 seconds until the new hidden node is in state RECOVERING.
+        rst.waitForState(rst.nodes[numNodes],
+                         [ReplSetTest.State.RECOVERING, ReplSetTest.State.SECONDARY],
+                         60 * 1000);
 
-        // Stop CRUD client, FSM client & replica set mongods
+        // Stop CRUD client and FSM client.
         assert(checkProgram(crudPid), testName + ' CRUD client was not running at end of test');
         assert(checkProgram(fsmPid), testName + ' FSM client was not running at end of test');
         stopMongoProgramByPid(crudPid);
         stopMongoProgramByPid(fsmPid);
+
+        // Wait up to 60 seconds until the new hidden node is in state SECONDARY.
+        rst.waitForState(rst.nodes[numNodes], ReplSetTest.State.SECONDARY, 60 * 1000);
+
+        // Stop set.
         rst.stopSet();
 
         // Cleanup the files from the test
@@ -283,22 +291,19 @@
     }
 
     // Main
+
+    // Add storage engines which are to be skipped entirely to this array
+    var noBackupTests = ['inMemoryExperiment'];
+
+    // Grab the storage engine, default is wiredTiger
     var storageEngine = jsTest.options().storageEngine || "wiredTiger";
 
+    if (noBackupTests.indexOf(storageEngine) != -1) {
+        jsTestLog("Skipping test for " + storageEngine);
+        return;
+    }
+
     if (storageEngine === "wiredTiger") {
-        // fsyncLock does not work for wiredTiger (SERVER-18899)
-        // runTest({
-        //     name: storageEngine + ' fsyncLock/fsyncUnlock',
-        //     storageEngine: storageEngine,
-        //     backup: 'fsyncLock',
-        //     clientTime: 30000
-        // });
-        runTest({
-            name: storageEngine + ' stop/start',
-            storageEngine: storageEngine,
-            backup: 'stopStart',
-            clientTime: 30000
-        });
         // if rsync is not available on the host, then this test is skipped
         if (!runProgram('bash', '-c', 'which rsync')) {
             runTest({
@@ -310,19 +315,21 @@
         } else {
             jsTestLog("Skipping test for " + storageEngine + ' rolling');
         }
-    } else if (storageEngine === 'inMemoryExperiment') {
-        jsTestLog("Skipping test for " + storageEngine);
-    } else {
-        runTest({
-            name: storageEngine + ' fsyncLock/fsyncUnlock',
-            storageEngine: storageEngine,
-            backup: 'fsyncLock'
-        });
-        runTest({
-            name: storageEngine + ' stop/start',
-            storageEngine: storageEngine,
-            backup: 'stopStart'
-        });
     }
+
+    // Run the fsyncLock test. Will return before testing for any engine that doesn't
+    // support fsyncLock
+    runTest({
+        name: storageEngine + ' fsyncLock/fsyncUnlock',
+        storageEngine: storageEngine,
+        backup: 'fsyncLock'
+    });
+
+    runTest({
+        name: storageEngine + ' stop/start',
+        storageEngine: storageEngine,
+        backup: 'stopStart',
+        clientTime: 30000
+    });
 
 }());

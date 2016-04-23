@@ -41,24 +41,26 @@
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/client.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/metadata/audit_metadata.h"
-#include "mongo/s/client/scc_fast_query_handler.h"
-#include "mongo/s/cluster_last_error_info.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/version_manager.h"
+#include "mongo/s/client/version_manager.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 using std::string;
 
-ShardingConnectionHook::ShardingConnectionHook(bool shardedConnections)
-    : _shardedConnections(shardedConnections) {}
+ShardingConnectionHook::ShardingConnectionHook(
+    bool shardedConnections, std::unique_ptr<rpc::ShardingEgressMetadataHook> egressHook)
+    : _shardedConnections(shardedConnections), _egressHook(std::move(egressHook)) {}
 
 void ShardingConnectionHook::onCreate(DBClientBase* conn) {
+    if (conn->type() == ConnectionString::INVALID) {
+        throw UserException(ErrorCodes::BadValue,
+                            str::stream() << "Unrecognized connection string.");
+    }
+
     // Authenticate as the first thing we do
     // NOTE: Replica set authentication allows authentication against *any* online host
-    if (getGlobalAuthorizationManager()->isAuthEnabled()) {
+    if (isInternalAuthSet()) {
         LOG(2) << "calling onCreate auth for " << conn->toString();
 
         bool result = conn->authenticateInternalUser();
@@ -68,33 +70,19 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
                 result);
     }
 
+    // Delegate the metadata hook logic to the egress hook; use lambdas to pass the arguments in
+    // the order expected by the egress hook.
     if (_shardedConnections) {
-        // For every DBClient created by mongos, add a hook that will capture the response from
-        // commands we pass along from the client, so that we can target the correct node when
-        // subsequent getLastError calls are made by mongos.
-        conn->setReplyMetadataReader([](const BSONObj& metadataObj, StringData hostString)
-                                         -> Status {
-                                             saveGLEStats(metadataObj, hostString);
-                                             return Status::OK();
-                                         });
+        conn->setReplyMetadataReader([this](const BSONObj& metadataObj, StringData target) {
+            return _egressHook->readReplyMetadata(target, metadataObj);
+        });
     }
-
-    // For every DBClient created by mongos, add a hook that will append impersonated users
-    // to the end of every runCommand.  mongod uses this information to produce auditing
-    // records attributed to the proper authenticated user(s).
-    conn->setRequestMetadataWriter([](BSONObjBuilder* metadataBob) -> Status {
-        audit::writeImpersonatedUsersToMetadata(metadataBob);
-        return Status::OK();
+    conn->setRequestMetadataWriter([this](BSONObjBuilder* metadataBob, StringData hostStringData) {
+        return _egressHook->writeRequestMetadata(_shardedConnections, hostStringData, metadataBob);
     });
 
-    // For every SCC created, add a hook that will allow fastest-config-first config reads if
-    // the appropriate server options are set.
-    if (conn->type() == ConnectionString::SYNC) {
-        SyncClusterConnection* scc = dynamic_cast<SyncClusterConnection*>(conn);
-        if (scc) {
-            scc->attachQueryHandler(new SCCFastQueryHandler);
-        }
-    } else if (conn->type() == ConnectionString::MASTER) {
+
+    if (conn->type() == ConnectionString::MASTER) {
         BSONObj isMasterResponse;
         if (!conn->runCommand("admin", BSON("ismaster" << 1), isMasterResponse)) {
             uassertStatusOK(getStatusFromCommandResult(isMasterResponse));
@@ -114,12 +102,6 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
                               << ". Expected either 0 or 1",
                 configServerModeNumber == 0 || configServerModeNumber == 1);
 
-        BSONElement setName = isMasterResponse["setName"];
-        status = grid.catalogManager()->scheduleReplaceCatalogManagerIfNeeded(
-            configServerModeNumber == 0 ? CatalogManager::ConfigServerMode::SCCC
-                                        : CatalogManager::ConfigServerMode::CSRS,
-            setName.type() == String ? setName.valueStringData() : StringData(),
-            static_cast<DBClientConnection*>(conn)->getServerHostAndPort());
         uassertStatusOK(status);
     }
 }

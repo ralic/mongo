@@ -85,7 +85,7 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -104,6 +104,11 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << nss.ns() << " is not a valid namespace",
+                nss.isValid());
+
         vector<BSONObj> bounds;
         if (!FieldParser::extract(cmdObj, boundsField, &bounds, &errmsg)) {
             return false;
@@ -130,12 +135,6 @@ public:
         if (maxKey.isEmpty()) {
             errmsg = "no max key specified";
             return false;
-        }
-
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        if (nss.size() == 0) {
-            return appendCommandStatus(
-                result, Status(ErrorCodes::InvalidNamespace, "no namespace specified"));
         }
 
         auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());

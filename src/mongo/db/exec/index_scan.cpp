@@ -94,6 +94,9 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     // Perform the possibly heavy-duty initialization of the underlying index cursor.
     _indexCursor = _iam->newCursor(getOpCtx(), _forward);
 
+    // We always seek once to establish the cursor position.
+    ++_specificStats.seeks;
+
     if (_params.bounds.isSimpleRange) {
         // Start at one key, end at another.
         _endKey = _params.bounds.endKey;
@@ -121,12 +124,7 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     }
 }
 
-PlanStage::StageState IndexScan::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     // Get the next kv pair from the index, if any.
     boost::optional<IndexKeyEntry> kv;
     try {
@@ -138,6 +136,7 @@ PlanStage::StageState IndexScan::work(WorkingSetID* out) {
                 kv = _indexCursor->next();
                 break;
             case NEED_SEEK:
+                ++_specificStats.seeks;
                 kv = _indexCursor->seek(_seekPoint);
                 break;
             case HIT_END:
@@ -176,7 +175,6 @@ PlanStage::StageState IndexScan::work(WorkingSetID* out) {
 
             case IndexBoundsChecker::MUST_ADVANCE:
                 _scanState = NEED_SEEK;
-                _commonStats.needTime++;
                 return PlanStage::NEED_TIME;
         }
     }
@@ -195,14 +193,12 @@ PlanStage::StageState IndexScan::work(WorkingSetID* out) {
         if (!_returned.insert(kv->loc).second) {
             // We've seen this RecordId before. Skip it this time.
             ++_specificStats.dupsDropped;
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
     }
 
     if (_filter) {
         if (!Filter::passes(kv->key, _keyPattern, _filter)) {
-            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
     }
@@ -213,9 +209,9 @@ PlanStage::StageState IndexScan::work(WorkingSetID* out) {
     // We found something to return, so fill out the WSM.
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
-    member->loc = kv->loc;
+    member->recordId = kv->loc;
     member->keyData.push_back(IndexKeyDatum(_keyPattern, kv->key, _iam));
-    _workingSet->transitionToLocAndIdx(id);
+    _workingSet->transitionToRecordIdAndIdx(id);
 
     if (_params.addKeyMetadata) {
         BSONObjBuilder bob;
@@ -224,7 +220,6 @@ PlanStage::StageState IndexScan::work(WorkingSetID* out) {
     }
 
     *out = id;
-    ++_commonStats.advanced;
     return PlanStage::ADVANCED;
 }
 
@@ -282,7 +277,7 @@ std::unique_ptr<PlanStageStats> IndexScan::getStats() {
     // Add a BSON representation of the filter to the stats tree, if there is one.
     if (NULL != _filter) {
         BSONObjBuilder bob;
-        _filter->toBSON(&bob);
+        _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
     }
 

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -202,7 +202,7 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
  * past the last committed transaction.
 */
 void
-__wt_txn_update_oldest(WT_SESSION_IMPL *session, int force)
+__wt_txn_update_oldest(WT_SESSION_IMPL *session, bool force)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_SESSION_IMPL *oldest_session;
@@ -211,11 +211,12 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, int force)
 	uint64_t current_id, id, last_running, oldest_id, prev_oldest_id;
 	uint32_t i, session_cnt;
 	int32_t count;
-	int last_running_moved;
+	bool last_running_moved;
 
 	conn = S2C(session);
 	txn_global = &conn->txn_global;
 
+retry:
 	current_id = last_running = txn_global->current;
 	oldest_session = NULL;
 	prev_oldest_id = txn_global->oldest_id;
@@ -287,46 +288,63 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, int force)
 	    WT_TXNID_LT(txn_global->last_running, last_running);
 
 	/* Update the oldest ID. */
-	if ((WT_TXNID_LT(prev_oldest_id, oldest_id) || last_running_moved) &&
-	    __wt_atomic_casiv32(&txn_global->scan_count, 1, -1)) {
-		WT_ORDERED_READ(session_cnt, conn->session_cnt);
-		for (i = 0, s = txn_global->states; i < session_cnt; i++, s++) {
-			if ((id = s->id) != WT_TXN_NONE &&
-			    WT_TXNID_LT(id, last_running))
-				last_running = id;
-			if ((id = s->snap_min) != WT_TXN_NONE &&
-			    WT_TXNID_LT(id, oldest_id))
-				oldest_id = id;
-		}
+	if (WT_TXNID_LT(prev_oldest_id, oldest_id) || last_running_moved) {
+		/*
+		 * We know we want to update.  Check if we're racing.
+		 */
+		if (__wt_atomic_casiv32(&txn_global->scan_count, 1, -1)) {
+			WT_ORDERED_READ(session_cnt, conn->session_cnt);
+			for (i = 0, s = txn_global->states;
+			    i < session_cnt; i++, s++) {
+				if ((id = s->id) != WT_TXN_NONE &&
+				WT_TXNID_LT(id, last_running))
+					last_running = id;
+				if ((id = s->snap_min) != WT_TXN_NONE &&
+				WT_TXNID_LT(id, oldest_id))
+					oldest_id = id;
+			}
 
-		if (WT_TXNID_LT(last_running, oldest_id))
-			oldest_id = last_running;
+			if (WT_TXNID_LT(last_running, oldest_id))
+				oldest_id = last_running;
 
 #ifdef HAVE_DIAGNOSTIC
-		/*
-		 * Make sure the ID doesn't move past any named snapshots.
-		 *
-		 * Don't include the read/assignment in the assert statement.
-		 * Coverity complains if there are assignments only done in
-		 * diagnostic builds, and when the read is from a volatile.
-		 */
-		id = txn_global->nsnap_oldest_id;
-		WT_ASSERT(session,
-		    id == WT_TXN_NONE || !WT_TXNID_LT(id, oldest_id));
+			/*
+			 * Make sure the ID doesn't move past any named
+			 * snapshots.
+			 *
+			 * Don't include the read/assignment in the assert
+			 * statement.  Coverity complains if there are
+			 * assignments only done in diagnostic builds, and
+			 * when the read is from a volatile.
+			 */
+			id = txn_global->nsnap_oldest_id;
+			WT_ASSERT(session,
+			    id == WT_TXN_NONE || !WT_TXNID_LT(id, oldest_id));
 #endif
-		if (WT_TXNID_LT(txn_global->last_running, last_running))
-			txn_global->last_running = last_running;
-		if (WT_TXNID_LT(txn_global->oldest_id, oldest_id))
-			txn_global->oldest_id = oldest_id;
-		WT_ASSERT(session, txn_global->scan_count == -1);
-		txn_global->scan_count = 0;
+			if (WT_TXNID_LT(txn_global->last_running, last_running))
+				txn_global->last_running = last_running;
+			if (WT_TXNID_LT(txn_global->oldest_id, oldest_id))
+				txn_global->oldest_id = oldest_id;
+			WT_ASSERT(session, txn_global->scan_count == -1);
+			txn_global->scan_count = 0;
+		} else {
+			/*
+			 * We wanted to update the oldest ID but we're racing
+			 * another thread.  Retry if this is a forced update.
+			 */
+			WT_ASSERT(session, txn_global->scan_count > 0);
+			(void)__wt_atomic_subiv32(&txn_global->scan_count, 1);
+			if (force) {
+				__wt_yield();
+				goto retry;
+			}
+		}
 	} else {
 		if (WT_VERBOSE_ISSET(session, WT_VERB_TRANSACTION) &&
-		    current_id - oldest_id > 10000 && last_running_moved &&
-		    oldest_session != NULL) {
+		    current_id - oldest_id > 10000 && oldest_session != NULL) {
 			(void)__wt_verbose(session, WT_VERB_TRANSACTION,
 			    "old snapshot %" PRIu64
-			    " pinned in session %d [%s]"
+			    " pinned in session %" PRIu32 " [%s]"
 			    " with snap_min %" PRIu64 "\n",
 			    oldest_id, oldest_session->id,
 			    oldest_session->lastop,
@@ -373,8 +391,11 @@ __wt_txn_config(WT_SESSION_IMPL *session, const char *cfg[])
 		 */
 		F_SET(txn, WT_TXN_SYNC_SET);
 
+	/*
+	 * If sync is turned off explicitly, clear the transaction's sync field.
+	 */
 	if (cval.val == 0)
-		FLD_CLR(txn->txn_logsync, WT_LOG_FLUSH);
+		txn->txn_logsync = 0;
 
 	WT_RET(__wt_config_gets_def(session, cfg, "snapshot", 0, &cval));
 	if (cval.len > 0)
@@ -481,7 +502,7 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	 * explicit setting.
 	 */
 	if (cval.len == 0) {
-		if (!FLD_ISSET(txn->txn_logsync, WT_LOG_FLUSH) &&
+		if (!FLD_ISSET(txn->txn_logsync, WT_LOG_SYNC_ENABLED) &&
 		    !F_ISSET(txn, WT_TXN_SYNC_SET))
 			txn->txn_logsync = 0;
 	} else {
@@ -519,7 +540,6 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 		 */
 		__wt_txn_release_snapshot(session);
 		ret = __wt_txn_log_commit(session, cfg);
-		WT_ASSERT(session, ret == 0);
 	}
 
 	/*
@@ -651,15 +671,20 @@ __wt_txn_stats_update(WT_SESSION_IMPL *session)
 	WT_TXN_GLOBAL *txn_global;
 	WT_CONNECTION_IMPL *conn;
 	WT_CONNECTION_STATS **stats;
-	uint64_t checkpoint_pinned;
+	uint64_t checkpoint_pinned, snapshot_pinned;
 
 	conn = S2C(session);
 	txn_global = &conn->txn_global;
 	stats = conn->stats;
 	checkpoint_pinned = txn_global->checkpoint_pinned;
+	snapshot_pinned = txn_global->nsnap_oldest_id;
 
 	WT_STAT_SET(session, stats, txn_pinned_range,
 	   txn_global->current - txn_global->oldest_id);
+
+	WT_STAT_SET(session, stats, txn_pinned_snapshot_range,
+	    snapshot_pinned == WT_TXN_NONE ?
+	    0 : txn_global->current - snapshot_pinned);
 
 	WT_STAT_SET(session, stats, txn_pinned_checkpoint_range,
 	    checkpoint_pinned == WT_TXN_NONE ?
@@ -708,6 +733,8 @@ __wt_txn_global_init(WT_SESSION_IMPL *session, const char *cfg[])
 	txn_global->current = txn_global->last_running =
 	    txn_global->oldest_id = WT_TXN_FIRST;
 
+	WT_RET(__wt_spin_init(session,
+	    &txn_global->id_lock, "transaction id lock"));
 	WT_RET(__wt_rwlock_alloc(session,
 	    &txn_global->nsnap_rwlock, "named snapshot lock"));
 	txn_global->nsnap_oldest_id = WT_TXN_NONE;
@@ -740,6 +767,7 @@ __wt_txn_global_destroy(WT_SESSION_IMPL *session)
 	if (txn_global == NULL)
 		return (0);
 
+	__wt_spin_destroy(session, &txn_global->id_lock);
 	WT_TRET(__wt_rwlock_destroy(session, &txn_global->nsnap_rwlock));
 	__wt_free(session, txn_global->states);
 

@@ -89,6 +89,8 @@ public:
         const BSONObj& projection = BSONObj(),
         const BSONObj& sort = BSONObj(),
         const BSONObj& hint = BSONObj(),
+        const BSONObj& readConcern = BSONObj(),
+        const BSONObj& collation = BSONObj(),
         boost::optional<long long> skip = boost::none,
         boost::optional<long long> limit = boost::none,
         boost::optional<long long> batchSize = boost::none,
@@ -109,7 +111,7 @@ public:
         bool isOplogReplay = false,
         bool isNoCursorTimeout = false,
         bool isAwaitData = false,
-        bool isPartial = false);
+        bool allowPartialResults = false);
 
     /**
      * Converts this LPQ into a find command.
@@ -118,16 +120,9 @@ public:
     void asFindCommand(BSONObjBuilder* cmdBuilder) const;
 
     /**
-     * Helper functions to parse maxTimeMS from a command object.  Returns the contained value,
-     * or an error on parsing fail.  When passed an EOO-type element, returns 0 (special value
-     * for "allow to run indefinitely").
+     * Parses maxTimeMS from the BSONElement containing its value.
      */
-    static StatusWith<int> parseMaxTimeMSCommand(const BSONObj& cmdObj);
-
-    /**
-     * Same as parseMaxTimeMSCommand, but for a query object.
-     */
-    static StatusWith<int> parseMaxTimeMSQuery(const BSONObj& queryObj);
+    static StatusWith<int> parseMaxTimeMS(BSONElement maxTimeMSElt);
 
     /**
      * Helper function to identify text search sort key
@@ -150,12 +145,19 @@ public:
      */
     static bool isQueryIsolated(const BSONObj& query);
 
-    // Name of the find command parameter used to pass read preference.
-    static const char* kFindCommandReadPrefField;
+    // Read preference is attached to commands in "wrapped" form, e.g.
+    //   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
+    //
+    // However, mongos internally "unwraps" the read preference and adds it as a parameter to the
+    // command, e.g.
+    //  { <cmd>: ... , <kUnwrappedReadPrefField>: { <kWrappedReadPrefField>: { ... } } }
+    static const std::string kWrappedReadPrefField;
+    static const std::string kUnwrappedReadPrefField;
 
     // Names of the maxTimeMS command and query option.
-    static const std::string cmdOptionMaxTimeMS;
-    static const std::string queryOptionMaxTimeMS;
+    // Char arrays because they are used in static initialization.
+    static const char cmdOptionMaxTimeMS[];
+    static const char queryOptionMaxTimeMS[];
 
     // Names of the $meta projection values.
     static const std::string metaGeoNearDistance;
@@ -183,6 +185,12 @@ public:
     }
     const BSONObj& getHint() const {
         return _hint;
+    }
+    const BSONObj& getReadConcern() const {
+        return _readConcern;
+    }
+    const BSONObj& getCollation() const {
+        return _collation;
     }
 
     static const long long kDefaultBatchSize;
@@ -263,8 +271,8 @@ public:
     bool isExhaust() const {
         return _exhaust;
     }
-    bool isPartial() const {
-        return _partial;
+    bool isAllowPartialResults() const {
+        return _allowPartialResults;
     }
 
     boost::optional<long long> getReplicationTerm() const {
@@ -305,8 +313,6 @@ private:
 
     Status initFullQuery(const BSONObj& top);
 
-    static StatusWith<int> parseMaxTimeMS(const BSONElement& maxTimeMSElt);
-
     /**
      * Updates the projection object with a $meta projection for the returnKey option.
      */
@@ -343,6 +349,10 @@ private:
     // the key pattern hinted.  If the hint was by index name, the value of '_hint' is
     // {$hint: <String>}, where <String> is the index name hinted.
     BSONObj _hint;
+    // The read concern is parsed elsewhere.
+    BSONObj _readConcern;
+    // The collation is parsed elsewhere.
+    BSONObj _collation;
 
     bool _wantMore = true;
 
@@ -385,7 +395,7 @@ private:
     bool _noCursorTimeout = false;
     bool _awaitData = false;
     bool _exhaust = false;
-    bool _partial = false;
+    bool _allowPartialResults = false;
 
     boost::optional<long long> _replicationTerm;
 };

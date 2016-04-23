@@ -48,14 +48,14 @@ struct TargeterStats {
 };
 
 /**
- * NSTargeter based on a ChunkManager implementation.  Wraps all exception codepaths and
- * returns DatabaseNotFound statuses on applicable failures.
+ * NSTargeter based on a ChunkManager implementation. Wraps all exception codepaths and returns
+ * NamespaceNotFound status on applicable failures.
  *
  * Must be initialized before use, and initialization may fail.
  */
 class ChunkManagerTargeter : public NSTargeter {
 public:
-    ChunkManagerTargeter(const NamespaceString& nss);
+    ChunkManagerTargeter(const NamespaceString& nss, TargeterStats* stats);
 
     /**
      * Initializes the ChunkManagerTargeter with the latest targeting information for the
@@ -99,11 +99,6 @@ public:
      */
     Status refreshIfNeeded(OperationContext* txn, bool* wasChanged);
 
-    /**
-     * Returns the stats. Note that the returned stats object is still owned by this targeter.
-     */
-    const TargeterStats* getStats() const;
-
 private:
     // Different ways we can refresh metadata
     enum RefreshType {
@@ -128,14 +123,18 @@ private:
      *
      * Returns !OK with message if replacement could not be targeted
      */
-    Status targetDoc(const BSONObj& doc, std::vector<ShardEndpoint*>* endpoints) const;
+    Status targetDoc(OperationContext* txn,
+                     const BSONObj& doc,
+                     std::vector<ShardEndpoint*>* endpoints) const;
 
     /**
      * Returns a vector of ShardEndpoints for a potentially multi-shard query.
      *
      * Returns !OK with message if query could not be targeted.
      */
-    Status targetQuery(const BSONObj& query, std::vector<ShardEndpoint*>* endpoints) const;
+    Status targetQuery(OperationContext* txn,
+                       const BSONObj& query,
+                       std::vector<ShardEndpoint*>* endpoints) const;
 
     /**
      * Returns a ShardEndpoint for an exact shard key query.
@@ -154,8 +153,8 @@ private:
     // Stores whether we need to check the remote server on refresh
     bool _needsTargetingRefresh;
 
-    // Represents only the view and not really part of the targeter state.
-    mutable TargeterStats _stats;
+    // Represents only the view and not really part of the targeter state. This is not owned here.
+    TargeterStats* _stats;
 
     // Zero or one of these are filled at all times
     // If sharded, _manager, if unsharded, _primary, on error, neither

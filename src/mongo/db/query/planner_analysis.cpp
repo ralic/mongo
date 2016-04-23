@@ -99,6 +99,12 @@ bool structureOKForExplode(QuerySolutionNode* solnRoot, QuerySolutionNode** toRe
     //
     // TODO: Can also try exploding if root is AND_HASH (last child dictates order.),
     // or other less obvious cases...
+
+    // Skip over a sharding filter stage.
+    if (STAGE_SHARDING_FILTER == solnRoot->getType()) {
+        solnRoot = solnRoot->children[0];
+    }
+
     if (STAGE_IXSCAN == solnRoot->getType()) {
         *toReplace = solnRoot;
         return true;
@@ -319,8 +325,9 @@ BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
         if (elt.type() == mongo::String) {
             break;
         }
-        long long val = elt.safeNumberLong();
-        int sortOrder = val >= 0 ? 1 : -1;
+        // The canonical check as to whether a key pattern element is "ascending" or "descending" is
+        // (elt.number() >= 0). This is defined by the Ordering class.
+        int sortOrder = (elt.number() >= 0) ? 1 : -1;
         sortBob.append(elt.fieldName(), sortOrder);
     }
     return sortBob.obj();
@@ -559,6 +566,9 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
         // with the topK first. If the client wants a limit, they'll get the efficiency
         // of topK. If they want a batchSize, the other OR branch will deliver the missing
         // results. The OR stage handles deduping.
+        //
+        // We must also add an ENSURE_SORTED node above the OR to ensure that the final results are
+        // in correct sorted order, which may not be true if the data is concurrently modified.
         if (lpq.wantMore() && params.options & QueryPlannerParams::SPLIT_LIMITED_SORT &&
             !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT) &&
             !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO) &&
@@ -573,7 +583,12 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
             SortNode* sortClone = static_cast<SortNode*>(sort->clone());
             sortClone->limit = 0;
             orn->children.push_back(sortClone);
-            solnRoot = orn;
+
+            // Add ENSURE_SORTED above the OR.
+            EnsureSortedNode* esn = new EnsureSortedNode();
+            esn->pattern = sort->pattern;
+            esn->children.push_back(orn);
+            solnRoot = esn;
         }
     } else {
         sort->limit = 0;
@@ -656,19 +671,22 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
     //
     // 3. There is an index-provided sort.  Ditto above comment about merging.
     //
+    // 4. There is a SORT that is not at the root of solution tree. Ditto above comment about
+    // merging.
+    //
     // TODO: do we want some kind of pre-planning step where we look for certain nodes and cache
     // them?  We do lookups in the tree a few times.  This may not matter as most trees are
     // shallow in terms of query nodes.
-    bool cannotKeepFlagged = hasNode(solnRoot, STAGE_TEXT) ||
+    const bool hasNotRootSort = hasSortStage && STAGE_SORT != solnRoot->getType();
+
+    const bool cannotKeepFlagged = hasNode(solnRoot, STAGE_TEXT) ||
         hasNode(solnRoot, STAGE_GEO_NEAR_2D) || hasNode(solnRoot, STAGE_GEO_NEAR_2DSPHERE) ||
-        (!lpq.getSort().isEmpty() && !hasSortStage);
+        (!lpq.getSort().isEmpty() && !hasSortStage) || hasNotRootSort;
 
-    // Only these stages can produce flagged results.  A stage has to hold state past one call
-    // to work(...) in order to possibly flag a result.
-    bool couldProduceFlagged =
-        hasAndHashStage || hasNode(solnRoot, STAGE_AND_SORTED) || hasNode(solnRoot, STAGE_FETCH);
+    // Only index intersection stages ever produce flagged results.
+    const bool couldProduceFlagged = hasAndHashStage || hasNode(solnRoot, STAGE_AND_SORTED);
 
-    bool shouldAddMutation = !cannotKeepFlagged && couldProduceFlagged;
+    const bool shouldAddMutation = !cannotKeepFlagged && couldProduceFlagged;
 
     if (shouldAddMutation && (params.options & QueryPlannerParams::KEEP_MUTATIONS)) {
         KeepMutationsNode* keep = new KeepMutationsNode();
@@ -708,10 +726,10 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
             // the fields we want to include and they're not dotted.  So we want to execute the
             // projection in the fast-path simple fashion.  Just don't know which fast path yet.
             LOG(5) << "PROJECTION: requires fields\n";
-            const vector<string>& fields = query.getProj()->getRequiredFields();
+            const vector<StringData>& fields = query.getProj()->getRequiredFields();
             bool covered = true;
             for (size_t i = 0; i < fields.size(); ++i) {
-                if (!solnRoot->hasField(fields[i])) {
+                if (!solnRoot->hasField(fields[i].toString())) {
                     LOG(5) << "PROJECTION: not covered due to field " << fields[i] << endl;
                     covered = false;
                     break;
@@ -760,6 +778,13 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
                     }
                 }
             }
+
+            // If we have a $meta sortKey, just use the project default path, as currently the
+            // project fast paths cannot handle $meta sortKey projections.
+            if (query.getProj()->wantSortKey()) {
+                projType = ProjectionNode::DEFAULT;
+                LOG(5) << "PROJECTION: needs $meta sortKey, using DEFAULT path instead";
+            }
         }
         // If we don't have a covered project, and we're not allowed to put an uncovered one in,
         // bail out.
@@ -780,7 +805,7 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
         }
 
         // We now know we have whatever data is required for the projection.
-        ProjectionNode* projNode = new ProjectionNode();
+        ProjectionNode* projNode = new ProjectionNode(*query.getProj());
         projNode->children.push_back(solnRoot);
         projNode->fullExpression = query.root();
         projNode->projection = lpq.getProj();

@@ -118,7 +118,10 @@ bool BSONObj::valid() const {
     return validateBSON(objdata(), objsize()).isOK();
 }
 
-int BSONObj::woCompare(const BSONObj& r, const Ordering& o, bool considerFieldName) const {
+int BSONObj::woCompare(const BSONObj& r,
+                       const Ordering& o,
+                       bool considerFieldName,
+                       StringData::ComparatorInterface* comparator) const {
     if (isEmpty())
         return r.isEmpty() ? 0 : -1;
     if (r.isEmpty())
@@ -139,7 +142,7 @@ int BSONObj::woCompare(const BSONObj& r, const Ordering& o, bool considerFieldNa
 
         int x;
         {
-            x = l.woCompare(r, considerFieldName);
+            x = l.woCompare(r, considerFieldName, comparator);
             if (o.descending(mask))
                 x = -x;
         }
@@ -151,7 +154,10 @@ int BSONObj::woCompare(const BSONObj& r, const Ordering& o, bool considerFieldNa
 }
 
 /* well ordered compare */
-int BSONObj::woCompare(const BSONObj& r, const BSONObj& idxKey, bool considerFieldName) const {
+int BSONObj::woCompare(const BSONObj& r,
+                       const BSONObj& idxKey,
+                       bool considerFieldName,
+                       StringData::ComparatorInterface* comparator) const {
     if (isEmpty())
         return r.isEmpty() ? 0 : -1;
     if (r.isEmpty())
@@ -183,7 +189,7 @@ int BSONObj::woCompare(const BSONObj& r, const BSONObj& idxKey, bool considerFie
                         x = _stricmp(l.valuestr(), r.valuestr());
                     }
                     else*/ {
-            x = l.woCompare(r, considerFieldName);
+            x = l.woCompare(r, considerFieldName, comparator);
             if (ordered && o.number() < 0)
                 x = -x;
         }
@@ -789,50 +795,6 @@ void BSONObj::toString(StringBuilder& s, bool isArray, bool full, int depth) con
         e.toString(s, !isArray, full, depth);
     }
     s << (isArray ? " ]" : " }");
-}
-
-Status DataType::Handler<BSONObj>::load(
-    BSONObj* bson, const char* ptr, size_t length, size_t* advanced, std::ptrdiff_t debug_offset) {
-    auto len = ConstDataRange(ptr, ptr + length).read<LittleEndian<uint32_t>>();
-
-    if (!len.isOK()) {
-        mongoutils::str::stream ss;
-        ss << "buffer size too small to read length at offset: " << debug_offset;
-        return Status(ErrorCodes::InvalidBSON, ss);
-    }
-
-    if (len.getValue() > length) {
-        mongoutils::str::stream ss;
-        ss << "length (" << len.getValue() << ") greater than buffer size (" << length
-           << ") at offset: " << debug_offset;
-        return Status(ErrorCodes::InvalidBSON, ss);
-    }
-
-    if (len.getValue() < BSONObj::kMinBSONLength) {
-        mongoutils::str::stream ss;
-        ss << "Invalid bson length (" << len.getValue() << ") at offset: " << debug_offset;
-        return Status(ErrorCodes::InvalidBSON, ss);
-    }
-
-    try {
-        BSONObj temp(ptr);
-
-        if (bson) {
-            *bson = std::move(temp);
-        }
-    } catch (...) {
-        auto status = exceptionToStatus();
-        mongoutils::str::stream ss;
-        ss << status.reason() << " at offset: " << debug_offset;
-
-        return Status(status.code(), ss);
-    }
-
-    if (advanced) {
-        *advanced = len.getValue();
-    }
-
-    return Status::OK();
 }
 
 Status DataType::Handler<BSONObj>::store(

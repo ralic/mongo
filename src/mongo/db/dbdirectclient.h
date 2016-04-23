@@ -81,8 +81,6 @@ public:
 
     virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0);
 
-    virtual bool callRead(Message& toSend, Message& response);
-
     virtual unsigned long long count(const std::string& ns,
                                      const BSONObj& query = BSONObj(),
                                      int options = 0,
@@ -96,6 +94,9 @@ public:
     virtual bool lazySupported() const;
 
     virtual QueryOptions _lookupAvailableOptions();
+
+    int getMinWireVersion() final;
+    int getMaxWireVersion() final;
 
 private:
     OperationContext* _txn;

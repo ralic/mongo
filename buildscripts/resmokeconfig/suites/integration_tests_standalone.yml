@@ -6,11 +6,11 @@ executor:
   cpp_integration_test:
     config: {}
     hooks:
+    - class: ValidateCollections
     - class: CleanEveryN
       n: 20
     fixture:
       class: MongoDFixture
       mongod_options:
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1

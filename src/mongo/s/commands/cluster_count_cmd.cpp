@@ -31,9 +31,9 @@
 #include <vector>
 
 #include "mongo/db/commands.h"
-#include "mongo/s/cluster_explain.h"
+#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/cluster_commands_common.h"
-#include "mongo/s/strategy.h"
+#include "mongo/s/commands/strategy.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -82,7 +82,8 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -100,6 +101,10 @@ public:
                      int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(
+            ErrorCodes::InvalidNamespace, "count command requires valid namespace", nss.isValid());
+
         long long skip = 0;
 
         if (cmdObj["skip"].isNumber()) {
@@ -113,11 +118,8 @@ public:
             return false;
         }
 
-        const string collection = cmdObj.firstElement().valuestrsafe();
-        const string fullns = dbname + "." + collection;
-
         BSONObjBuilder countCmdBuilder;
-        countCmdBuilder.append("count", collection);
+        countCmdBuilder.append("count", nss.coll());
 
         BSONObj filter;
         if (cmdObj["query"].isABSONObj()) {
@@ -152,7 +154,7 @@ public:
 
         vector<Strategy::CommandResult> countResult;
         Strategy::commandOp(
-            txn, dbname, countCmdBuilder.done(), options, fullns, filter, &countResult);
+            txn, dbname, countCmdBuilder.done(), options, nss.ns(), filter, &countResult);
 
         long long total = 0;
         BSONObjBuilder shardSubTotal(result.subobjStart("shards"));
@@ -194,8 +196,13 @@ public:
                            const std::string& dbname,
                            const BSONObj& cmdObj,
                            ExplainCommon::Verbosity verbosity,
+                           const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                            BSONObjBuilder* out) const {
-        const string fullns = parseNs(dbname, cmdObj);
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        if (!nss.isValid()) {
+            return Status{ErrorCodes::InvalidNamespace,
+                          str::stream() << "Invalid collection name: " << nss.ns()};
+        }
 
         // Extract the targeting query.
         BSONObj targetingQuery;
@@ -204,14 +211,16 @@ public:
         }
 
         BSONObjBuilder explainCmdBob;
-        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+        int options = 0;
+        ClusterExplain::wrapAsExplain(
+            cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
 
         // We will time how long it takes to run the commands on the shards
         Timer timer;
 
         vector<Strategy::CommandResult> shardResults;
         Strategy::commandOp(
-            txn, dbname, explainCmdBob.obj(), 0, fullns, targetingQuery, &shardResults);
+            txn, dbname, explainCmdBob.obj(), options, nss.ns(), targetingQuery, &shardResults);
 
         long long millisElapsed = timer.millis();
 

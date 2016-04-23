@@ -54,8 +54,8 @@ public:
     virtual bool adminOnly() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     virtual void help(stringstream& help) const {
         help << "Adds a no-op entry to the oplog";

@@ -65,7 +65,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -99,11 +100,12 @@ public:
                 continue;
             }
 
-            const auto shardHost = uassertStatusOK(s->getTargeter()->findHost(
-                {ReadPreference::PrimaryPreferred, TagSet::primaryOnly()}));
-
-            BSONObj x = uassertStatusOK(
-                grid.shardRegistry()->runCommand(shardHost, "admin", BSON("listDatabases" << 1)));
+            BSONObj x = uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
+                txn,
+                s,
+                ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
+                "admin",
+                BSON("listDatabases" << 1)));
 
             BSONObjIterator j(x["databases"].Obj());
             while (j.more()) {
@@ -132,7 +134,7 @@ public:
 
         long long totalSize = 0;
 
-        BSONArrayBuilder bb(result.subarrayStart("databases"));
+        BSONArrayBuilder dbListBuilder(result.subarrayStart("databases"));
         for (map<string, long long>::iterator i = sizes.begin(); i != sizes.end(); ++i) {
             const string name = i->first;
 
@@ -155,53 +157,17 @@ public:
             temp.appendBool("empty", size == 1);
             temp.append("shards", dbShardInfo[name]->obj());
 
-            bb.append(temp.obj());
+            dbListBuilder.append(temp.obj());
         }
 
+        // Get information for config and admin dbs from the config servers.
         auto catalogManager = grid.catalogManager(txn);
-        {
-            // get config db from the config servers
-            BSONObjBuilder builder;
-
-            if (!catalogManager->runReadCommand(txn, "config", BSON("dbstats" << 1), &builder)) {
-                bb.append(BSON("name"
-                               << "config"));
-            } else {
-                BSONObj x = builder.obj();
-                BSONObjBuilder b;
-                b.append("name", "config");
-                b.appendBool("empty", false);
-                if (x["fileSize"].type()) {
-                    b.appendAs(x["fileSize"], "sizeOnDisk");
-                } else {
-                    b.append("sizeOnDisk", 1);
-                }
-                bb.append(b.obj());
-            }
+        auto appendStatus = catalogManager->appendInfoForConfigServerDatabases(txn, &dbListBuilder);
+        if (!appendStatus.isOK()) {
+            return Command::appendCommandStatus(result, appendStatus);
         }
 
-        {
-            // get admin db from the config servers
-            BSONObjBuilder builder;
-
-            if (!catalogManager->runReadCommand(txn, "admin", BSON("dbstats" << 1), &builder)) {
-                bb.append(BSON("name"
-                               << "admin"));
-            } else {
-                BSONObj x = builder.obj();
-                BSONObjBuilder b;
-                b.append("name", "admin");
-                b.appendBool("empty", false);
-                if (x["fileSize"].type()) {
-                    b.appendAs(x["fileSize"], "sizeOnDisk");
-                } else {
-                    b.append("sizeOnDisk", 1);
-                }
-                bb.append(b.obj());
-            }
-        }
-
-        bb.done();
+        dbListBuilder.done();
 
         result.appendNumber("totalSize", totalSize);
         result.appendNumber("totalSizeMb", totalSize / (1024 * 1024));

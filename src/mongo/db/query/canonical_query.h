@@ -47,9 +47,7 @@ public:
      * Used for legacy find through the OP_QUERY message.
      */
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        const QueryMessage& qm,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const QueryMessage& qm, const ExtensionsCallback& extensionsCallback);
 
     /**
      * Takes ownership of 'lpq'.
@@ -59,10 +57,8 @@ public:
      *
      * Used for finds using the find command path.
      */
-    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        LiteParsedQuery* lpq,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+    static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(LiteParsedQuery* lpq,
+                                                                    const ExtensionsCallback&);
 
     /**
      * For testing or for internal clients to use.
@@ -78,37 +74,30 @@ public:
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         const CanonicalQuery& baseQuery,
         MatchExpression* root,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const ExtensionsCallback& extensionsCallback);
 
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
-        NamespaceString nss,
-        const BSONObj& query,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        NamespaceString nss, const BSONObj& query, const ExtensionsCallback& extensionsCallback);
 
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         NamespaceString nss,
         const BSONObj& query,
         bool explain,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const ExtensionsCallback& extensionsCallback);
 
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         NamespaceString nss,
         const BSONObj& query,
         long long skip,
         long long limit,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const ExtensionsCallback& extensionsCallback);
 
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         NamespaceString nss,
         const BSONObj& query,
         const BSONObj& sort,
         const BSONObj& proj,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const ExtensionsCallback& extensionsCallback);
 
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         NamespaceString nss,
@@ -117,8 +106,7 @@ public:
         const BSONObj& proj,
         long long skip,
         long long limit,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const ExtensionsCallback& extensionsCallback);
 
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         NamespaceString nss,
@@ -128,8 +116,7 @@ public:
         long long skip,
         long long limit,
         const BSONObj& hint,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const ExtensionsCallback& extensionsCallback);
 
     static StatusWith<std::unique_ptr<CanonicalQuery>> canonicalize(
         NamespaceString nss,
@@ -143,8 +130,7 @@ public:
         const BSONObj& maxObj,
         bool snapshot,
         bool explain,
-        const MatchExpressionParser::WhereCallback& whereCallback =
-            MatchExpressionParser::WhereCallback());
+        const ExtensionsCallback& extensionsCallback);
 
     /**
      * Returns true if "query" describes an exact-match query on _id, possibly with
@@ -208,6 +194,25 @@ public:
      */
     static size_t countNodes(const MatchExpression* root, MatchExpression::MatchType type);
 
+    /**
+     * Returns true if this canonical query converted extensions such as $where and $text into
+     * no-ops during parsing.
+     *
+     * Queries with a no-op extension context are special because they can be parsed and planned,
+     * but they cannot be executed.
+     */
+    bool hasNoopExtensions() const {
+        return _hasNoopExtensions;
+    }
+
+    /**
+     * Returns true if the query this CanonicalQuery was parsed from included a $isolated/$atomic
+     * operator.
+     */
+    bool isIsolated() const {
+        return _isIsolated;
+    }
+
 private:
     // You must go through canonicalize to create a CanonicalQuery.
     CanonicalQuery() {}
@@ -216,7 +221,7 @@ private:
      * Takes ownership of 'root' and 'lpq'.
      */
     Status init(LiteParsedQuery* lpq,
-                const MatchExpressionParser::WhereCallback& whereCallback,
+                const ExtensionsCallback& extensionsCallback,
                 MatchExpression* root);
 
     std::unique_ptr<LiteParsedQuery> _pq;
@@ -225,6 +230,10 @@ private:
     std::unique_ptr<MatchExpression> _root;
 
     std::unique_ptr<ParsedProjection> _proj;
+
+    bool _hasNoopExtensions = false;
+
+    bool _isIsolated;
 };
 
 }  // namespace mongo

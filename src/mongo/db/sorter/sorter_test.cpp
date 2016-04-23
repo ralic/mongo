@@ -33,6 +33,11 @@
 #include <boost/filesystem.hpp>
 
 #include "mongo/config.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/init.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_noop.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
@@ -52,6 +57,12 @@ bool isMongos() {
     return false;
 }
 
+// Stub to avoid including the server environment library.
+MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
+    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
+    return Status::OK();
+}
+
 //
 // Sorter framework testing utilities
 //
@@ -69,7 +80,7 @@ public:
         buf.appendNum(_i);
     }
     static IntWrapper deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
-        return buf.read<int>();
+        return buf.read<LittleEndian<int>>().value;
     }
     int memUsageForSorter() const {
         return sizeof(IntWrapper);

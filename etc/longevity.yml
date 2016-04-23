@@ -5,19 +5,21 @@ pre:
     - command: shell.track
 
 post:
+    - command: attach.results
+      params:
+        file_location: src/report.json
     - command: shell.cleanup
     - command: shell.exec
-      # destroy the cluster after the test is done
+      # destroy the cluster
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}
-          # destroy the cluster post test
+          # call terraform destroy twice to avoid AWS timeout
           yes yes | ./terraform destroy
-          # clean all file to be safe
-          rm -rf *
+          yes yes | ./terraform destroy
           echo "Cluster DESTROYED."
 
 functions:
@@ -31,7 +33,7 @@ functions:
       # checkout and setup DSI environment
       params:
         script: |
-          set -e 
+          set -e
           set -v
           git clone git@github.com:10gen/dsi.git
           cd dsi
@@ -58,10 +60,10 @@ functions:
         silent: true
         script: |
           # to create a mongod EC2 cluster
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}
-          ./setup-cluster.sh
+          ../../bin/setup-cluster.sh ${cluster}
           echo "EC2 Cluster CREATED."
 
   "configure mongodb cluster":
@@ -70,13 +72,13 @@ functions:
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}
           # configure mongodb cluster with wiredTiger
-          ../../bin/config-${setup}.sh mongodb ${storageEngine} ${numShard}
+          USE_CSRS=${use_csrs} ../../bin/config-${setup}.sh mongodb ${storageEngine} ${numShard}
           echo "${cluster} MongoDB Cluster STARTED."
-          
+
   "run test":
     - command: shell.exec
       params:
@@ -85,18 +87,8 @@ functions:
           set -e
           set -v
           cd ./clusters/${cluster}
-          # show cluster details
-          cat ips.sh
-          ./update_run_config.sh
-          cat run-${test}.json
-          # clean up old artifact from the last test
-          rm -f ../perf.json
-          rm -rf ./reports
-          rm -f ../../reports.tgz
-          echo "Run test for ${test} with setup ${setup}"
-          # run test
-          ./run-${test}.sh
-          mv perf.json ..
+          echo "Run test for ${test}-${storageEngine} with setup ${setup}"
+          ../../bin/run-${test}.sh ${storageEngine} ${setup} ${cluster}
           cd ..
           cat perf.json >> perf_all.json
           echo "Complete test for ${test} with setup ${setup}!"
@@ -111,10 +103,11 @@ functions:
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}
           # destroy the EC2 cluster
+          yes yes | ./terraform destroy
           yes yes | ./terraform destroy
           # clean all file to be safe
           rm -rf *
@@ -129,13 +122,15 @@ functions:
       params:
         working_dir: dsi
         script: |
-          set -e 
+          set -e
           set -o verbose
           cd ./clusters/${cluster}/reports
           # move additional file here
           cp ../ips.sh .
           cp ../../perf_all.json .
           cd ..
+          ../../bin/retrieve-diag-data.sh
+          ../../bin/generate-timeseries-html.sh
           rm -rf ../reports
           mv ./reports ..
 
@@ -157,6 +152,39 @@ functions:
             permissions: public-read
             content_type: ${content_type|application/x-gzip}
             display_name: ${test}-longevity-testlog
+    - command: s3.put
+      params:
+            aws_key: ${aws_key}
+            aws_secret: ${aws_secret}
+            local_file: dsi/clusters/reports/graphs/timeseries-p1.html
+            remote_file: dsi/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-p1-${test}-${build_id}.html
+            bucket: mciuploads
+            permissions: public-read
+            content_type: text/html
+            display_name: timeseries-p1.html
+
+  "analyze":
+    - command: json.get_history
+      params:
+        task: ${task_name}
+        file: "src/history.json"
+        name: "perf"
+    - command: json.get_history
+      params:
+        tags: true
+        task: ${task_name}
+        file: "src/tags.json"
+        name: "perf"
+    - command: shell.exec
+      # post_run_check.py and longevity_override.json for DSI tests are part of dsi repo
+      type : test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          python -u ../dsi/analysis/post_run_check.py --rev ${revision} -f history.json -t tags.json --refTag 3.2.1-Baseline --overrideFile ../dsi/analysis/master/longevity_override.json --project_id mongo-longevity --task_name ${task_name} --variant ${build_variant}
+
 
 tasks:
 - name: compile
@@ -198,35 +226,78 @@ tasks:
 - name: shard_cluster_test
   depends_on:
     - name: compile
+  exec_timeout_secs: 216000
   commands:
     - func: "prepare environment"
     - func: "bring up 3 shard cluster"
     - func: "configure mongodb cluster"
+      vars:
+        use_csrs: "true"
     - func: "run test"
       vars:
+        storageEngine: "wiredTiger"
         test: "ycsb"
     - func: "make test log artifact"
     - func: "upload log file"
       vars:
         test: "ycsb"
     - func: "destroy cluster"
+    - func: "analyze"
+
+- name: shard_cluster_MMAPv1_test
+  depends_on:
+    - name: compile
+  exec_timeout_secs: 28800
+  commands:
+    - func: "prepare environment"
+    - func: "bring up 3 shard cluster"
+    - func: "configure mongodb cluster"
+      vars:
+        use_csrs: "true"
+    - func: "run test"
+      vars:
+        storageEngine: "mmapv1"
+        test: "ycsb"
+    - func: "make test log artifact"
+    - func: "upload log file"
+      vars:
+        test: "ycsb"
+    - func: "destroy cluster"
+    - func: "analyze"
 
 buildvariants:
 - name: linux-wt-shard
   display_name: Linux WT Shard
-  batchtime: 10080 # 1 week
+  batchtime: 40320 # 4 weeks
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
     setup: shard
     cluster: longevity
     numShard: 3
     storageEngine: wiredTiger
 
   run_on:
-    - "linux-64-amzn-perf-longevity"
+    - "rhel70-perf-longevity"
   tasks:
     - name: compile
       distros:
       - rhel55
     - name: shard_cluster_test
 
+- name: linux-mmapv1-shard
+  display_name: Linux MMAPv1 Shard
+  batchtime: 40320 # 4 week
+  expansions:
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ --release
+    setup: shard
+    cluster: longevity
+    numShard: 3
+    storageEngine: mmapv1
+
+  run_on:
+    - "rhel70-perf-longevity"
+  tasks:
+    - name: compile
+      distros:
+      - rhel55
+    - name: shard_cluster_MMAPv1_test

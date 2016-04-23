@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#!/usr/bin/env python
 """
 A script that provides:
 1. Ability to grab binaries where possible from LLVM.
@@ -31,7 +31,6 @@ from multiprocessing import cpu_count
 if __name__ == "__main__" and __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(os.path.realpath(__file__)))))
 
-from buildscripts.resmokelib.utils import globstar
 from buildscripts import moduleconfig
 
 
@@ -183,7 +182,6 @@ def get_clang_format_from_linux_cache(dest_file):
     # Destination Path
     shutil.move("llvm/Release/bin/clang-format", dest_file)
 
-
 class ClangFormat(object):
     """Class encapsulates finding a suitable copy of clang-format,
     and linting/formating an individual file
@@ -275,36 +273,43 @@ class ClangFormat(object):
 
         return False
 
-    def lint(self, file_name):
+    def _lint(self, file_name, print_diff):
         """Check the specified file has the correct format
         """
-        with open(file_name, 'r') as original_text:
+        with open(file_name, 'rb') as original_text:
             original_file = original_text.read()
 
         # Get formatted file as clang-format would format the file
         formatted_file = callo([self.path, "--style=file", file_name])
 
         if original_file != formatted_file:
+            if print_diff:
+                original_lines = original_file.splitlines()
+                formatted_lines = formatted_file.splitlines()
+                result = difflib.unified_diff(original_lines, formatted_lines)
 
-            original_lines = original_file.splitlines()
-            formatted_lines = formatted_file.splitlines()
-            result = difflib.unified_diff(original_lines, formatted_lines)
-
-            # Take a lock to ensure diffs do not get mixed
-            with self.print_lock:
-                print("ERROR: Found diff for " + file_name)
-                print("To fix formatting errors, run %s --style=file -i %s" %
-                        (self.path, file_name))
-                for line in result:
-                    print(line.rstrip())
+                # Take a lock to ensure diffs do not get mixed when printed to the screen
+                with self.print_lock:
+                    print("ERROR: Found diff for " + file_name)
+                    print("To fix formatting errors, run %s --style=file -i %s" %
+                            (self.path, file_name))
+                    for line in result:
+                        print(line.rstrip())
 
             return False
 
         return True
 
+    def lint(self, file_name):
+        """Check the specified file has the correct format
+        """
+        return self._lint(file_name, print_diff=True)
+
     def format(self, file_name):
         """Update the format of the specified file
         """
+        if self._lint(file_name, print_diff=False):
+            return True
 
         # Update the file with clang-format
         return not subprocess.call([self.path, "--style=file", "-i", file_name])
@@ -317,8 +322,6 @@ def parallel_process(items, func):
         cpus = cpu_count()
     except NotImplementedError:
         cpus = 1
-
-    # print("Running across %d cpus" % (cpus))
 
     task_queue = Queue.Queue()
 
@@ -412,18 +415,16 @@ class Repo(object):
     def __init__(self, path):
         self.path = path
 
-       # Get candidate files
-        self.candidate_files = self._get_candidate_files()
-
         self.root = self._get_root()
 
     def _callgito(self, args):
         """Call git for this repository
         """
         # These two flags are the equivalent of -C in newer versions of Git
-        # but we use these to support versions back to ~1.8
+        # but we use these to support versions pre 1.8.5 but it depends on the command
+        # and what the current directory is
         return callo(['git', '--git-dir', os.path.join(self.path, ".git"),
-                        '--work-tree', self.path] + args)
+                            '--work-tree', self.path] + args)
 
     def _get_local_dir(self, path):
         """Get a directory path relative to the git root directory
@@ -433,13 +434,10 @@ class Repo(object):
         return path
 
     def get_candidates(self, candidates):
-        """Get the set of candidate files to check by doing an intersection
-        between the input list, and the list of candidates in the repository
+        """Get the set of candidate files to check by querying the repository
 
         Returns the full path to the file for clang-format to consume.
         """
-        # NOTE: Files may have an absolute root (i.e. leading /)
-
         if candidates is not None and len(candidates) > 0:
             candidates = [self._get_local_dir(f) for f in candidates]
             valid_files = list(set(candidates).intersection(self.get_candidate_files()))
@@ -448,6 +446,7 @@ class Repo(object):
 
         # Get the full file name here
         valid_files = [os.path.normpath(os.path.join(self.root, f)) for f in valid_files]
+
         return valid_files
 
     def get_root(self):
@@ -462,45 +461,63 @@ class Repo(object):
 
         return gito.rstrip()
 
-    def get_candidate_files(self):
-        """Get a list of candidate files
+    def _git_ls_files(self, cmd):
+        """Run git-ls-files and filter the list of files to a valid candidate list
         """
-        return self._get_candidate_files()
-
-    def _get_candidate_files(self):
-        """Query git to get a list of all files in the repo to consider for analysis
-        """
-        gito = self._callgito(["ls-files"])
+        gito = self._callgito(cmd)
 
         # This allows us to pick all the interesting files
         # in the mongo and mongo-enterprise repos
         file_list = [line.rstrip()
-                for line in gito.splitlines() if "src" in line and not "src/third_party" in line]
+                for line in gito.splitlines()
+                    if (line.startswith("jstests") or line.startswith("src"))
+                        and not line.startswith("src/third_party")]
 
-        files_match = re.compile('\\.(h|cpp)$')
+        files_match = re.compile('\\.(h|cpp|js)$')
 
         file_list = [a for a in file_list if files_match.search(a)]
 
         return file_list
 
+    def get_candidate_files(self):
+        """Query git to get a list of all files in the repo to consider for analysis
+        """
+        return self._git_ls_files(["ls-files", "--cached"])
 
-def expand_file_string(glob_pattern):
-    """Expand a string that represents a set of files
+    def get_working_tree_candidate_files(self):
+        """Query git to get a list of all files in the working tree to consider for analysis
+        """
+        return self._git_ls_files(["ls-files", "--cached", "--others"])
+
+    def get_working_tree_candidates(self):
+        """Get the set of candidate files to check by querying the repository
+
+        Returns the full path to the file for clang-format to consume.
+        """
+        valid_files = list(self.get_working_tree_candidate_files())
+
+        # Get the full file name here
+        valid_files = [os.path.normpath(os.path.join(self.root, f)) for f in valid_files]
+
+        return valid_files
+
+def get_files_to_check_working_tree():
+    """Get a list of files to check form the working tree.
+       This will pick up files not managed by git.
     """
-    return [os.path.abspath(f) for f in globstar.iglob(glob_pattern)]
-
-def get_files_to_check(files):
-    """Filter the specified list of files to check down to the actual
-        list of files that need to be checked."""
-    candidates = []
-
-    # Get a list of candidate_files
-    candidates = [expand_file_string(f) for f in files]
-    candidates = list(itertools.chain.from_iterable(candidates))
-
     repos = get_repos()
 
-    valid_files = list(itertools.chain.from_iterable([r.get_candidates(candidates) for r in repos]))
+    valid_files = list(itertools.chain.from_iterable([r.get_working_tree_candidates() for r in repos]))
+
+    return valid_files
+
+def get_files_to_check():
+    """Get a list of files that need to be checked
+       based on which files are managed by git.
+    """
+    repos = get_repos()
+
+    valid_files = list(itertools.chain.from_iterable([r.get_candidates(None) for r in repos]))
 
     return valid_files
 
@@ -550,10 +567,19 @@ def lint_patch(clang_format, infile):
     if files:
         _lint_files(clang_format, files)
 
-def lint(clang_format, glob):
+def lint(clang_format):
     """Lint files command entry point
     """
-    files = get_files_to_check(glob)
+    files = get_files_to_check()
+
+    _lint_files(clang_format, files)
+
+    return True
+
+def lint_all(clang_format):
+    """Lint files command entry point based on working tree
+    """
+    files = get_files_to_check_working_tree()
 
     _lint_files(clang_format, files)
 
@@ -570,37 +596,37 @@ def _format_files(clang_format, files):
         print("ERROR: failed to format files")
         sys.exit(1)
 
-def format_func(clang_format, glob):
+def format_func(clang_format):
     """Format files command entry point
     """
-    files = get_files_to_check(glob)
+    files = get_files_to_check()
 
     _format_files(clang_format, files)
 
 def usage():
     """Print usage
     """
-    print("clang-format.py supports 3 commands [ lint, lint-patch, format ]. Run "
-            " <command> -? for more information")
+    print("clang-format.py supports 4 commands [ lint, lint-all, lint-patch, format ].")
 
 def main():
     """Main entry point
     """
-    if len(sys.argv) > 1:
-        command = sys.argv[1]
+    parser = OptionParser()
+    parser.add_option("-c", "--clang-format", type="string", dest="clang_format")
 
-        parser = OptionParser()
-        parser.add_option("-c", "--clang-format", type="string", dest="clang_format")
+    (options, args) = parser.parse_args(args=sys.argv)
+
+    if len(args) > 1:
+        command = args[1]
 
         if command == "lint":
-            (options, args) = parser.parse_args(args=sys.argv[2:])
-            lint(options.clang_format, args)
+            lint(options.clang_format)
+        elif command == "lint-all":
+            lint_all(options.clang_format)
         elif command == "lint-patch":
-            (options, args) = parser.parse_args(args=sys.argv[2:])
-            lint_patch(options.clang_format, args)
+            lint_patch(options.clang_format, args[2:])
         elif command == "format":
-            (options, args) = parser.parse_args(args=sys.argv[2:])
-            format_func(options.clang_format, args)
+            format_func(options.clang_format)
         else:
             usage()
     else:

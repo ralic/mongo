@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -20,6 +20,22 @@ __wt_errno(void)
 	 * error code, but there's some chance it's not set.
 	 */
 	return (errno == 0 ? WT_ERROR : errno);
+}
+
+/*
+ * __wt_map_error_rdonly --
+ *	Map an error into a  WiredTiger error code specific for
+ *	read-only operation which intercepts based on certain types
+ *	of failures.
+ */
+int
+__wt_map_error_rdonly(int error)
+{
+	if (error == ENOENT)
+		return (WT_NOTFOUND);
+	else if (error == EACCES)
+		return (WT_PERM_DENIED);
+	return (error);
 }
 
 /*

@@ -42,7 +42,6 @@
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
-#include "mongo/s/chunk.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -82,8 +81,11 @@ Status addMongosOptions(moe::OptionSection* options) {
 
     moe::OptionSection sharding_options("Sharding options");
 
-    sharding_options.addOptionChaining(
-        "sharding.configDB", "configdb", moe::String, "1 or 3 comma separated config servers");
+    sharding_options.addOptionChaining("sharding.configDB",
+                                       "configdb",
+                                       moe::String,
+                                       "Connection string for communicating with config servers:\n"
+                                       "<config replset name>/<host1:port>,<host2:port>,[...]");
 
     sharding_options.addOptionChaining(
         "replication.localPingThresholdMs",
@@ -205,16 +207,18 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
     }
 
     if (params.count("sharding.chunkSize")) {
-        int csize = params["sharding.chunkSize"].as<int>();
-
-        // validate chunksize before proceeding
-        if (csize == 0) {
-            return Status(ErrorCodes::BadValue, "error: need a non-zero chunksize");
+        const int maxChunkSizeMB = params["sharding.chunkSize"].as<int>();
+        if (maxChunkSizeMB <= 0) {
+            return Status(ErrorCodes::BadValue, "error: need a positive chunksize");
         }
 
-        if (!Chunk::setMaxChunkSizeSizeMB(csize)) {
+        const uint64_t maxChunkSizeBytes = maxChunkSizeMB * 1024 * 1024;
+
+        if (!ChunkSizeSettingsType::checkMaxChunkSizeValid(maxChunkSizeBytes)) {
             return Status(ErrorCodes::BadValue, "MaxChunkSize invalid");
         }
+
+        mongosGlobalParams.maxChunkSizeBytes = maxChunkSizeBytes;
     }
 
     if (params.count("net.port")) {
@@ -238,8 +242,8 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
     }
 
     if (params.count("sharding.autoSplit")) {
-        Chunk::ShouldAutoSplit = params["sharding.autoSplit"].as<bool>();
-        if (Chunk::ShouldAutoSplit == false) {
+        mongosGlobalParams.shouldAutoSplit = params["sharding.autoSplit"].as<bool>();
+        if (!mongosGlobalParams.shouldAutoSplit) {
             warning() << "running with auto-splitting disabled";
         }
     }
@@ -248,31 +252,34 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
         return Status(ErrorCodes::BadValue, "error: no args for --configdb");
     }
 
-    {
-        std::string configdbString = params["sharding.configDB"].as<std::string>();
+    std::string configdbString = params["sharding.configDB"].as<std::string>();
 
-        auto configdbConnectionString = ConnectionString::parse(configdbString);
-        if (!configdbConnectionString.isOK()) {
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "Invalid configdb connection string: "
-                                        << configdbConnectionString.getStatus().toString());
+    auto configdbConnectionString = ConnectionString::parse(configdbString);
+    if (!configdbConnectionString.isOK()) {
+        return configdbConnectionString.getStatus();
+    }
+
+    if (configdbConnectionString.getValue().type() != ConnectionString::SET) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "configdb supports only replica set connection string");
+    }
+
+    std::vector<HostAndPort> seedServers;
+    for (const auto& host : configdbConnectionString.getValue().getServers()) {
+        seedServers.push_back(host);
+        if (!seedServers.back().hasPort()) {
+            seedServers.back() = HostAndPort{host.host(), ServerGlobalParams::ConfigServerPort};
         }
-
-        mongosGlobalParams.configdbs = configdbConnectionString.getValue();
     }
 
-    std::vector<HostAndPort> configServers = mongosGlobalParams.configdbs.getServers();
+    mongosGlobalParams.configdbs =
+        ConnectionString{configdbConnectionString.getValue().type(),
+                         seedServers,
+                         configdbConnectionString.getValue().getSetName()};
 
-    if (mongosGlobalParams.configdbs.type() != ConnectionString::SYNC &&
-        mongosGlobalParams.configdbs.type() != ConnectionString::SET) {
-        return Status(
-            ErrorCodes::BadValue,
-            "Must have either 3 node legacy config servers, or a replica set config server");
-    }
-
-    if (configServers.size() < 3) {
-        warning() << "running with less than 3 config servers should be done only for testing "
-                     "purposes and is not recommended for production";
+    if (mongosGlobalParams.configdbs.getServers().size() < 3) {
+        warning() << "Running a sharded cluster with fewer than 3 config servers should only be "
+                     "done for testing purposes and is not recommended for production.";
     }
 
     return Status::OK();

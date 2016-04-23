@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -17,7 +17,7 @@ int
 __wt_buf_grow_worker(WT_SESSION_IMPL *session, WT_ITEM *buf, size_t size)
 {
 	size_t offset;
-	int copy_data;
+	bool copy_data;
 
 	/*
 	 * Maintain the existing data: there are 3 cases:
@@ -30,10 +30,10 @@ __wt_buf_grow_worker(WT_SESSION_IMPL *session, WT_ITEM *buf, size_t size)
 	 */
 	if (WT_DATA_IN_ITEM(buf)) {
 		offset = WT_PTRDIFF(buf->data, buf->mem);
-		copy_data = 0;
+		copy_data = false;
 	} else {
 		offset = 0;
-		copy_data = buf->size ? 1 : 0;
+		copy_data = buf->size > 0;
 	}
 
 	/*
@@ -45,7 +45,7 @@ __wt_buf_grow_worker(WT_SESSION_IMPL *session, WT_ITEM *buf, size_t size)
 			WT_RET(__wt_realloc_aligned(
 			    session, &buf->memsize, size, &buf->mem));
 		else
-			WT_RET(__wt_realloc(
+			WT_RET(__wt_realloc_noclear(
 			    session, &buf->memsize, size, &buf->mem));
 	}
 

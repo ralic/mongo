@@ -106,7 +106,7 @@ Status wrappedRun(OperationContext* txn,
         IndexDescriptor* desc =
             collection->getIndexCatalog()->findIndexByKeyPattern(txn, f.embeddedObject());
         if (desc == NULL) {
-            return Status(ErrorCodes::InvalidOptions,
+            return Status(ErrorCodes::IndexNotFound,
                           str::stream()
                               << "can't find index with key: " << f.embeddedObject().toString());
         }
@@ -149,8 +149,11 @@ Status dropIndexes(OperationContext* txn,
         if (!status.isOK()) {
             return status;
         }
-        getGlobalServiceContext()->getOpObserver()->onDropIndex(
-            txn, dbName.toString() + ".$cmd", idxDescriptor);
+
+        auto opObserver = getGlobalServiceContext()->getOpObserver();
+        if (opObserver)
+            opObserver->onDropIndex(txn, dbName.toString() + ".$cmd", idxDescriptor);
+
         wunit.commit();
     }
     MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "dropIndexes", dbName);

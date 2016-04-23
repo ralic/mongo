@@ -50,16 +50,16 @@
 
 namespace mongo {
 
+class BSONObjBuilder;
 class NamespaceString;
 class OperationContext;
 
 namespace executor {
+struct ConnectionPoolStats;
 class NetworkInterface;
 }  // namespace executor
 
 namespace repl {
-
-class StorageInterface;
 
 /**
  * Implementation of the TaskExecutor interface for providing an event loop for driving state
@@ -98,9 +98,7 @@ public:
      *
      * Takes ownership of the passed NetworkInterface object.
      */
-    ReplicationExecutor(executor::NetworkInterface* netInterface,
-                        StorageInterface* storageInterface,
-                        int64_t pnrgSeed);
+    ReplicationExecutor(executor::NetworkInterface* netInterface, int64_t pnrgSeed);
 
     /**
      * Destroys an executor.
@@ -108,6 +106,7 @@ public:
     virtual ~ReplicationExecutor();
 
     std::string getDiagnosticString() override;
+    BSONObj getDiagnosticBSON();
     Date_t now() override;
     void startup() override;
     void shutdown() override;
@@ -122,6 +121,8 @@ public:
                                                      const RemoteCommandCallbackFn& cb) override;
     void cancel(const CallbackHandle& cbHandle) override;
     void wait(const CallbackHandle& cbHandle) override;
+
+    void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
 
     /**
      * Executes the run loop. May be called up to one time.
@@ -301,7 +302,6 @@ private:
     PseudoRandom _random;
 
     std::unique_ptr<executor::NetworkInterface> _networkInterface;
-    std::unique_ptr<StorageInterface> _storageInterface;
 
     // Thread which executes the run method. Started by startup and must be jointed after shutdown.
     stdx::thread _executorThread;
@@ -316,12 +316,25 @@ private:
     WorkQueue _networkInProgressQueue;
     WorkQueue _sleepersQueue;
     EventList _unsignaledEvents;
-    int64_t _totalEventWaiters;
+    int64_t _totalEventWaiters = 0;
+
+    // Counters for metrics, for the whole life of this instance, protected by _mutex.
+    int64_t _counterWaitEvents = 0;
+    int64_t _counterCreatedEvents = 0;
+    int64_t _counterScheduledCommands = 0;
+    int64_t _counterScheduledExclusiveWorks = 0;
+    int64_t _counterScheduledDBWorks = 0;
+    int64_t _counterScheduledWorks = 0;
+    int64_t _counterScheduledWorkAts = 0;
+    int64_t _counterSchedulingFailures = 0;
+    int64_t _counterCancels = 0;
+    int64_t _counterWaits = 0;
+
     bool _inShutdown;
     OldThreadPool _dblockWorkers;
     TaskRunner _dblockTaskRunner;
     TaskRunner _dblockExclusiveLockTaskRunner;
-    uint64_t _nextId;
+    uint64_t _nextId = 0;
 };
 
 class ReplicationExecutor::Callback : public executor::TaskExecutor::CallbackState {
@@ -336,6 +349,7 @@ public:
 
     void cancel() override;
     void waitForCompletion() override;
+    bool isCanceled() const override;
 
 private:
     ReplicationExecutor* _executor;
@@ -343,6 +357,7 @@ private:
     // All members other than _executor are protected by the executor's _mutex.
     CallbackFn _callbackFn;
     bool _isCanceled;
+    bool _isSleeper;
     WorkQueue::iterator _iter;
     EventHandle _finishedEvent;
 };

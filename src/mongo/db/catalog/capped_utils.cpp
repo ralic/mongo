@@ -43,7 +43,6 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -183,7 +182,9 @@ Status cloneCollectionAsCapped(OperationContext* txn,
             }
 
             WriteUnitOfWork wunit(txn);
-            toCollection->insertDocument(txn, objToClone.value(), true, txn->writesAreReplicated());
+            OpDebug* const nullOpDebug = nullptr;
+            toCollection->insertDocument(
+                txn, objToClone.value(), nullOpDebug, true, txn->writesAreReplicated());
             wunit.commit();
 
             // Go to the next document
@@ -222,7 +223,7 @@ Status convertToCapped(OperationContext* txn, const NamespaceString& collectionN
 
     Database* const db = autoDb.getDb();
     if (!db) {
-        return Status(ErrorCodes::DatabaseNotFound,
+        return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "database " << dbname << " not found");
     }
 

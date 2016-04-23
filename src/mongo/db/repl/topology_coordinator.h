@@ -29,6 +29,7 @@
 #pragma once
 
 #include <string>
+#include <iosfwd>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -109,14 +110,16 @@ public:
      * Gets the latest term this member is aware of. If this member is the primary,
      * it's the current term of the replica set.
      */
-    virtual long long getTerm() const = 0;
+    virtual long long getTerm() = 0;
+
+    enum class UpdateTermResult { kAlreadyUpToDate, kTriggerStepDown, kUpdatedTerm };
 
     /**
      * Sets the latest term this member is aware of to the higher of its current value and
      * the value passed in as "term".
-     * Returns true if the local term value is changed.
+     * Returns the result of setting the term value, or if a stepdown should be triggered.
      */
-    virtual bool updateTerm(long long term) = 0;
+    virtual UpdateTermResult updateTerm(long long term, Date_t now) = 0;
 
     ////////////////////////////////////////////////////////////
     //
@@ -152,12 +155,19 @@ public:
 
     /**
      * Determines if a new sync source should be chosen, if a better candidate sync source is
-     * available.  If the current sync source's last optime is more than _maxSyncSourceLagSecs
-     * behind any syncable source, this function returns true.
+     * available.  If the current sync source's last optime ("syncSourceLastOpTime" under
+     * protocolVersion 1, but pulled from the MemberHeartbeatData in protocolVersion 0) is more than
+     * _maxSyncSourceLagSecs behind any syncable source, this function returns true. If we are
+     * running in ProtocolVersion 1, our current sync source is not primary, has no sync source
+     * ("syncSourceHasSyncSource" is false), and only has data up to "myLastOpTime", returns true.
      *
      * "now" is used to skip over currently blacklisted sync sources.
      */
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource, Date_t now) const = 0;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& myLastOpTime,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource,
+                                        Date_t now) const = 0;
 
     /**
      * Checks whether we are a single node set and we are not in a stepdown period.  If so,
@@ -198,8 +208,7 @@ public:
     ////////////////////////////////////////////////////////////
 
     // produces a reply to a replSetSyncFrom command
-    virtual void prepareSyncFromResponse(const ReplicationExecutor::CallbackArgs& data,
-                                         const HostAndPort& target,
+    virtual void prepareSyncFromResponse(const HostAndPort& target,
                                          const OpTime& lastOpApplied,
                                          BSONObjBuilder* response,
                                          Status* result) = 0;
@@ -223,6 +232,7 @@ public:
                                             const ReplSetHeartbeatArgs& args,
                                             const std::string& ourSetName,
                                             const OpTime& lastOpApplied,
+                                            const OpTime& lastOpDurable,
                                             ReplSetHeartbeatResponse* response) = 0;
 
     // produce a reply to a V1 heartbeat
@@ -230,13 +240,20 @@ public:
                                               const ReplSetHeartbeatArgsV1& args,
                                               const std::string& ourSetName,
                                               const OpTime& lastOpApplied,
+                                              const OpTime& lastOpDurable,
                                               ReplSetHeartbeatResponse* response) = 0;
 
+    struct ReplSetStatusArgs {
+        Date_t now;
+        unsigned selfUptime;
+        const OpTime& lastOpApplied;
+        const OpTime& lastOpDurable;
+        const OpTime& lastCommittedOpTime;
+        const OpTime& readConcernMajorityOpTime;
+    };
+
     // produce a reply to a status request
-    virtual void prepareStatusResponse(const ReplicationExecutor::CallbackArgs& data,
-                                       Date_t now,
-                                       unsigned uptime,
-                                       const OpTime& lastOpApplied,
+    virtual void prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                        BSONObjBuilder* response,
                                        Status* result) = 0;
 
@@ -335,9 +352,14 @@ public:
     virtual bool voteForMyself(Date_t now) = 0;
 
     /**
-     * Set lastVote to be for ourself in this term.
+     * Sets lastVote to be for ourself in this term.
      */
     virtual void voteForMyselfV1() = 0;
+
+    /**
+     * Sets election id and election optime.
+     */
+    virtual void setElectionInfo(OID electionId, Timestamp electionOpTime) = 0;
 
     /**
      * Performs state updates associated with winning an election.
@@ -383,7 +405,7 @@ public:
      * Considers whether or not this node should stand for election, and returns true
      * if the node has transitioned to candidate role as a result of the call.
      */
-    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) = 0;
+    virtual Status checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const = 0;
 
     /**
      * Set the outgoing heartbeat message from self
@@ -411,25 +433,11 @@ public:
                                             const OpTime& lastAppliedOpTime) = 0;
 
     /**
-     * Determines whether or not the newly elected primary is valid from our perspective.
-     * If it is, sets the _currentPrimaryIndex and term to the received values.
-     * If it is not, return ErrorCode::BadValue and the current term from our perspective.
-     * Populate responseTerm with the current term from our perspective.
-     */
-    virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                                       long long* responseTerm) = 0;
-
-    /**
      * Loads an initial LastVote document, which was read from local storage.
      *
      * Called only during replication startup. All other updates are done internally.
      */
     virtual void loadLastVote(const LastVote& lastVote) = 0;
-
-    /**
-     * Returns the most recent term this node is aware of.
-     */
-    virtual long long getTerm() = 0;
 
     /**
      * Readies the TopologyCoordinator for stepdown.
@@ -440,6 +448,17 @@ public:
      * Updates the current primary index.
      */
     virtual void setPrimaryIndex(long long primaryIndex) = 0;
+
+    /**
+     * Transitions to the candidate role if the node is electable.
+     */
+    virtual Status becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied) = 0;
+
+    /**
+     * Updates the storage engine read committed support in the TopologyCoordinator options after
+     * creation.
+     */
+    virtual void setStorageEngineSupportsReadCommitted(bool supported) = 0;
 
 protected:
     TopologyCoordinator() {}
@@ -487,6 +506,12 @@ private:
 
     int _value;
 };
+
+//
+// Convenience method for unittest code. Please use accessors otherwise.
+//
+
+std::ostream& operator<<(std::ostream& os, TopologyCoordinator::Role role);
 
 }  // namespace repl
 }  // namespace mongo

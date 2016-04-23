@@ -26,54 +26,17 @@
  *    then also delete it in the license file.
  */
 
-
 #pragma once
 
 #include <string>
 
 namespace mongo {
 
-class BSONObj;
-class Client;
 class OperationContext;
-class ShardedConnectionInfo;
-
-struct ShardForceVersionOkModeBlock {
-    ShardForceVersionOkModeBlock(Client* client);
-    ~ShardForceVersionOkModeBlock();
-
-    ShardedConnectionInfo* info;
-};
-
-// -----------------
-// --- core ---
-// -----------------
 
 /**
  * @return true if we have any shard info for the ns
  */
-bool haveLocalShardingInfo(Client* client, const std::string& ns);
+bool haveLocalShardingInfo(OperationContext* txn, const std::string& ns);
 
-/**
- * Validates whether the shard chunk version for the specified collection is up to date and if
- * not, throws SendStaleConfigException.
- *
- * It is important (but not enforced) that method be called with the collection locked in at
- * least IS mode in order to ensure that the shard version won't change.
- *
- * @param ns Complete collection namespace to be cheched.
- */
-void ensureShardVersionOKOrThrow(OperationContext* txn, const std::string& ns);
-
-/**
- * If a migration for the chunk in 'ns' where 'obj' lives is occurring, save this log entry
- * if it's relevant. The entries saved here are later transferred to the receiving side of
- * the migration. A relevant entry is an insertion, a deletion, or an update.
- */
-void logOpForSharding(OperationContext* txn,
-                      const char* opstr,
-                      const char* ns,
-                      const BSONObj& obj,
-                      BSONObj* patt,
-                      bool forMigrateCleanup);
-}
+}  // namespace mongo

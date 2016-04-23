@@ -1,82 +1,100 @@
 // Tests whether new sharding is detected on insert by mongos
 load("jstests/replsets/rslib.js");
-(function () {
-var st = new ShardingTest(name = "test", 
-                          shards = 1, 
-                          verbose = 2, 
-                          mongos = 2, 
-                          other = { rs : true });
 
-var mongos = st.s;
-var config = mongos.getDB("config");
+(function() {
+    'use strict';
 
-config.settings.update({ _id : "balancer" }, { $set : { stopped : true } }, true );
+    var st = new ShardingTest({
+        name: 'mongos_no_replica_set_refresh',
+        shards: 1,
+        mongos: 1,
+        other: {
+            rs0: {
+                nodes: [{}, {rsConfig: {priority: 0}}, {rsConfig: {priority: 0}}, ],
+            }
+        }
+    });
 
-printjson( mongos.getCollection("foo.bar").findOne() );
+    var rsObj = st.rs0;
+    assert.commandWorked(rsObj.nodes[0].adminCommand({
+        replSetTest: 1,
+        waitForMemberState: ReplSetTest.State.PRIMARY,
+        timeoutMillis: 60 * 1000,
+    }),
+                         'node 0 ' + rsObj.nodes[0].host + ' failed to become primary');
 
-var rsObj = st._rs[0].test;
-var primary = rsObj.getPrimary();
-var secondaries = rsObj.getSecondaries();
+    var mongos = st.s;
+    var config = mongos.getDB("config");
 
-jsTestLog( "Reconfiguring replica set..." );
+    printjson(mongos.getCollection("foo.bar").findOne());
 
-var rsConfig = primary.getDB("local").system.replset.findOne();
-// First, make sure the last node in the config is not the primary
-rsConfig.members[0].priority = 10;
-rsConfig.version++;
-reconfig(rsObj, rsConfig);
-rsObj.waitForState(rsObj.nodes[0], rsObj.PRIMARY, 60* 1000);
-primary = rsObj.getPrimary();
+    jsTestLog("Reconfiguring replica set...");
 
-// Now remove the last node in the config.
-var removedNode = rsConfig.members.pop();
-rsConfig.version++;
-reconfig(rsObj, rsConfig);
+    var rsConfig = rsObj.getReplSetConfigFromNode(0);
 
-var numRSHosts = function(){
-    var result = primary.getDB("admin").runCommand({ ismaster : 1 });
-    printjson( result );
-    return result.hosts.length;
-};
+    // Now remove the last node in the config.
+    var removedNode = rsConfig.members.pop();
+    rsConfig.version++;
+    reconfig(rsObj, rsConfig);
 
-primary = rsObj.getPrimary();
-assert.soon( function(){ return numRSHosts() < 3; } );
+    // Wait for the election round to complete
+    rsObj.getPrimary();
 
-var numMongosHosts = function(){
-    var result = mongos.getDB("admin").runCommand("connPoolStats")["replicaSets"][ rsObj.name ];
-    printjson( result );
-    return result.hosts.length;
-};
+    var numRSHosts = function() {
+        var result = assert.commandWorked(rsObj.nodes[0].adminCommand({ismaster: 1}));
+        jsTestLog('Nodes in ' + rsObj.name + ': ' + tojson(result));
+        return result.hosts.length + result.passives.length;
+    };
 
-// Wait for ReplicaSetMonitor to refresh; it should discover that the set now has only 2 hosts.
-assert.soon( function(){ return numMongosHosts() < 3; } );
+    assert.soon(function() {
+        return numRSHosts() < 3;
+    });
 
-jsTestLog( "Mongos successfully detected change..." );
+    var numMongosHosts = function() {
+        var commandResult = assert.commandWorked(mongos.adminCommand("connPoolStats"));
+        var result = commandResult.replicaSets[rsObj.name];
+        jsTestLog('Nodes in ' + rsObj.name + ' connected to mongos: ' + tojson(result));
+        return result.hosts.length;
+    };
 
-var configServerURL = function(){
-    var result = config.shards.find().toArray()[0];
-    printjson( result );
-    return result.host;
-};
+    // Wait for ReplicaSetMonitor to refresh; it should discover that the set now has only 2 hosts.
+    assert.soon(function() {
+        return numMongosHosts() < 3;
+    });
 
-assert.soon( function(){ return configServerURL().indexOf( removedNode.host ) < 0; } );
+    jsTestLog("Mongos successfully detected change...");
 
-jsTestLog( "Now test adding new replica set servers..." );
+    var configServerURL = function() {
+        var result = config.shards.find().toArray()[0];
+        printjson(result);
+        return result.host;
+    };
 
-config.shards.update({ _id : rsObj.name }, { $set : { host : rsObj.name + "/" + primary.host } });
-printjson( config.shards.find().toArray() );
+    assert.soon(function() {
+        return configServerURL().indexOf(removedNode.host) < 0;
+    });
 
-rsConfig.members.push(removedNode);
-rsConfig.version++;
-reconfig(rsObj, rsConfig);
+    jsTestLog("Now test adding new replica set servers...");
 
-assert.soon( function(){ return numRSHosts() > 2; } );
+    config.shards.update({_id: rsObj.name}, {$set: {host: rsObj.name + "/" + rsObj.nodes[0].host}});
+    printjson(config.shards.find().toArray());
 
-assert.soon( function(){ return numMongosHosts() > 2; } );
+    rsConfig.members.push(removedNode);
+    rsConfig.version++;
+    reconfig(rsObj, rsConfig);
 
-assert.soon( function(){ return configServerURL().indexOf( removedNode.host ) >= 0; } );
+    assert.soon(function() {
+        return numRSHosts() > 2;
+    });
 
-jsTestLog( "Done..." );
+    assert.soon(function() {
+        return numMongosHosts() > 2;
+    });
 
-st.stop();
+    assert.soon(function() {
+        return configServerURL().indexOf(removedNode.host) >= 0;
+    });
+
+    st.stop();
+
 }());

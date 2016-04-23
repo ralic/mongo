@@ -29,19 +29,21 @@
 
 #pragma once
 
+#include <bitset>
 #include <list>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "mongo/bson/timestamp.h"
-#include "mongo/bson/bsontypes.h"
-#include "mongo/bson/oid.h"
-#include "mongo/bson/bsonelement.h"
 #include "mongo/base/data_type.h"
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
+#include "mongo/base/string_data_comparator_interface.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/bufreader.h"
@@ -176,8 +178,8 @@ public:
         return _ownedBuffer.get() != 0;
     }
 
-    /** assure the data buffer is under the control of this BSONObj and not a remote buffer
-        @see isOwned()
+    /** If the data buffer is under the control of this BSONObj, return it.
+        Else return an owned copy.
     */
     BSONObj getOwned() const;
 
@@ -244,7 +246,17 @@ public:
         @param fields if a field is found its element is stored in its corresponding position in
                 this array. if not found the array element is unchanged.
      */
+
     void getFields(unsigned n, const char** fieldNames, BSONElement* fields) const;
+
+    /**
+     * Get several fields at once. This is faster than separate getField() calls as the size of
+     * elements iterated can then be calculated only once each.
+     */
+    template <size_t N>
+    void getFields(const std::array<StringData, N>& fieldNames,
+                   std::array<BSONElement, N>* fields) const;
+
 
     /** Get the field of the specified name. eoo() is true on the returned
         element if not found.
@@ -386,18 +398,24 @@ public:
     /**wo='well ordered'.  fields must be in same order in each object.
        Ordering is with respect to the signs of the elements
        and allows ascending / descending key mixing.
+       If comparator is non-null, it is used for all comparisons between two strings.
        @return  <0 if l<r. 0 if l==r. >0 if l>r
     */
-    int woCompare(const BSONObj& r, const Ordering& o, bool considerFieldName = true) const;
+    int woCompare(const BSONObj& r,
+                  const Ordering& o,
+                  bool considerFieldName = true,
+                  StringData::ComparatorInterface* comparator = nullptr) const;
 
     /**wo='well ordered'.  fields must be in same order in each object.
        Ordering is with respect to the signs of the elements
        and allows ascending / descending key mixing.
+       If comparator is non-null, it is used for all comparisons between two strings.
        @return  <0 if l<r. 0 if l==r. >0 if l>r
     */
     int woCompare(const BSONObj& r,
                   const BSONObj& ordering = BSONObj(),
-                  bool considerFieldName = true) const;
+                  bool considerFieldName = true,
+                  StringData::ComparatorInterface* comparator = nullptr) const;
 
     bool operator<(const BSONObj& other) const {
         return woCompare(other) < 0;
@@ -571,7 +589,7 @@ public:
         buf.appendBuf(objdata(), objsize());
     }
     static BSONObj deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
-        const int size = buf.peek<int>();
+        const int size = buf.peek<LittleEndian<int>>();
         const void* ptr = buf.skip(size);
         return BSONObj(static_cast<const char*>(ptr));
     }
@@ -790,7 +808,17 @@ struct DataType::Handler<BSONObj> {
                        const char* ptr,
                        size_t length,
                        size_t* advanced,
-                       std::ptrdiff_t debug_offset);
+                       std::ptrdiff_t debug_offset) {
+        auto temp = BSONObj(ptr);
+        auto len = temp.objsize();
+        if (bson) {
+            *bson = std::move(temp);
+        }
+        if (advanced) {
+            *advanced = len;
+        }
+        return Status::OK();
+    }
 
     static Status store(const BSONObj& bson,
                         char* ptr,
@@ -802,4 +830,22 @@ struct DataType::Handler<BSONObj> {
         return BSONObj();
     }
 };
+
+template <size_t N>
+inline void BSONObj::getFields(const std::array<StringData, N>& fieldNames,
+                               std::array<BSONElement, N>* fields) const {
+    std::bitset<N> foundFields;
+    auto iter = this->begin();
+    while (iter.more() && !foundFields.all()) {
+        auto el = iter.next();
+        auto fieldName = el.fieldNameStringData();
+        for (std::size_t i = 0; i < N; ++i) {
+            if (!foundFields.test(i) && (fieldNames[i] == fieldName)) {
+                (*fields)[i] = std::move(el);
+                foundFields.set(i);
+                break;
+            }
+        }
+    }
 }
+}  // namespace mongo

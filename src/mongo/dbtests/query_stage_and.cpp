@@ -32,9 +32,12 @@
  */
 
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/and_hash.h"
@@ -45,7 +48,6 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
@@ -77,7 +79,7 @@ public:
         return descriptor;
     }
 
-    void getLocs(set<RecordId>* out, Collection* coll) {
+    void getRecordIds(set<RecordId>* out, Collection* coll) {
         auto cursor = coll->getCursor(&_txn);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -147,7 +149,8 @@ public:
     }
 
 protected:
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
 
 private:
     DBDirectClient _client;
@@ -214,7 +217,7 @@ public:
         ah->saveState();
         // ...invalidate one of the read objects
         set<RecordId> data;
-        getLocs(&data, coll);
+        getRecordIds(&data, coll);
         size_t memUsageBefore = ah->getMemUsage();
         for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
             if (coll->docFor(&_txn, *it).value()["foo"].numberInt() == 15) {
@@ -318,7 +321,7 @@ public:
         BSONObj deletedObj = BSON("_id" << 20 << "foo" << 20 << "bar" << 20 << "baz" << 20);
         ah->saveState();
         set<RecordId> data;
-        getLocs(&data, coll);
+        getRecordIds(&data, coll);
 
         size_t memUsageBefore = ah->getMemUsage();
         for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
@@ -346,7 +349,7 @@ public:
                 continue;
             }
             WorkingSetMember* wsm = ws.get(id);
-            ASSERT_NOT_EQUALS(0, deletedObj.woCompare(coll->docFor(&_txn, wsm->loc).value()));
+            ASSERT_NOT_EQUALS(0, deletedObj.woCompare(coll->docFor(&_txn, wsm->recordId).value()));
             ++count;
         }
 
@@ -887,9 +890,9 @@ public:
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
-                wsm->loc = RecordId(1);
+                wsm->recordId = RecordId(1);
                 wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                ws.transitionToLocAndObj(id);
+                ws.transitionToRecordIdAndObj(id);
                 childStage1->pushBack(id);
             }
 
@@ -921,9 +924,9 @@ public:
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
-                wsm->loc = RecordId(1);
+                wsm->recordId = RecordId(1);
                 wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                ws.transitionToLocAndObj(id);
+                ws.transitionToRecordIdAndObj(id);
                 childStage1->pushBack(id);
             }
             childStage1->pushBack(PlanStage::DEAD);
@@ -932,9 +935,9 @@ public:
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
-                wsm->loc = RecordId(2);
+                wsm->recordId = RecordId(2);
                 wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                ws.transitionToLocAndObj(id);
+                ws.transitionToRecordIdAndObj(id);
                 childStage2->pushBack(id);
             }
 
@@ -961,9 +964,9 @@ public:
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
-                wsm->loc = RecordId(1);
+                wsm->recordId = RecordId(1);
                 wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                ws.transitionToLocAndObj(id);
+                ws.transitionToRecordIdAndObj(id);
                 childStage1->pushBack(id);
             }
 
@@ -971,9 +974,9 @@ public:
             {
                 WorkingSetID id = ws.allocate();
                 WorkingSetMember* wsm = ws.get(id);
-                wsm->loc = RecordId(2);
+                wsm->recordId = RecordId(2);
                 wsm->obj = Snapshotted<BSONObj>(SnapshotId(), dataObj);
-                ws.transitionToLocAndObj(id);
+                ws.transitionToRecordIdAndObj(id);
                 childStage2->pushBack(id);
             }
             childStage2->pushBack(PlanStage::DEAD);
@@ -1036,9 +1039,9 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
-        // Get the set of disklocs in our collection to use later.
+        // Get the set of RecordIds in our collection to use later.
         set<RecordId> data;
-        getLocs(&data, coll);
+        getRecordIds(&data, coll);
 
         // We're making an assumption here that happens to be true because we clear out the
         // collection before running this: increasing inserts have increasing RecordIds.
@@ -1085,7 +1088,7 @@ public:
             ASSERT_EQUALS(1, elt.numberInt());
             ASSERT_TRUE(member->getFieldDotted("bar", &elt));
             ASSERT_EQUALS(1, elt.numberInt());
-            ASSERT_EQUALS(member->loc, *it);
+            ASSERT_EQUALS(member->recordId, *it);
         }
 
         // Move 'it' to a result that's yet to show up.
@@ -1319,11 +1322,11 @@ public:
             if (PlanStage::ADVANCED != status) {
                 continue;
             }
-            BSONObj thisObj = coll->docFor(&_txn, ws.get(id)->loc).value();
+            BSONObj thisObj = coll->docFor(&_txn, ws.get(id)->recordId).value();
             ASSERT_EQUALS(7 + count, thisObj["bar"].numberInt());
             ++count;
             if (WorkingSet::INVALID_ID != lastId) {
-                BSONObj lastObj = coll->docFor(&_txn, ws.get(lastId)->loc).value();
+                BSONObj lastObj = coll->docFor(&_txn, ws.get(lastId)->recordId).value();
                 ASSERT_LESS_THAN(lastObj["bar"].woCompare(thisObj["bar"]), 0);
             }
             lastId = id;

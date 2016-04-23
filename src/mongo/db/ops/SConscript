@@ -69,6 +69,7 @@ env.Library(
         'modifier_unset.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/global_timestamp',
         'update_common',
@@ -230,5 +231,25 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         '$BUILD_DIR/mongo/db/query/query_planner',
         'update_driver',
+    ],
+)
+
+env.Library(
+    target='write_ops_parsers',
+    source=[
+        'write_ops_parsers.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/dbmessage',
+    ],
+)
+
+env.CppUnitTest(
+    target='write_ops_parsers_test',
+    source='write_ops_parsers_test.cpp',
+    LIBDEPS=[
+        'write_ops_parsers',
+        '$BUILD_DIR/mongo/client/clientdriver',
     ],
 )

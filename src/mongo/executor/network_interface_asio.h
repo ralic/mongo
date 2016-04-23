@@ -30,19 +30,27 @@
 
 #include <asio.hpp>
 
+#include <array>
 #include <boost/optional.hpp>
 #include <memory>
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/system_error.h"
+#include "mongo/executor/async_stream_factory_interface.h"
+#include "mongo/executor/async_stream_interface.h"
+#include "mongo/executor/connection_pool.h"
+#include "mongo/executor/async_timer_interface.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
@@ -51,42 +59,100 @@
 #include "mongo/util/net/message.h"
 
 namespace mongo {
+
 namespace executor {
 
-class AsyncStreamFactoryInterface;
+namespace connection_pool_asio {
+class ASIOConnection;
+class ASIOTimer;
+class ASIOImpl;
+}  // connection_pool_asio
+
 class AsyncStreamInterface;
+
+#define MONGO_ASIO_INVARIANT(_Expression, ...)              \
+    do {                                                    \
+        if (MONGO_unlikely(!(_Expression))) {               \
+            _failWithInfo(__FILE__, __LINE__, __VA_ARGS__); \
+        }                                                   \
+    } while (false)
+
+#define MONGO_ASIO_INVARIANT_INLOCK(_Expression, ...)              \
+    do {                                                           \
+        if (MONGO_unlikely(!(_Expression))) {                      \
+            _failWithInfo_inlock(__FILE__, __LINE__, __VA_ARGS__); \
+        }                                                          \
+    } while (false)
+
+// An AsyncOp can transition through at most 5 states.
+const int kMaxStateTransitions = 5;
 
 /**
  * Implementation of the replication system's network interface using Christopher
  * Kohlhoff's ASIO library instead of existing MongoDB networking primitives.
  */
 class NetworkInterfaceASIO final : public NetworkInterface {
+    friend class connection_pool_asio::ASIOConnection;
+    friend class connection_pool_asio::ASIOTimer;
+    friend class connection_pool_asio::ASIOImpl;
+
 public:
-    NetworkInterfaceASIO(std::unique_ptr<AsyncStreamFactoryInterface> streamFactory,
-                         std::unique_ptr<NetworkConnectionHook> networkConnectionHook);
-    NetworkInterfaceASIO(std::unique_ptr<AsyncStreamFactoryInterface> streamFactory);
+    struct Options {
+        Options();
+
+// Explicit move construction and assignment to support MSVC
+#if defined(_MSC_VER) && _MSC_VER < 1900
+        Options(Options&&);
+        Options& operator=(Options&&);
+#else
+        Options(Options&&) = default;
+        Options& operator=(Options&&) = default;
+#endif
+
+        std::string instanceName = "NetworkInterfaceASIO";
+        ConnectionPool::Options connectionPoolOptions;
+        std::unique_ptr<AsyncTimerFactoryInterface> timerFactory;
+        std::unique_ptr<NetworkConnectionHook> networkConnectionHook;
+        std::unique_ptr<AsyncStreamFactoryInterface> streamFactory;
+        std::unique_ptr<rpc::EgressMetadataHook> metadataHook;
+    };
+
+    NetworkInterfaceASIO(Options = Options());
+
     std::string getDiagnosticString() override;
+
+    uint64_t getNumCanceledOps();
+    uint64_t getNumFailedOps();
+    uint64_t getNumSucceededOps();
+    uint64_t getNumTimedOutOps();
+
+    void appendConnectionStats(ConnectionPoolStats* stats) const override;
     std::string getHostName() override;
     void startup() override;
     void shutdown() override;
+    bool inShutdown() const override;
     void waitForWork() override;
     void waitForWorkUntil(Date_t when) override;
     void signalWorkAvailable() override;
     Date_t now() override;
-    void startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                      const RemoteCommandRequest& request,
-                      const RemoteCommandCompletionFn& onFinish) override;
+    Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                        const RemoteCommandRequest& request,
+                        const RemoteCommandCompletionFn& onFinish) override;
     void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) override;
-    void setAlarm(Date_t when, const stdx::function<void()>& action) override;
+    void cancelAllCommands() override;
+    Status setAlarm(Date_t when, const stdx::function<void()>& action) override;
 
-    bool inShutdown() const;
+    bool onNetworkThread() override;
 
 private:
     using ResponseStatus = TaskExecutor::ResponseStatus;
     using NetworkInterface::RemoteCommandCompletionFn;
     using NetworkOpHandler = stdx::function<void(std::error_code, size_t)>;
+    using TableRow = std::vector<std::string>;
 
     enum class State { kReady, kRunning, kShutdown };
+
+    friend class AsyncOp;
 
     /**
      * AsyncConnection encapsulates the per-connection state we maintain.
@@ -96,6 +162,8 @@ private:
         AsyncConnection(std::unique_ptr<AsyncStreamInterface>, rpc::ProtocolSet serverProtocols);
 
         AsyncStreamInterface& stream();
+
+        void cancel();
 
         rpc::ProtocolSet serverProtocols() const;
         rpc::ProtocolSet clientProtocols() const;
@@ -114,7 +182,10 @@ private:
         std::unique_ptr<AsyncStreamInterface> _stream;
 
         rpc::ProtocolSet _serverProtocols;
-        rpc::ProtocolSet _clientProtocols{rpc::supports::kAll};
+
+        // Dynamically initialized from [min max]WireVersionOutgoing.
+        // Its expected that isMaster response is checked only on the caller.
+        rpc::ProtocolSet _clientProtocols{rpc::supports::kNone};
     };
 
     /**
@@ -122,7 +193,31 @@ private:
      */
     class AsyncCommand {
     public:
-        AsyncCommand(AsyncConnection* conn, Message&& command, Date_t now);
+        /**
+         * Describes the variant of AsyncCommand this object represents.
+         */
+        enum class CommandType {
+            /**
+             * An ordinary command of an unspecified Protocol.
+             */
+            kRPC,
+
+            /**
+             * A 'find' command that has been downconverted to an OP_QUERY.
+             */
+            kDownConvertedFind,
+
+            /**
+             * A 'getMore' command that has been downconverted to an OP_GET_MORE.
+             */
+            kDownConvertedGetMore,
+        };
+
+        AsyncCommand(AsyncConnection* conn,
+                     CommandType type,
+                     Message&& command,
+                     Date_t now,
+                     const HostAndPort& target);
 
         NetworkInterfaceASIO::AsyncConnection& conn();
 
@@ -130,10 +225,14 @@ private:
         Message& toRecv();
         MSGHEADER::Value& header();
 
-        ResponseStatus response(rpc::Protocol protocol, Date_t now);
+        ResponseStatus response(rpc::Protocol protocol,
+                                Date_t now,
+                                rpc::EgressMetadataHook* metadataHook = nullptr);
 
     private:
         NetworkInterfaceASIO::AsyncConnection* const _conn;
+
+        const CommandType _type;
 
         Message _toSend;
         Message _toRecv;
@@ -142,20 +241,64 @@ private:
         MSGHEADER::Value _header;
 
         const Date_t _start;
+
+        HostAndPort _target;
     };
 
     /**
      * Helper object to manage individual network operations.
      */
     class AsyncOp {
+        friend class NetworkInterfaceASIO;
+
     public:
-        AsyncOp(const TaskExecutor::CallbackHandle& cbHandle,
+        /**
+          * Describe the various states through which an AsyncOp transitions.
+          */
+        enum class State : unsigned char {
+            // A non-state placeholder.
+            kNoState,
+            // A new or zeroed-out AsyncOp.
+            kUninitialized,
+            // An AsyncOp begins its progress when startProgress() is called.
+            kInProgress,
+            // An AsyncOp transitions to kTimedOut when timeOut() is called.
+            // Note that the AsyncOp can be in a kCanceled state and still be
+            // in-flight in NetworkInterfaceASIO.
+            kTimedOut,
+            // An AsyncOp transitions to kCanceled when cancel() is called.
+            // Note that the AsyncOp can be in a kCanceled state and still be
+            // in-flight in NetworkInterfaceASIO.
+            kCanceled,
+            // An AsyncOp is finished once its finish() method is called. Note
+            // that the AsyncOp can be in a kFinished state and still be in the
+            // NetworkInterface's set of in-progress operations.
+            kFinished,
+        };
+
+        AsyncOp(NetworkInterfaceASIO* net,
+                const TaskExecutor::CallbackHandle& cbHandle,
                 const RemoteCommandRequest& request,
                 const RemoteCommandCompletionFn& onFinish,
                 Date_t now);
 
+        /**
+         * Access control for AsyncOp. These objects should be used through shared_ptrs.
+         *
+         * In order to safely access an AsyncOp:
+         * 1. Take the lock
+         * 2. Check the id
+         * 3. If id matches saved generation, proceed, otherwise op has been recycled.
+         */
+        struct AccessControl {
+            stdx::mutex mutex;
+            std::size_t id = 0;
+        };
+
         void cancel();
         bool canceled() const;
+        void timeOut_inlock();
+        bool timedOut() const;
 
         const TaskExecutor::CallbackHandle& cbHandle() const;
 
@@ -166,15 +309,22 @@ private:
         // AsyncOp may run multiple commands over its lifetime (for example, an ismaster
         // command, the command provided to the NetworkInterface via startCommand(), etc.)
         // Calling beginCommand() resets internal state to prepare to run newCommand.
-        AsyncCommand& beginCommand(const RemoteCommandRequest& request,
-                                   rpc::Protocol protocol,
-                                   Date_t now);
-        AsyncCommand& beginCommand(Message&& newCommand, Date_t now);
-        AsyncCommand& command();
+        Status beginCommand(const RemoteCommandRequest& request,
+                            rpc::EgressMetadataHook* metadataHook = nullptr);
+
+        // This form of beginCommand takes a raw message. It is needed if the caller
+        // has to form the command manually (e.g. to use a specific requestBuilder).
+        Status beginCommand(Message&& newCommand,
+                            AsyncCommand::CommandType,
+                            const HostAndPort& target);
+
+        AsyncCommand* command();
 
         void finish(const TaskExecutor::ResponseStatus& status);
 
         const RemoteCommandRequest& request() const;
+
+        void startProgress(Date_t startTime);
 
         Date_t start() const;
 
@@ -182,12 +332,58 @@ private:
 
         void setOperationProtocol(rpc::Protocol proto);
 
+        void reset();
+
+        void clearStateTransitions();
+
+        void setOnFinish(RemoteCommandCompletionFn&& onFinish);
+
+        // Returns diagnostic strings for logging.
+        TableRow getStringFields() const;
+        std::string toString() const;
+
+        asio::io_service::strand& strand() {
+            return _strand;
+        }
+
+        asio::ip::tcp::resolver& resolver() {
+            return _resolver;
+        }
+
+        bool operator==(const AsyncOp& other) const;
+
     private:
+        // Type to represent the internal id of this request.
+        using AsyncOpId = uint64_t;
+
+        static const TableRow kFieldLabels;
+
+        // Return string representation of a given state.
+        std::string _stateToString(State state) const;
+
+        // Return a string representation of this op's state transitions.
+        std::string _stateString() const;
+
+        bool _hasSeenState(State state) const;
+
+        // Track and validate AsyncOp state transitions.
+        // Use the _inlock variant if already holding the access control lock.
+        void _transitionToState(State newState);
+        void _transitionToState_inlock(State newState);
+
+        // Helper for debugging.
+        void _failWithInfo(const char* file, int line, std::string error) const;
+
+        NetworkInterfaceASIO* const _owner;
         // Information describing a task enqueued on the NetworkInterface
         // via a call to startCommand().
         TaskExecutor::CallbackHandle _cbHandle;
         RemoteCommandRequest _request;
         RemoteCommandCompletionFn _onFinish;
+
+        // AsyncOp's have a handle to their connection pool handle. They are
+        // also owned by it when they're in the pool
+        ConnectionPool::ConnectionHandle _connectionPoolHandle;
 
         /**
          * The connection state used to service this request. We wrap it in an optional
@@ -201,9 +397,19 @@ private:
          */
         boost::optional<rpc::Protocol> _operationProtocol;
 
-        const Date_t _start;
+        Date_t _start;
+        std::unique_ptr<AsyncTimerInterface> _timeoutAlarm;
 
-        AtomicUInt64 _canceled;
+        asio::ip::tcp::resolver _resolver;
+
+        const AsyncOpId _id;
+
+        /**
+         * We maintain a shared_ptr to an access control object. This ensures that tangent
+         * execution paths, such as timeouts for this operation, will not try to access its
+         * state after it has been cleaned up.
+         */
+        std::shared_ptr<AccessControl> _access;
 
         /**
          * An AsyncOp may run 0, 1, or multiple commands over its lifetime.
@@ -211,6 +417,22 @@ private:
          * representing its current running or next-to-be-run command, if there is one.
          */
         boost::optional<AsyncCommand> _command;
+        bool _inSetup;
+
+        /**
+         * The explicit strand that all operations for this op must run on.
+         * This must be the last member of AsyncOp because any pending
+         * operation for the strand are run when it's dtor is called. Any
+         * members that fall after it will have already been destroyed, which
+         * will make those fields illegal to touch from callbacks.
+         */
+        asio::io_service::strand _strand;
+
+        /**
+         * We hold an array of states to show the path this AsyncOp has taken.
+         * Must be holding the access control's lock to edit.
+         */
+        std::array<State, kMaxStateTransitions> _states;
     };
 
     void _startCommand(AsyncOp* op);
@@ -228,6 +450,12 @@ private:
         if (op->canceled())
             return _completeOperation(op,
                                       Status(ErrorCodes::CallbackCanceled, "Callback canceled"));
+        if (op->timedOut()) {
+            str::stream msg;
+            msg << "Operation timed out"
+                << ", request was " << op->_request.toString();
+            return _completeOperation(op, Status(ErrorCodes::ExceededTimeLimit, msg));
+        }
         if (ec)
             return _networkErrorCallback(op, ec);
 
@@ -252,25 +480,55 @@ private:
 
     void _signalWorkAvailable_inlock();
 
-    void _asyncRunCommand(AsyncCommand* cmd, NetworkOpHandler handler);
+    void _asyncRunCommand(AsyncOp* op, NetworkOpHandler handler);
+
+    std::string _getDiagnosticString_inlock(AsyncOp* currentOp);
+
+    // Helpers for debugging crashes
+    void _failWithInfo(const char* file, int line, std::string error, AsyncOp* op = nullptr);
+    void _failWithInfo_inlock(const char* file, int line, std::string error, AsyncOp* op = nullptr);
+
+    Options _options;
 
     asio::io_service _io_service;
-    stdx::thread _serviceRunner;
+    std::vector<stdx::thread> _serviceRunners;
 
-    std::unique_ptr<NetworkConnectionHook> _hook;
+    const std::unique_ptr<rpc::EgressMetadataHook> _metadataHook;
 
-    asio::ip::tcp::resolver _resolver;
+    const std::unique_ptr<NetworkConnectionHook> _hook;
 
-    std::atomic<State> _state;
+    std::atomic<State> _state;  // NOLINT
+
+    std::unique_ptr<AsyncTimerFactoryInterface> _timerFactory;
 
     std::unique_ptr<AsyncStreamFactoryInterface> _streamFactory;
 
+    ConnectionPool _connectionPool;
+
+    // If it is necessary to hold this lock while accessing a particular operation with
+    // an AccessControl object, take this lock first, always.
     stdx::mutex _inProgressMutex;
     std::unordered_map<AsyncOp*, std::unique_ptr<AsyncOp>> _inProgress;
+    std::unordered_set<TaskExecutor::CallbackHandle> _inGetConnection;
+
+    // Operation counters
+    AtomicUInt64 _numCanceledOps;
+    AtomicUInt64 _numFailedOps;  // includes timed out ops but does not include canceled ops
+    AtomicUInt64 _numSucceededOps;
+    AtomicUInt64 _numTimedOutOps;
 
     stdx::mutex _executorMutex;
     bool _isExecutorRunnable;
     stdx::condition_variable _isExecutorRunnableCondition;
+
+    /**
+     * The explicit strand that all non-op operations run on. This must be the
+     * last member of NetworkInterfaceASIO because any pending operation for
+     * the strand are run when it's dtor is called. Any members that fall after
+     * it will have already been destroyed, which will make those fields
+     * illegal to touch from callbacks.
+     */
+    asio::io_service::strand _strand;
 };
 
 template <typename T, typename R, typename... MethodArgs, typename... DeducedArgs>

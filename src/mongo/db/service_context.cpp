@@ -147,16 +147,24 @@ TickSource* ServiceContext::getTickSource() const {
     return _tickSource.get();
 }
 
-ClockSource* ServiceContext::getClockSource() const {
-    return _clockSource.get();
+ClockSource* ServiceContext::getFastClockSource() const {
+    return _fastClockSource.get();
+}
+
+ClockSource* ServiceContext::getPreciseClockSource() const {
+    return _preciseClockSource.get();
 }
 
 void ServiceContext::setTickSource(std::unique_ptr<TickSource> newSource) {
     _tickSource = std::move(newSource);
 }
 
-void ServiceContext::setClockSource(std::unique_ptr<ClockSource> newSource) {
-    _clockSource = std::move(newSource);
+void ServiceContext::setFastClockSource(std::unique_ptr<ClockSource> newSource) {
+    _fastClockSource = std::move(newSource);
+}
+
+void ServiceContext::setPreciseClockSource(std::unique_ptr<ClockSource> newSource) {
+    _preciseClockSource = std::move(newSource);
 }
 
 void ServiceContext::ClientDeleter::operator()(Client* client) const {
@@ -205,6 +213,7 @@ ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Clie
 
 void ServiceContext::OperationContextDeleter::operator()(OperationContext* opCtx) const {
     auto client = opCtx->getClient();
+    invariant(client);
     auto service = client->getServiceContext();
     // // TODO(schwerin): When callers no longer construct their own OperationContexts directly,
     // // but only through the ServiceContext, uncomment the following.  Until then, it must

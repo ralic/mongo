@@ -32,19 +32,20 @@
 #include <vector>
 
 #include "mongo/client/connpool.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 
@@ -94,6 +95,9 @@ void appendReplicationInfo(OperationContext* txn, BSONObjBuilder& result, int le
             while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
                 src.push_back(obj.getOwned());
             }
+
+            // Non-yielding collection scans from InternalPlanner will never error.
+            invariant(PlanExecutor::IS_EOF == state);
         }
 
         for (list<BSONObj>::const_iterator i = src.begin(); i != src.end(); i++) {
@@ -178,7 +182,7 @@ public:
 
         BSONObjBuilder result;
         // TODO(siyuan) Output term of OpTime
-        result.append("latestOptime", replCoord->getMyLastOptime().getTimestamp());
+        result.append("latestOptime", replCoord->getMyLastAppliedOpTime().getTimestamp());
 
         const std::string& oplogNS =
             replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet
@@ -206,7 +210,7 @@ public:
                 "--slave in simple master/slave setups.\n";
         help << "{ isMaster : 1 }";
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -227,18 +231,17 @@ public:
 
         appendReplicationInfo(txn, result, 0);
 
-        if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::CSRS) {
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             result.append("configsvr", 1);
-        } else if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::SCCC) {
-            result.append("configsvr", 0);
         }
 
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
         result.appendNumber("maxWriteBatchSize", BatchedCommandRequest::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
-        result.append("maxWireVersion", maxWireVersion);
-        result.append("minWireVersion", minWireVersion);
+        result.append("maxWireVersion", WireSpec::instance().maxWireVersionIncoming);
+        result.append("minWireVersion", WireSpec::instance().minWireVersionIncoming);
+        result.append("readOnly", storageGlobalParams.readOnly);
         return true;
     }
 } cmdismaster;

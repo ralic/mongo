@@ -1,11 +1,12 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
 
+#define	WT_PTRDIFFT_FMT	"td"			/* ptrdiff_t format string */
 #define	WT_SIZET_FMT	"zu"			/* size_t format string */
 
 /* Add GCC-specific attributes to types and function declarations. */
@@ -123,7 +124,7 @@ __wt_atomic_sub##name(type *vp, type v)					\
 {									\
 	return (__sync_sub_and_fetch(vp, v));				\
 }									\
-static inline int							\
+static inline bool							\
 __wt_atomic_cas##name(type *vp, type old, type new)			\
 {									\
 	return (WT_ATOMIC_CAS(vp, old, new));				\
@@ -145,7 +146,7 @@ WT_ATOMIC_FUNC(size, size_t, size_t)
  * __wt_atomic_cas_ptr --
  *	Pointer compare and swap.
  */
-static inline int
+static inline bool
 __wt_atomic_cas_ptr(void *vp, void *old, void *new)
 {
 	return (WT_ATOMIC_CAS((void **)vp, old, new));
@@ -156,8 +157,7 @@ __wt_atomic_cas_ptr(void *vp, void *old, void *new)
 
 #if defined(x86_64) || defined(__x86_64__)
 /* Pause instruction to prevent excess processor bus usage */
-#define	WT_PAUSE() __asm__ volatile("pause\n" ::: "memory")
-
+#define	WT_PAUSE()	__asm__ volatile("pause\n" ::: "memory")
 #define	WT_FULL_BARRIER() do {						\
 	__asm__ volatile ("mfence" ::: "memory");			\
 } while (0)
@@ -169,7 +169,7 @@ __wt_atomic_cas_ptr(void *vp, void *old, void *new)
 } while (0)
 
 #elif defined(i386) || defined(__i386__)
-#define	WT_PAUSE() __asm__ volatile("pause\n" ::: "memory")
+#define	WT_PAUSE()	__asm__ volatile("pause\n" ::: "memory")
 #define	WT_FULL_BARRIER() do {						\
 	__asm__ volatile ("lock; addl $0, 0(%%esp)" ::: "memory");	\
 } while (0)
@@ -177,23 +177,58 @@ __wt_atomic_cas_ptr(void *vp, void *old, void *new)
 #define	WT_WRITE_BARRIER()	WT_FULL_BARRIER()
 
 #elif defined(__PPC64__) || defined(PPC64)
+/* ori 0,0,0 is the PPC64 noop instruction */
 #define	WT_PAUSE()	__asm__ volatile("ori 0,0,0" ::: "memory")
-#define	WT_FULL_BARRIER()	do {
+#define	WT_FULL_BARRIER() do {						\
 	__asm__ volatile ("sync" ::: "memory");				\
 } while (0)
-#define	WT_READ_BARRIER()	WT_FULL_BARRIER()
-#define	WT_WRITE_BARRIER()	WT_FULL_BARRIER()
+
+/* TODO: ISA 2.07 Elemental Memory Barriers would be better,
+   specifically mbll, and mbss, but they are not supported by POWER 8 */
+#define	WT_READ_BARRIER() do {						\
+	__asm__ volatile ("lwsync" ::: "memory");			\
+} while (0)
+#define	WT_WRITE_BARRIER() do {						\
+	__asm__ volatile ("lwsync" ::: "memory");			\
+} while (0)
 
 #elif defined(__aarch64__)
 #define	WT_PAUSE()	__asm__ volatile("yield" ::: "memory")
 #define	WT_FULL_BARRIER() do {						\
-	  __asm__ volatile ("dsb sy" ::: "memory");			\
+	__asm__ volatile ("dsb sy" ::: "memory");			\
 } while (0)
 #define	WT_READ_BARRIER() do {						\
-	  __asm__ volatile ("dsb ld" ::: "memory");			\
+	__asm__ volatile ("dsb ld" ::: "memory");			\
 } while (0)
 #define	WT_WRITE_BARRIER() do {						\
-	  __asm__ volatile ("dsb st" ::: "memory");			\
+	__asm__ volatile ("dsb st" ::: "memory");			\
+} while (0)
+
+#elif defined(__s390x__)
+#define	WT_PAUSE()	__asm__ volatile("lr 0,0" ::: "memory")
+#define	WT_FULL_BARRIER() do {						\
+	__asm__ volatile ("bcr 15,0\n" ::: "memory");			\
+} while (0)
+#define	WT_READ_BARRIER()	WT_FULL_BARRIER()
+#define	WT_WRITE_BARRIER()	WT_FULL_BARRIER()
+
+#elif defined(__sparc__)
+#define	WT_PAUSE()	__asm__ volatile("rd %%ccr, %%g0" ::: "memory")
+
+#define	WT_FULL_BARRIER() do {						\
+	__asm__ volatile ("membar #StoreLoad" ::: "memory");		\
+} while (0)
+
+/*
+ * On UltraSparc machines, TSO is used, and so there is no need for membar.
+ * READ_BARRIER = #LoadLoad, and WRITE_BARRIER = #StoreStore are noop.
+ */
+#define	WT_READ_BARRIER() do {						\
+	__asm__ volatile ("" ::: "memory");				\
+} while (0)
+
+#define	WT_WRITE_BARRIER() do {						\
+	__asm__ volatile ("" ::: "memory");				\
 } while (0)
 
 #else

@@ -26,6 +26,8 @@
  * it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/pipeline_d.h"
@@ -35,21 +37,27 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/exec/fetch.h"
+#include "mongo/db/exec/index_iterator.h"
 #include "mongo/db/exec/multi_iterator.h"
-#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -64,16 +72,18 @@ public:
     MongodImplementation(const intrusive_ptr<ExpressionContext>& ctx)
         : _ctx(ctx), _client(ctx->opCtx) {}
 
+    void setOperationContext(OperationContext* opCtx) {
+        invariant(_ctx->opCtx == opCtx);
+        _client.setOpCtx(opCtx);
+    }
+
     DBClientBase* directClient() final {
-        // opCtx may have changed since our last call
-        invariant(_ctx->opCtx);
-        _client.setOpCtx(_ctx->opCtx);
         return &_client;
     }
 
     bool isSharded(const NamespaceString& ns) final {
         const ChunkVersion unsharded(0, 0, OID());
-        return !(ShardingState::get(getGlobalServiceContext())
+        return !(ShardingState::get(_ctx->opCtx)
                      ->getVersion(ns.ns())
                      .isWriteCompatibleWith(unsharded));
     }
@@ -91,6 +101,19 @@ public:
 
         _client.insert(ns.ns(), objs);
         return _client.getLastErrorDetailed();
+    }
+
+    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
+                                          const NamespaceString& ns) final {
+        AutoGetCollectionForRead autoColl(opCtx, ns);
+
+        Collection* collection = autoColl.getCollection();
+        if (!collection) {
+            LOG(2) << "Collection not found on index stats retrieval: " << ns.ns();
+            return CollectionIndexUsageMap();
+        }
+
+        return collection->infoCache()->getIndexUsageStats();
     }
 
 private:
@@ -111,24 +134,50 @@ shared_ptr<PlanExecutor> createRandomCursorExecutor(Collection* collection,
     if (sampleSize > numRecords * kMaxSampleRatioForRandCursor || numRecords <= 100)
         return {};
 
-    // Attempt to get a random cursor from the storage engine.
-    auto randCursor = collection->getRecordStore()->getRandomCursor(txn);
-
-    if (!randCursor)
-        return {};
+    // Attempt to get a random cursor from the RecordStore. If the RecordStore does not support
+    // random cursors, attempt to get one from the _id index.
+    std::unique_ptr<RecordCursor> rsRandCursor = collection->getRecordStore()->getRandomCursor(txn);
 
     auto ws = stdx::make_unique<WorkingSet>();
-    auto stage = stdx::make_unique<MultiIteratorStage>(txn, ws.get(), collection);
-    stage->addIterator(std::move(randCursor));
+    std::unique_ptr<PlanStage> stage;
+
+    if (rsRandCursor) {
+        stage = stdx::make_unique<MultiIteratorStage>(txn, ws.get(), collection);
+        static_cast<MultiIteratorStage*>(stage.get())->addIterator(std::move(rsRandCursor));
+
+    } else {
+        auto indexCatalog = collection->getIndexCatalog();
+        auto indexDescriptor = indexCatalog->findIdIndex(txn);
+
+        if (!indexDescriptor) {
+            // There was no _id index.
+            return {};
+        }
+
+        IndexAccessMethod* idIam = indexCatalog->getIndex(indexDescriptor);
+        auto idxRandCursor = idIam->newRandomCursor(txn);
+
+        if (!idxRandCursor) {
+            // Storage engine does not support any type of random cursor.
+            return {};
+        }
+
+        auto idxIterator = stdx::make_unique<IndexIteratorStage>(txn,
+                                                                 ws.get(),
+                                                                 collection,
+                                                                 idIam,
+                                                                 indexDescriptor->keyPattern(),
+                                                                 std::move(idxRandCursor));
+        stage = stdx::make_unique<FetchStage>(
+            txn, ws.get(), idxIterator.release(), nullptr, collection);
+    }
+
+    ShardingState* const shardingState = ShardingState::get(txn);
 
     // If we're in a sharded environment, we need to filter out documents we don't own.
-    if (ShardingState::get(getGlobalServiceContext())
-            ->needCollectionMetadata(txn->getClient(), txn->getNS())) {
+    if (shardingState->needCollectionMetadata(txn, txn->getNS())) {
         auto shardFilterStage = stdx::make_unique<ShardFilterStage>(
-            txn,
-            ShardingState::get(getGlobalServiceContext())->getCollectionMetadata(txn->getNS()),
-            ws.get(),
-            stage.release());
+            txn, shardingState->getCollectionMetadata(txn->getNS()), ws.get(), stage.release());
         return uassertStatusOK(PlanExecutor::make(
             txn, std::move(ws), std::move(shardFilterStage), collection, PlanExecutor::YIELD_AUTO));
     }
@@ -145,10 +194,10 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
     BSONObj projectionObj,
     BSONObj sortObj,
     const size_t plannerOpts) {
-    const WhereCallbackReal whereCallback(pExpCtx->opCtx, pExpCtx->ns.db());
+    const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &pExpCtx->ns);
 
-    auto cq =
-        CanonicalQuery::canonicalize(pExpCtx->ns, queryObj, sortObj, projectionObj, whereCallback);
+    auto cq = CanonicalQuery::canonicalize(
+        pExpCtx->ns, queryObj, sortObj, projectionObj, extensionsCallback);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -167,15 +216,16 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
 shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     OperationContext* txn,
     Collection* collection,
+    const NamespaceString& nss,
     const intrusive_ptr<Pipeline>& pPipeline,
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
     // We will be modifying the source vector as we go.
     Pipeline::SourceContainer& sources = pPipeline->sources;
 
     // Inject a MongodImplementation to sources that need them.
-    for (size_t i = 0; i < sources.size(); i++) {
+    for (auto&& source : sources) {
         DocumentSourceNeedsMongod* needsMongod =
-            dynamic_cast<DocumentSourceNeedsMongod*>(sources[i].get());
+            dynamic_cast<DocumentSourceNeedsMongod*>(source.get());
         if (needsMongod) {
             needsMongod->injectMongodInterface(std::make_shared<MongodImplementation>(pExpCtx));
         }
@@ -213,13 +263,19 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
         }
     }
 
-    // Look for an initial match. This works whether we got an initial query or not.
-    // If not, it results in a "{}" query, which will be what we want in that case.
+    // Look for an initial match. This works whether we got an initial query or not. If not, it
+    // results in a "{}" query, which will be what we want in that case.
     const BSONObj queryObj = pPipeline->getInitialQuery();
     if (!queryObj.isEmpty()) {
-        // This will get built in to the Cursor we'll create, so
-        // remove the match from the pipeline
-        sources.pop_front();
+        if (dynamic_cast<DocumentSourceMatch*>(sources.front().get())) {
+            // If a $match query is pulled into the cursor, the $match is redundant, and can be
+            // removed from the pipeline.
+            sources.pop_front();
+        } else {
+            // A $geoNear stage, the only other stage that can produce an initial query, is also
+            // a valid initial stage and will be handled above.
+            MONGO_UNREACHABLE;
+        }
     }
 
     // Find the set of fields in the source documents depended on by this pipeline.
@@ -245,8 +301,16 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     }
 
     // Create the PlanExecutor.
-    auto exec = prepareExecutor(
-        txn, collection, pPipeline, pExpCtx, sortStage, deps, queryObj, &sortObj, &projForQuery);
+    auto exec = prepareExecutor(txn,
+                                collection,
+                                nss,
+                                pPipeline,
+                                pExpCtx,
+                                sortStage,
+                                deps,
+                                queryObj,
+                                &sortObj,
+                                &projForQuery);
 
     return addCursorSource(pPipeline, pExpCtx, exec, deps, queryObj, sortObj, projForQuery);
 }
@@ -254,6 +318,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
 std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
     OperationContext* txn,
     Collection* collection,
+    const NamespaceString& nss,
     const intrusive_ptr<Pipeline>& pipeline,
     const intrusive_ptr<ExpressionContext>& expCtx,
     const intrusive_ptr<DocumentSourceSort>& sortStage,
@@ -279,8 +344,19 @@ std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
     //
     // LATER - We should attempt to determine if the results from the query are returned in some
     // order so we can then apply other optimizations there are tickets for, such as SERVER-4507.
-    size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::INCLUDE_SHARD_FILTER |
-        QueryPlannerParams::NO_BLOCKING_SORT;
+    size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::NO_BLOCKING_SORT;
+
+    // If we are connecting directly to the shard rather than through a mongos, don't filter out
+    // orphaned documents.
+    if (ShardingState::get(txn)->needCollectionMetadata(txn, nss.ns())) {
+        plannerOpts |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    }
+
+    if (deps.hasNoRequirements()) {
+        // If we don't need any fields from the input document, performing a count is faster, and
+        // will output empty documents, which is okay.
+        plannerOpts |= QueryPlannerParams::IS_COUNT;
+    }
 
     // The only way to get a text score is to let the query system handle the projection. In all
     // other cases, unless the query system can do an index-covered projection and avoid going to
@@ -361,6 +437,10 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
     pSource->setQuery(queryObj);
     pSource->setSort(sortObj);
 
+    if (deps.hasNoRequirements()) {
+        pSource->shouldProduceEmptyDocs();
+    }
+
     if (!projectionObj.isEmpty()) {
         pSource->setProjection(projectionObj, boost::none);
     } else {
@@ -372,11 +452,10 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
         pSource->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
 
-    while (!pipeline->sources.empty() && pSource->coalesce(pipeline->sources.front())) {
-        pipeline->sources.pop_front();
-    }
-
+    // Add the initial DocumentSourceCursor to the front of the pipeline. Then optimize again in
+    // case the new stage can be absorbed with the first stages of the pipeline.
     pipeline->addInitialSource(pSource);
+    pipeline->optimizePipeline();
 
     // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved. We
     // deregister the PlanExecutor so that it can be registered with ClientCursor.

@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <string>
 #include <vector>
 
 #include "mongo/config.h"
@@ -59,7 +60,7 @@ TEST(LockerImpl, LockNoConflict) {
 
     ASSERT(locker.isLockHeldForMode(resId, MODE_NONE));
 
-    locker.unlockAll();
+    locker.unlockGlobal();
 }
 
 TEST(LockerImpl, ReLockNoConflict) {
@@ -77,7 +78,7 @@ TEST(LockerImpl, ReLockNoConflict) {
     ASSERT(locker.unlock(resId));
     ASSERT(locker.isLockHeldForMode(resId, MODE_NONE));
 
-    ASSERT(locker.unlockAll());
+    ASSERT(locker.unlockGlobal());
 }
 
 TEST(LockerImpl, ConflictWithTimeout) {
@@ -95,8 +96,8 @@ TEST(LockerImpl, ConflictWithTimeout) {
 
     ASSERT(locker1.unlock(resId));
 
-    ASSERT(locker1.unlockAll());
-    ASSERT(locker2.unlockAll());
+    ASSERT(locker1.unlockGlobal());
+    ASSERT(locker2.unlockGlobal());
 }
 
 TEST(LockerImpl, ConflictUpgradeWithTimeout) {
@@ -113,23 +114,24 @@ TEST(LockerImpl, ConflictUpgradeWithTimeout) {
     // Try upgrading locker 1, which should block and timeout
     ASSERT(LOCK_TIMEOUT == locker1.lock(resId, MODE_X, 1));
 
-    locker1.unlockAll();
-    locker2.unlockAll();
+    locker1.unlockGlobal();
+    locker2.unlockGlobal();
 }
+
 
 TEST(LockerImpl, ReadTransaction) {
     DefaultLockerImpl locker;
 
     locker.lockGlobal(MODE_IS);
-    locker.unlockAll();
+    locker.unlockGlobal();
 
     locker.lockGlobal(MODE_IX);
-    locker.unlockAll();
+    locker.unlockGlobal();
 
     locker.lockGlobal(MODE_IX);
     locker.lockGlobal(MODE_IS);
-    locker.unlockAll();
-    locker.unlockAll();
+    locker.unlockGlobal();
+    locker.unlockGlobal();
 }
 
 /**
@@ -156,7 +158,7 @@ TEST(LockerImpl, saveAndRestoreGlobal) {
     locker.restoreLockState(lockInfo);
 
     ASSERT(locker.isLocked());
-    ASSERT(locker.unlockAll());
+    ASSERT(locker.unlockGlobal());
 }
 
 /**
@@ -180,9 +182,9 @@ TEST(LockerImpl, saveAndRestoreGlobalAcquiredTwice) {
 
     ASSERT(locker.isLocked());
 
-    // We must unlockAll twice.
-    ASSERT(!locker.unlockAll());
-    ASSERT(locker.unlockAll());
+    // We must unlockGlobal twice.
+    ASSERT(!locker.unlockGlobal());
+    ASSERT(locker.unlockGlobal());
 }
 
 /**
@@ -213,7 +215,7 @@ TEST(LockerImpl, saveAndRestoreDBAndCollection) {
     ASSERT_EQUALS(MODE_IX, locker.getLockMode(resIdDatabase));
     ASSERT_EQUALS(MODE_X, locker.getLockMode(resIdCollection));
 
-    ASSERT(locker.unlockAll());
+    ASSERT(locker.unlockGlobal());
 }
 
 TEST(LockerImpl, DefaultLocker) {
@@ -231,7 +233,7 @@ TEST(LockerImpl, DefaultLocker) {
     ASSERT_EQUALS(RESOURCE_GLOBAL, info.locks[0].resourceId.getType());
     ASSERT_EQUALS(resId, info.locks[1].resourceId);
 
-    ASSERT(locker.unlockAll());
+    ASSERT(locker.unlockGlobal());
 }
 
 TEST(LockerImpl, MMAPV1Locker) {
@@ -250,7 +252,53 @@ TEST(LockerImpl, MMAPV1Locker) {
     ASSERT_EQUALS(RESOURCE_MMAPV1_FLUSH, info.locks[1].resourceId.getType());
     ASSERT_EQUALS(resId, info.locks[2].resourceId);
 
-    ASSERT(locker.unlockAll());
+    ASSERT(locker.unlockGlobal());
+}
+
+TEST(LockerImpl, CanceledDeadlockUnblocks) {
+    const ResourceId db1(RESOURCE_DATABASE, std::string("db1"));
+    const ResourceId db2(RESOURCE_DATABASE, std::string("db2"));
+
+    DefaultLockerImpl locker1;
+    DefaultLockerImpl locker2;
+    DefaultLockerImpl locker3;
+
+    ASSERT(LOCK_OK == locker1.lockGlobal(MODE_IX));
+    ASSERT(LOCK_OK == locker1.lock(db1, MODE_S));
+
+    ASSERT(LOCK_OK == locker2.lockGlobal(MODE_IX));
+    ASSERT(LOCK_OK == locker2.lock(db2, MODE_X));
+
+    // Set up locker1 and locker2 for deadlock
+    ASSERT(LOCK_WAITING == locker1.lockBegin(db2, MODE_X));
+    ASSERT(LOCK_WAITING == locker2.lockBegin(db1, MODE_X));
+
+    // Locker3 blocks behind locker 2
+    ASSERT(LOCK_OK == locker3.lockGlobal(MODE_IX));
+    ASSERT(LOCK_WAITING == locker3.lockBegin(db1, MODE_S));
+
+    // Detect deadlock, canceling our request
+    ASSERT(LOCK_DEADLOCK == locker2.lockComplete(db1, MODE_X, 1, /*checkDeadlock*/ true));
+
+    // Now locker3 must be able to complete its request
+    ASSERT(LOCK_OK == locker3.lockComplete(db1, MODE_S, 1, /*checkDeadlock*/ false));
+
+    // Locker1 still can't complete its request
+    ASSERT(LOCK_TIMEOUT == locker1.lockComplete(db2, MODE_X, 1, false));
+
+    // Check ownership for db1
+    ASSERT(locker1.getLockMode(db1) == MODE_S);
+    ASSERT(locker2.getLockMode(db1) == MODE_NONE);
+    ASSERT(locker3.getLockMode(db1) == MODE_S);
+
+    // Check ownership for db2
+    ASSERT(locker1.getLockMode(db2) == MODE_NONE);
+    ASSERT(locker2.getLockMode(db2) == MODE_X);
+    ASSERT(locker3.getLockMode(db2) == MODE_NONE);
+
+    ASSERT(locker1.unlockGlobal());
+    ASSERT(locker2.unlockGlobal());
+    ASSERT(locker3.unlockGlobal());
 }
 
 
@@ -295,7 +343,7 @@ TEST(Locker, PerformanceLocker) {
         // Do some warm-up loops
         for (int i = 0; i < 1000; i++) {
             locker.lockGlobal(MODE_IS);
-            locker.unlockAll();
+            locker.unlockGlobal();
         }
 
         // Measure the number of loops
@@ -303,7 +351,7 @@ TEST(Locker, PerformanceLocker) {
 
         for (int i = 0; i < NUM_PERF_ITERS; i++) {
             locker.lockGlobal(MODE_IS);
-            locker.unlockAll();
+            locker.unlockGlobal();
         }
 
         log() << numLockers << " locks took: "

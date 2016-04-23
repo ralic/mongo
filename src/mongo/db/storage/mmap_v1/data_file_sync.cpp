@@ -36,9 +36,10 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/storage/mmap_v1/dur_journal.h"
 #include "mongo/db/storage/mmap_v1/mmap.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 
@@ -60,7 +61,7 @@ void DataFileSync::run() {
     } else if (storageGlobalParams.syncdelay == 1) {
         log() << "--syncdelay 1" << endl;
     } else if (storageGlobalParams.syncdelay != 60) {
-        LOG(1) << "--syncdelay " << storageGlobalParams.syncdelay << endl;
+        LOG(1) << "--syncdelay " << storageGlobalParams.syncdelay.load() << endl;
     }
     int time_flushing = 0;
     while (!inShutdown()) {
@@ -81,7 +82,11 @@ void DataFileSync::run() {
 
         Date_t start = jsTime();
         StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+
+        dur::notifyPreDataFileFlush();
         int numFiles = storageEngine->flushAllFiles(true);
+        dur::notifyPostDataFileFlush();
+
         time_flushing = durationCount<Milliseconds>(jsTime() - start);
 
         _flushed(time_flushing);

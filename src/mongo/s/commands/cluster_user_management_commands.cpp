@@ -42,13 +42,19 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/write_ops/wc_error_detail.h"
 
 namespace mongo {
 
 using std::string;
 using std::stringstream;
 using std::vector;
+
+namespace {
 
 class CmdCreateUser : public Command {
 public:
@@ -58,8 +64,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -79,7 +86,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         return grid.catalogManager(txn)
-            ->runUserManagementWriteCommand(txn, this->name, dbname, cmdObj, &result);
+            ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result);
     }
 
     virtual void redactForLogging(mutablebson::Document* cmdObj) {
@@ -96,8 +103,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -117,12 +125,12 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateUserArgs args;
-        Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, this->name, dbname, &args);
+        Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, getName(), dbname, &args);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -145,8 +153,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -173,7 +182,7 @@ public:
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -192,8 +201,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -213,7 +223,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -232,8 +242,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -256,12 +267,12 @@ public:
         vector<RoleName> roles;
         BSONObj unusedWriteConcern;
         Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, this->name, dbname, &userNameString, &roles, &unusedWriteConcern);
+            cmdObj, getName(), dbname, &userNameString, &roles, &unusedWriteConcern);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -280,8 +291,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -304,12 +316,12 @@ public:
         vector<RoleName> unusedRoles;
         BSONObj unusedWriteConcern;
         Status status = auth::parseRolePossessionManipulationCommands(
-            cmdObj, this->name, dbname, &userNameString, &unusedRoles, &unusedWriteConcern);
+            cmdObj, getName(), dbname, &userNameString, &unusedRoles, &unusedWriteConcern);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -330,7 +342,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -365,8 +378,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -386,7 +400,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         return grid.catalogManager(txn)
-            ->runUserManagementWriteCommand(txn, this->name, dbname, cmdObj, &result);
+            ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result);
     }
 
 } cmdCreateRole;
@@ -399,8 +413,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -420,7 +435,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -439,8 +454,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -460,7 +476,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -479,8 +495,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -500,7 +517,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -519,8 +536,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -540,7 +558,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -559,8 +577,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -580,7 +599,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -599,8 +618,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -623,7 +643,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -642,8 +662,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(stringstream& ss) const {
@@ -667,7 +688,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         const bool ok = grid.catalogManager(txn)->runUserManagementWriteCommand(
-            txn, this->name, dbname, cmdObj, &result);
+            txn, getName(), dbname, cmdObj, &result);
 
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         invariant(authzManager);
@@ -690,7 +711,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -727,7 +749,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -773,8 +796,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual bool adminOnly() const {
@@ -798,9 +822,127 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         return grid.catalogManager(txn)
-            ->runUserManagementWriteCommand(txn, this->name, dbname, cmdObj, &result);
+            ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result);
     }
 
 } cmdMergeAuthzCollections;
 
+namespace {
+/**
+ * Runs the authSchemaUpgrade on all shards, with the given maxSteps and writeConcern
+ * parameters.
+ *
+ * Upgrades each shard serially, and stops on first failure.  Returned error indicates that
+ * failure.
+ */
+Status runUpgradeOnAllShards(OperationContext* txn,
+                             int maxSteps,
+                             const BSONObj& writeConcern,
+                             BSONObjBuilder& result) {
+    BSONObjBuilder cmdObjBuilder;
+    cmdObjBuilder.append("authSchemaUpgrade", 1);
+    cmdObjBuilder.append("maxSteps", maxSteps);
+    if (!writeConcern.isEmpty()) {
+        cmdObjBuilder.append("writeConcern", writeConcern);
+    }
+    const BSONObj cmdObj = cmdObjBuilder.done();
+
+    // Upgrade each shard in turn, stopping on first failure.
+    auto shardRegistry = grid.shardRegistry();
+    shardRegistry->reload(txn);
+    vector<string> shardIds;
+    shardRegistry->getAllShardIds(&shardIds);
+
+    bool hasWCError = false;
+    for (const auto& shardId : shardIds) {
+        auto cmdResult = shardRegistry->runIdempotentCommandOnShard(
+            txn, shardId, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, "admin", cmdObj);
+
+        if (!cmdResult.isOK()) {
+            return Status(cmdResult.getStatus().code(),
+                          str::stream() << "Failed to run authSchemaUpgrade on shard " << shardId
+                                        << causedBy(cmdResult.getStatus()));
+        }
+
+        // If the result has a writeConcernError, append it.
+        if (!hasWCError) {
+            if (auto wcErrorElem = cmdResult.getValue()["writeConcernError"]) {
+                appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, result);
+                hasWCError = true;
+            }
+        }
+    }
+
+    return Status::OK();
+}
+}  // namespace
+
+class CmdAuthSchemaUpgrade : public Command {
+public:
+    CmdAuthSchemaUpgrade() : Command("authSchemaUpgrade") {}
+
+    virtual bool slaveOk() const {
+        return false;
+    }
+
+    virtual bool adminOnly() const {
+        return true;
+    }
+
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    virtual void help(stringstream& ss) const {
+        ss << "Upgrades the auth data storage schema";
+    }
+
+    virtual Status checkAuthForCommand(ClientBasic* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        return auth::checkAuthForAuthSchemaUpgradeCommand(client);
+    }
+
+    bool run(OperationContext* txn,
+             const string& dbname,
+             BSONObj& cmdObj,
+             int options,
+             string& errmsg,
+             BSONObjBuilder& result) {
+        // Run the authSchemaUpgrade command on the config servers
+        if (!grid.catalogManager(txn)
+                 ->runUserManagementWriteCommand(txn, getName(), dbname, cmdObj, &result)) {
+            return false;
+        }
+
+        auth::AuthSchemaUpgradeArgs parsedArgs;
+        Status status = auth::parseAuthSchemaUpgradeCommand(cmdObj, dbname, &parsedArgs);
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
+        }
+
+        // Optionally run the authSchemaUpgrade command on the individual shards
+        if (parsedArgs.shouldUpgradeShards) {
+            status =
+                runUpgradeOnAllShards(txn, parsedArgs.maxSteps, parsedArgs.writeConcern, result);
+            if (!status.isOK()) {
+                // If the status is a write concern error, append a writeConcernError instead of
+                // and error message.
+                if (ErrorCodes::isWriteConcernError(status.code())) {
+                    WCErrorDetail wcError;
+                    wcError.setErrMessage(status.reason());
+                    wcError.setErrCode(status.code());
+                    result.append("writeConcernError", wcError.toBSON());
+                } else {
+                    return appendCommandStatus(result, status);
+                }
+            }
+        }
+        return true;
+    }
+
+} cmdAuthSchemaUpgrade;
+
+}  // namespace
 }  // namespace mongo

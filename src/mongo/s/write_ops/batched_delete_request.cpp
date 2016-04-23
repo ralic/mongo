@@ -43,7 +43,6 @@ const BSONField<std::string> BatchedDeleteRequest::collName("delete");
 const BSONField<std::vector<BatchedDeleteDocument*>> BatchedDeleteRequest::deletes("deletes");
 const BSONField<BSONObj> BatchedDeleteRequest::writeConcern("writeConcern");
 const BSONField<bool> BatchedDeleteRequest::ordered("ordered", true);
-const BSONField<BSONObj> BatchedDeleteRequest::metadata("metadata");
 
 BatchedDeleteRequest::BatchedDeleteRequest() {
     clear();
@@ -96,9 +95,6 @@ BSONObj BatchedDeleteRequest::toBSON() const {
     if (_isOrderedSet)
         builder.append(ordered(), _ordered);
 
-    if (_metadata)
-        builder.append(metadata(), _metadata->toBSON());
-
     return builder.obj();
 }
 
@@ -110,37 +106,37 @@ bool BatchedDeleteRequest::parseBSON(StringData dbName, const BSONObj& source, s
         errMsg = &dummy;
 
     FieldParser::FieldState fieldState;
-    std::string collNameTemp;
-    fieldState = FieldParser::extract(source, collName, &collNameTemp, errMsg);
-    if (fieldState == FieldParser::FIELD_INVALID)
-        return false;
-    _ns = NamespaceString(dbName, collNameTemp);
-    _isNSSet = fieldState == FieldParser::FIELD_SET;
-
-    fieldState = FieldParser::extract(source, deletes, &_deletes, errMsg);
-    if (fieldState == FieldParser::FIELD_INVALID)
-        return false;
-    _isDeletesSet = fieldState == FieldParser::FIELD_SET;
-
-    fieldState = FieldParser::extract(source, writeConcern, &_writeConcern, errMsg);
-    if (fieldState == FieldParser::FIELD_INVALID)
-        return false;
-    _isWriteConcernSet = fieldState == FieldParser::FIELD_SET;
-
-    fieldState = FieldParser::extract(source, ordered, &_ordered, errMsg);
-    if (fieldState == FieldParser::FIELD_INVALID)
-        return false;
-    _isOrderedSet = fieldState == FieldParser::FIELD_SET;
-
-    BSONObj metadataObj;
-    fieldState = FieldParser::extract(source, metadata, &metadataObj, errMsg);
-    if (fieldState == FieldParser::FIELD_INVALID)
-        return false;
-
-    if (!metadataObj.isEmpty()) {
-        _metadata.reset(new BatchedRequestMetadata());
-        if (!_metadata->parseBSON(metadataObj, errMsg)) {
-            return false;
+    for (BSONElement field : source) {
+        const StringData fieldName = field.fieldNameStringData();
+        if (fieldName == collName.name()) {
+            std::string collNameTemp;
+            fieldState = FieldParser::extract(field, collName, &collNameTemp, errMsg);
+            if (fieldState == FieldParser::FIELD_INVALID)
+                return false;
+            _ns = NamespaceString(dbName, collNameTemp);
+            _isNSSet = fieldState == FieldParser::FIELD_SET;
+        } else if (fieldName == deletes.name()) {
+            fieldState = FieldParser::extract(field, deletes, &_deletes, errMsg);
+            if (fieldState == FieldParser::FIELD_INVALID)
+                return false;
+            _isDeletesSet = fieldState == FieldParser::FIELD_SET;
+        } else if (fieldName == writeConcern.name()) {
+            fieldState = FieldParser::extract(field, writeConcern, &_writeConcern, errMsg);
+            if (fieldState == FieldParser::FIELD_INVALID)
+                return false;
+            _isWriteConcernSet = fieldState == FieldParser::FIELD_SET;
+        } else if (fieldName == ordered.name()) {
+            fieldState = FieldParser::extract(field, ordered, &_ordered, errMsg);
+            if (fieldState == FieldParser::FIELD_INVALID)
+                return false;
+            _isOrderedSet = fieldState == FieldParser::FIELD_SET;
+        } else if (fieldName[0] != '$') {
+            std::initializer_list<StringData> ignoredFields = {"maxTimeMS", "shardVersion"};
+            if (std::find(ignoredFields.begin(), ignoredFields.end(), fieldName) ==
+                ignoredFields.end()) {
+                *errMsg = str::stream() << "Unknown option to delete command: " << fieldName;
+                return false;
+            }
         }
     }
 
@@ -158,8 +154,6 @@ void BatchedDeleteRequest::clear() {
 
     _ordered = false;
     _isOrderedSet = false;
-
-    _metadata.reset();
 }
 
 void BatchedDeleteRequest::cloneTo(BatchedDeleteRequest* other) const {
@@ -182,11 +176,6 @@ void BatchedDeleteRequest::cloneTo(BatchedDeleteRequest* other) const {
 
     other->_ordered = _ordered;
     other->_isOrderedSet = _isOrderedSet;
-
-    if (_metadata) {
-        other->_metadata.reset(new BatchedRequestMetadata());
-        _metadata->cloneTo(other->_metadata.get());
-    }
 }
 
 std::string BatchedDeleteRequest::toString() const {
@@ -284,18 +273,6 @@ bool BatchedDeleteRequest::getOrdered() const {
     } else {
         return ordered.getDefault();
     }
-}
-
-void BatchedDeleteRequest::setMetadata(BatchedRequestMetadata* metadata) {
-    _metadata.reset(metadata);
-}
-
-bool BatchedDeleteRequest::isMetadataSet() const {
-    return _metadata.get();
-}
-
-BatchedRequestMetadata* BatchedDeleteRequest::getMetadata() const {
-    return _metadata.get();
 }
 
 }  // namespace mongo

@@ -33,6 +33,7 @@
 #include <map>
 #include <string>
 
+#include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -80,13 +81,21 @@ public:
 
     virtual int flushAllFiles(bool sync);
 
+    virtual Status beginBackup(OperationContext* txn);
+
+    virtual void endBackup(OperationContext* txn);
+
     virtual bool isDurable() const;
+
+    virtual bool isEphemeral() const;
 
     virtual Status repairRecordStore(OperationContext* txn, const std::string& ns);
 
     virtual void cleanShutdown();
 
     SnapshotManager* getSnapshotManager() const final;
+
+    void setJournalListener(JournalListener* jl) final;
 
     // ------ kv ------
 
@@ -120,5 +129,8 @@ private:
     typedef std::map<std::string, KVDatabaseCatalogEntry*> DBMap;
     DBMap _dbs;
     mutable stdx::mutex _dbsLock;
+
+    // Flag variable that states if the storage engine is in backup mode.
+    bool _inBackupMode = false;
 };
 }

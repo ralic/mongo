@@ -30,8 +30,9 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
-#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/decorable.h"
@@ -48,7 +49,7 @@ class WriteUnitOfWork;
 
 /**
  * This class encompasses the state required by an operation and lives from the time a network
- * peration is dispatched until its execution is finished. Note that each "getmore" on a cursor
+ * operation is dispatched until its execution is finished. Note that each "getmore" on a cursor
  * is a separate operation. On construction, an OperationContext associates itself with the
  * current client, and only on destruction it deassociates itself. At any time a client can be
  * associated with at most one OperationContext. Each OperationContext has a RecoveryUnit
@@ -76,7 +77,6 @@ public:
      * Interface for durability.  Caller DOES NOT own pointer.
      */
     virtual RecoveryUnit* recoveryUnit() const = 0;
-
 
     /**
      * Returns the RecoveryUnit (same return value as recoveryUnit()) but the caller takes
@@ -183,23 +183,33 @@ public:
     virtual bool writesAreReplicated() const = 0;
 
     /**
-     * Marks this operation as killed.
+     * Marks this operation as killed so that subsequent calls to checkForInterrupt and
+     * checkForInterruptNoAssert by the thread executing the operation will start returning the
+     * specified error code.
      *
-     * Subsequent calls to checkForInterrupt and checkForInterruptNoAssert by the thread
-     * executing the operation will indicate that the operation has been killed.
+     * If multiple threads kill the same operation with different codes, only the first code will
+     * be preserved.
      *
-     * May be called by any thread that has locked the Client owning this operation context,
-     * or by the thread executing on behalf of this operation context.
+     * May be called by any thread that has locked the Client owning this operation context.
      */
-    void markKilled();
+    void markKilled(ErrorCodes::Error killCode = ErrorCodes::Interrupted);
 
     /**
-     * Returns true if markKilled has been called on this operation context.
+     * Returns the code passed to markKilled if this operation context has been killed previously
+     * or ErrorCodes::OK otherwise.
      *
-     * May be called by any thread that has locked the Client owning this operation context,
-     * or by the thread executing on behalf of this operation context.
+     * May be called by any thread that has locked the Client owning this operation context, or
+     * without lock by the thread executing on behalf of this operation context.
      */
-    bool isKillPending() const;
+    ErrorCodes::Error getKillStatus() const;
+
+    /**
+     * Shortcut method, which checks whether getKillStatus returns a non-OK value. Has the same
+     * concurrency rules as getKillStatus.
+     */
+    bool isKillPending() const {
+        return getKillStatus() != ErrorCodes::OK;
+    }
 
 protected:
     OperationContext(Client* client, unsigned int opId, Locker* locker);
@@ -211,11 +221,14 @@ private:
     Client* const _client;
     const unsigned int _opId;
 
-    // The lifetime of locker is managed by subclasses of OperationContext, so it is not
-    // safe to access _locker in the destructor of OperationContext.
+    // Not owned.
     Locker* const _locker;
 
-    AtomicInt32 _killPending{0};
+    // Follows the values of ErrorCodes::Error. The default value is 0 (OK), which means the
+    // operation is not killed. If killed, it will contain a specific code. This value changes only
+    // once from OK to some kill code.
+    AtomicWord<ErrorCodes::Error> _killCode{ErrorCodes::OK};
+
     WriteConcernOptions _writeConcern;
 };
 
@@ -227,6 +240,9 @@ public:
         : _txn(txn),
           _committed(false),
           _toplevel(txn->_ruState == OperationContext::kNotInUnitOfWork) {
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot execute a write operation in read-only mode",
+                !storageGlobalParams.readOnly);
         _txn->lockState()->beginWriteUnitOfWork();
         if (_toplevel) {
             _txn->recoveryUnit()->beginUnitOfWork(_txn);
@@ -235,6 +251,7 @@ public:
     }
 
     ~WriteUnitOfWork() {
+        dassert(!storageGlobalParams.readOnly);
         if (!_committed) {
             invariant(_txn->_ruState != OperationContext::kNotInUnitOfWork);
             if (_toplevel) {

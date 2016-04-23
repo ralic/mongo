@@ -29,11 +29,14 @@
  * This file includes integration testing between the MockDBClientBase and MockRemoteDB.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/net/socket_exception.h"
 
 #include <ctime>
 #include <string>

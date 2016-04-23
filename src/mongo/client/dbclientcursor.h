@@ -191,18 +191,8 @@ public:
     }
 
     Message* getMessage() {
-        return batch.m.get();
+        return &batch.m;
     }
-
-    /**
-     * Used mainly to run commands on connections that doesn't support lazy initialization and
-     * does not support commands through the call interface.
-     *
-     * @param cmd The BSON representation of the command to send.
-     *
-     * @return true if command was sent successfully
-     */
-    bool initCommand();
 
     /**
      * actually does the query
@@ -215,13 +205,13 @@ public:
     class Batch {
         MONGO_DISALLOW_COPYING(Batch);
         friend class DBClientCursor;
-        std::unique_ptr<Message> m;
-        int nReturned;
-        int pos;
-        const char* data;
+        Message m;
+        int nReturned{0};
+        int pos{0};
+        const char* data{nullptr};
 
     public:
-        Batch() : m(new Message()), nReturned(), pos(), data() {}
+        Batch() = default;
     };
 
     /**

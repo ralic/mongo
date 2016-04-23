@@ -36,11 +36,11 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
@@ -66,15 +66,18 @@ BSONObj f(const char* s) {
 
 class Base {
 protected:
-    mutable OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     mutable DBDirectClient _client;
 
 public:
     Base() : _client(&_txn) {
         ReplSettings replSettings;
-        replSettings.oplogSize = 10 * 1024 * 1024;
-        replSettings.master = true;
+        replSettings.setOplogSizeBytes(10 * 1024 * 1024);
+        replSettings.setMaster(true);
         setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
+
+        getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserver>());
 
         setOplogCollectionName();
         createOplog(&_txn);
@@ -95,7 +98,7 @@ public:
             deleteAll(ns());
             deleteAll(cllNS());
             ReplSettings replSettings;
-            replSettings.oplogSize = 10 * 1024 * 1024;
+            replSettings.setOplogSizeBytes(10 * 1024 * 1024);
             setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
         } catch (...) {
             FAIL("Exception while cleaning up test");
@@ -232,19 +235,7 @@ protected:
             coll = db->createCollection(&_txn, ns);
         }
 
-        vector<RecordId> toDelete;
-        {
-            auto cursor = coll->getCursor(&_txn);
-            while (auto record = cursor->next()) {
-                toDelete.push_back(record->id);
-            }
-        }
-
-        for (vector<RecordId>::iterator i = toDelete.begin(); i != toDelete.end(); ++i) {
-            _txn.setReplicatedWrites(false);
-            coll->deleteDocument(&_txn, *i, true);
-            _txn.setReplicatedWrites(true);
-        }
+        ASSERT_OK(coll->truncate(&_txn));
         wunit.commit();
     }
     void insert(const BSONObj& o) const {
@@ -258,9 +249,10 @@ protected:
             coll = db->createCollection(&_txn, ns());
         }
 
+        OpDebug* const nullOpDebug = nullptr;
         if (o.hasField("_id")) {
             _txn.setReplicatedWrites(false);
-            coll->insertDocument(&_txn, o, true);
+            coll->insertDocument(&_txn, o, nullOpDebug, true);
             _txn.setReplicatedWrites(true);
             wunit.commit();
             return;
@@ -272,7 +264,7 @@ protected:
         b.appendOID("_id", &id);
         b.appendElements(o);
         _txn.setReplicatedWrites(false);
-        coll->insertDocument(&_txn, b.obj(), true);
+        coll->insertDocument(&_txn, b.obj(), nullOpDebug, true);
         _txn.setReplicatedWrites(true);
         wunit.commit();
     }

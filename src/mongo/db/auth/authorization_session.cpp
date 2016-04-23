@@ -42,6 +42,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/security_key.h"
+#include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
@@ -177,7 +178,7 @@ PrivilegeVector AuthorizationSession::getDefaultPrivileges() {
     return defaultPrivileges;
 }
 
-Status AuthorizationSession::checkAuthForQuery(const NamespaceString& ns, const BSONObj& query) {
+Status AuthorizationSession::checkAuthForFind(const NamespaceString& ns, bool hasTerm) {
     if (MONGO_unlikely(ns.isCommand())) {
         return Status(ErrorCodes::InternalError,
                       str::stream() << "Checking query auth on command namespace " << ns.ns());
@@ -186,10 +187,23 @@ Status AuthorizationSession::checkAuthForQuery(const NamespaceString& ns, const 
         return Status(ErrorCodes::Unauthorized,
                       str::stream() << "not authorized for query on " << ns.ns());
     }
+
+    // Only internal clients (such as other nodes in a replica set) are allowed to use
+    // the 'term' field in a find operation. Use of this field could trigger changes
+    // in the receiving server's replication state and should be protected.
+    if (hasTerm &&
+        !isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                          ActionType::internal)) {
+        return Status(ErrorCodes::Unauthorized,
+                      str::stream() << "not authorized for query with term on " << ns.ns());
+    }
+
     return Status::OK();
 }
 
-Status AuthorizationSession::checkAuthForGetMore(const NamespaceString& ns, long long cursorID) {
+Status AuthorizationSession::checkAuthForGetMore(const NamespaceString& ns,
+                                                 long long cursorID,
+                                                 bool hasTerm) {
     // "ns" can be in one of three formats: "listCollections" format, "listIndexes" format, and
     // normal format.
     if (ns.isListCollectionsCursorNS()) {
@@ -216,6 +230,17 @@ Status AuthorizationSession::checkAuthForGetMore(const NamespaceString& ns, long
                           str::stream() << "not authorized for getMore on " << ns.ns());
         }
     }
+
+    // Only internal clients (such as other nodes in a replica set) are allowed to use
+    // the 'term' field in a getMore operation. Use of this field could trigger changes
+    // in the receiving server's replication state and should be protected.
+    if (hasTerm &&
+        !isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                          ActionType::internal)) {
+        return Status(ErrorCodes::Unauthorized,
+                      str::stream() << "not authorized for getMore with term on " << ns.ns());
+    }
+
     return Status::OK();
 }
 
@@ -275,22 +300,29 @@ Status AuthorizationSession::checkAuthForDelete(const NamespaceString& ns, const
 Status AuthorizationSession::checkAuthForKillCursors(const NamespaceString& ns,
                                                      long long cursorID) {
     // See implementation comments in checkAuthForGetMore().  This method looks very similar.
+
+    // SERVER-20364 Check for find or killCursor privileges until we have a way of associating
+    // a cursor with an owner.
     if (ns.isListCollectionsCursorNS()) {
-        if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
-                                              ActionType::killCursors)) {
+        if (!(isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
+                                               ActionType::killCursors) ||
+              isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
+                                               ActionType::listCollections))) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "not authorized to kill listCollections cursor on "
                                         << ns.ns());
         }
     } else if (ns.isListIndexesCursorNS()) {
         NamespaceString targetNS = ns.getTargetNSForListIndexes();
-        if (!isAuthorizedForActionsOnNamespace(targetNS, ActionType::killCursors)) {
+        if (!(isAuthorizedForActionsOnNamespace(targetNS, ActionType::killCursors) ||
+              isAuthorizedForActionsOnNamespace(targetNS, ActionType::listIndexes))) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "not authorized to kill listIndexes cursor on "
                                         << ns.ns());
         }
     } else {
-        if (!isAuthorizedForActionsOnNamespace(ns, ActionType::killCursors)) {
+        if (!(isAuthorizedForActionsOnNamespace(ns, ActionType::killCursors) ||
+              isAuthorizedForActionsOnNamespace(ns, ActionType::find))) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "not authorized to kill cursor on " << ns.ns());
         }
@@ -335,6 +367,29 @@ Status AuthorizationSession::checkAuthorizedToRevokePrivilege(const Privilege& p
                       " must be authorized to revoke roles from the admin database");
     }
     return Status::OK();
+}
+
+bool AuthorizationSession::isAuthorizedToCreateRole(
+    const struct auth::CreateOrUpdateRoleArgs& args) {
+    // A user is allowed to create a role under either of two conditions.
+
+    // The user may create a role if the authorization system says they are allowed to.
+    if (isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(args.roleName.getDB()),
+                                         ActionType::createRole)) {
+        return true;
+    }
+
+    // The user may create a role if the localhost exception is enabled, and they already own the
+    // role. This implies they have obtained the role through an external authorization mechanism.
+    if (_externalState->shouldAllowLocalhost()) {
+        for (const User* const user : _authenticatedUsers) {
+            if (user->hasRole(args.roleName)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 bool AuthorizationSession::isAuthorizedToGrantRole(const RoleName& role) {

@@ -269,6 +269,7 @@ Status QueryPlanner::cacheDataFromTaggedTree(const MatchExpression* const tagged
         IndexEntry* ientry = new IndexEntry(relevantIndices[itag->index]);
         indexTree->entry.reset(ientry);
         indexTree->index_pos = itag->pos;
+        indexTree->canCombineBounds = itag->canCombineBounds;
     }
 
     for (size_t i = 0; i < taggedTree->numChildren(); ++i) {
@@ -323,7 +324,8 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
             ss << "Did not find index with keyPattern: " << indexTree->entry->keyPattern.toString();
             return Status(ErrorCodes::BadValue, ss);
         }
-        filter->setTag(new IndexTag(got->second, indexTree->index_pos));
+        filter->setTag(
+            new IndexTag(got->second, indexTree->index_pos, indexTree->canCombineBounds));
     }
 
     return Status::OK();
@@ -657,7 +659,7 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     }
 
     // Figure out how useful each index is to each predicate.
-    QueryPlannerIXSelect::rateIndices(query.root(), "", relevantIndices);
+    QueryPlannerIXSelect::rateIndices(query.root(), "", relevantIndices, params.collator);
     QueryPlannerIXSelect::stripInvalidAssignments(query.root(), relevantIndices);
 
     // Unless we have GEO_NEAR, TEXT, or a projection, we may be able to apply an optimization

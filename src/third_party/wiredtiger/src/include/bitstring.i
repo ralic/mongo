@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2015 MongoDB, Inc.
+ * Public Domain 2014-2016 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -84,10 +84,10 @@ __bit_alloc(WT_SESSION_IMPL *session, uint64_t nbits, void *retp)
  * __bit_test --
  *	Test one bit in name.
  */
-static inline int
+static inline bool
 __bit_test(uint8_t *bitf, uint64_t bit)
 {
-	return (bitf[__bit_byte(bit)] & __bit_mask(bit) ? 1 : 0);
+	return ((bitf[__bit_byte(bit)] & __bit_mask(bit)) != 0);
 }
 
 /*

@@ -25,11 +25,14 @@ env.CppUnitTest(
 env.Library(
     target='network',
     source=[
+        "hostname_canonicalization.cpp",
         "httpclient.cpp",
         "listen.cpp",
         "message.cpp",
         "message_port.cpp",
         "sock.cpp",
+        "sockaddr.cpp",
+        'socket_exception.cpp',
         "socket_poll.cpp",
         "ssl_expiration.cpp",
         "ssl_manager.cpp",
@@ -44,10 +47,17 @@ env.Library(
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         'hostandport',
     ],
-    LIBDEPS_TAGS=[
-        # Depends on inShutdown
-        'incomplete',
+)
+
+env.CppUnitTest(
+    target='listen_test',
+    source=[
+        'listen_test.cpp',
     ],
+    LIBDEPS=[
+        'network',
+    ],
+    NO_CRUTCH = True,
 )
 
 env.Library(
@@ -72,6 +82,18 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target="hostname_canonicalization_worker",
+    source=[
+        "hostname_canonicalization_worker.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+        'network',
+    ],
+)
+
+env.Library(
     target="message_server_port",
     source=[
         "message_server_port.cpp",
@@ -79,10 +101,6 @@ env.Library(
     LIBDEPS=[
         'network',
         '$BUILD_DIR/mongo/db/stats/counters',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on inShutdown and dbexit
-        'incomplete',
     ],
 )
 

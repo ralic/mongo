@@ -201,6 +201,8 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
     _ws->clear();
     _children.clear();
 
+    _specificStats.replanned = true;
+
     // Use the query planning module to plan the whole query.
     std::vector<QuerySolution*> rawSolutions;
     Status status = QueryPlanner::plan(*_canonicalQuery, _plannerParams, &rawSolutions);
@@ -230,9 +232,16 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
 
         PlanStage* newRoot;
         // Only one possible plan. Build the stages from the solution.
-        verify(StageBuilder::build(getOpCtx(), _collection, *solutions[0], _ws, &newRoot));
+        verify(StageBuilder::build(
+            getOpCtx(), _collection, *_canonicalQuery, *solutions[0], _ws, &newRoot));
         _children.emplace_back(newRoot);
         _replannedQs.reset(solutions.popAndReleaseBack());
+
+        LOG(1)
+            << "Replanning of query resulted in single query solution, which will not be cached. "
+            << _canonicalQuery->toStringShort()
+            << " plan summary after replan: " << Explain::getPlanSummary(child().get())
+            << " previous cache entry evicted: " << (shouldCache ? "yes" : "no");
         return Status::OK();
     }
 
@@ -250,26 +259,30 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache) {
         }
 
         PlanStage* nextPlanRoot;
-        verify(StageBuilder::build(getOpCtx(), _collection, *solutions[ix], _ws, &nextPlanRoot));
+        verify(StageBuilder::build(
+            getOpCtx(), _collection, *_canonicalQuery, *solutions[ix], _ws, &nextPlanRoot));
 
         // Takes ownership of 'solutions[ix]' and 'nextPlanRoot'.
         multiPlanStage->addPlan(solutions.releaseAt(ix), nextPlanRoot, _ws);
     }
 
     // Delegate to the MultiPlanStage's plan selection facility.
-    return multiPlanStage->pickBestPlan(yieldPolicy);
+    Status pickBestPlanStatus = multiPlanStage->pickBestPlan(yieldPolicy);
+    if (!pickBestPlanStatus.isOK()) {
+        return pickBestPlanStatus;
+    }
+
+    LOG(1) << "Replanning " << _canonicalQuery->toStringShort()
+           << " resulted in plan with summary: " << Explain::getPlanSummary(child().get())
+           << ", which " << (shouldCache ? "has" : "has not") << " been written to the cache";
+    return Status::OK();
 }
 
 bool CachedPlanStage::isEOF() {
     return _results.empty() && child()->isEOF();
 }
 
-PlanStage::StageState CachedPlanStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState CachedPlanStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
@@ -278,37 +291,20 @@ PlanStage::StageState CachedPlanStage::work(WorkingSetID* out) {
     if (!_results.empty()) {
         *out = _results.front();
         _results.pop_front();
-        _commonStats.advanced++;
         return PlanStage::ADVANCED;
     }
 
     // Nothing left in trial period buffer.
-    StageState childStatus = child()->work(out);
-
-    if (PlanStage::ADVANCED == childStatus) {
-        _commonStats.advanced++;
-    } else if (PlanStage::NEED_YIELD == childStatus) {
-        _commonStats.needYield++;
-    } else if (PlanStage::NEED_TIME == childStatus) {
-        _commonStats.needTime++;
-    }
-
-    return childStatus;
+    return child()->work(out);
 }
 
 void CachedPlanStage::doInvalidate(OperationContext* txn,
                                    const RecordId& dl,
                                    InvalidationType type) {
-    for (std::list<WorkingSetID>::iterator it = _results.begin(); it != _results.end();) {
+    for (auto it = _results.begin(); it != _results.end(); ++it) {
         WorkingSetMember* member = _ws->get(*it);
-        if (member->hasLoc() && member->loc == dl) {
-            std::list<WorkingSetID>::iterator next = it;
-            ++next;
-            WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
-            _results.erase(it);
-            it = next;
-        } else {
-            ++it;
+        if (member->hasRecordId() && member->recordId == dl) {
+            WorkingSetCommon::fetchAndInvalidateRecordId(txn, member, _collection);
         }
     }
 }
@@ -319,7 +315,7 @@ std::unique_ptr<PlanStageStats> CachedPlanStage::getStats() {
     std::unique_ptr<PlanStageStats> ret =
         stdx::make_unique<PlanStageStats>(_commonStats, STAGE_CACHED_PLAN);
     ret->specific = stdx::make_unique<CachedPlanStats>(_specificStats);
-    ret->children.push_back(child()->getStats().release());
+    ret->children.emplace_back(child()->getStats());
 
     return ret;
 }
@@ -331,7 +327,7 @@ const SpecificStats* CachedPlanStage::getSpecificStats() const {
 void CachedPlanStage::updatePlanCache() {
     std::unique_ptr<PlanCacheEntryFeedback> feedback = stdx::make_unique<PlanCacheEntryFeedback>();
     feedback->stats = getStats();
-    feedback->score = PlanRanker::scoreTree(feedback->stats.get());
+    feedback->score = PlanRanker::scoreTree(feedback->stats->children[0].get());
 
     PlanCache* cache = _collection->infoCache()->getPlanCache();
     Status fbs = cache->feedback(*_canonicalQuery, feedback.release());

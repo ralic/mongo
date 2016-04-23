@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mongo/executor/network_interface.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/list.h"
 #include "mongo/stdx/mutex.h"
@@ -75,6 +76,7 @@ public:
 
     NetworkInterfaceMock();
     virtual ~NetworkInterfaceMock();
+    virtual void appendConnectionStats(ConnectionPoolStats* stats) const;
     virtual std::string getDiagnosticString();
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -85,17 +87,25 @@ public:
 
     virtual void startup();
     virtual void shutdown();
+    virtual bool inShutdown() const;
     virtual void waitForWork();
     virtual void waitForWorkUntil(Date_t when);
     virtual void setConnectionHook(std::unique_ptr<NetworkConnectionHook> hook);
+    virtual void setEgressMetadataHook(std::unique_ptr<rpc::EgressMetadataHook> metadataHook);
     virtual void signalWorkAvailable();
     virtual Date_t now();
     virtual std::string getHostName();
-    virtual void startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                              const RemoteCommandRequest& request,
-                              const RemoteCommandCompletionFn& onFinish);
+    virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                                const RemoteCommandRequest& request,
+                                const RemoteCommandCompletionFn& onFinish);
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle);
-    virtual void setAlarm(Date_t when, const stdx::function<void()>& action);
+    /**
+     * Not implemented.
+     */
+    void cancelAllCommands() override {}
+    virtual Status setAlarm(Date_t when, const stdx::function<void()>& action);
+
+    virtual bool onNetworkThread();
 
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -166,10 +176,11 @@ public:
 
     /**
      * Runs the simulator forward until now() == until or hasReadyRequests() is true.
+     * Returns now().
      *
      * Will not return until the executor thread is blocked in waitForWorkUntil or waitForWork.
      */
-    void runUntil(Date_t until);
+    Date_t runUntil(Date_t until);
 
     /**
      * Processes all ready, scheduled network operations.
@@ -282,7 +293,7 @@ private:
     bool _hasStarted;  // (M)
 
     // Set to true by "shutDown()".
-    bool _inShutdown;  // (M)
+    AtomicWord<bool> _inShutdown;  // (M)
 
     // Next date that the executor expects to wake up at (due to a scheduleWorkAt() call).
     Date_t _executorNextWakeupDate;  // (M)
@@ -310,6 +321,9 @@ private:
 
     // The connection hook.
     std::unique_ptr<NetworkConnectionHook> _hook;  // (R)
+
+    // The metadata hook.
+    std::unique_ptr<rpc::EgressMetadataHook> _metadataHook;  // (R)
 
     // The set of hosts we have seen so far. If we see a new host, we will execute the
     // ConnectionHook's validation and post-connection logic.

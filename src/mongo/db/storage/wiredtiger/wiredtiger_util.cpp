@@ -45,6 +45,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -69,6 +70,8 @@ Status wtRCToStatus_slow(int retCode, const char* prefix) {
     if (retCode == EINVAL) {
         return Status(ErrorCodes::BadValue, s);
     }
+
+    uassert(ErrorCodes::ExceededMemoryLimit, s, retCode != WT_CACHE_FULL);
 
     // TODO convert specific codes rather than just using UNKNOWN_ERROR for everything.
     return Status(ErrorCodes::UnknownError, s);
@@ -200,6 +203,13 @@ Status WiredTigerUtil::checkApplicationMetadataFormatVersion(OperationContext* o
         return Status(ErrorCodes::UnsupportedFormat,
                       str::stream() << "application metadata for " << uri << " is missing ");
 
+    if (metadata.type != WT_CONFIG_ITEM::WT_CONFIG_ITEM_STRUCT) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "application metadata must be enclosed in parentheses. Actual value: "
+                          << StringData(metadata.str, metadata.len));
+    }
+
     WiredTigerConfigParser parser(metadata);
 
     int64_t version = 0;
@@ -306,6 +316,26 @@ int64_t WiredTigerUtil::getIdentSize(WT_SESSION* s, const std::string& uri) {
         uassertStatusOK(status);
     }
     return result.getValue();
+}
+
+size_t WiredTigerUtil::getCacheSizeMB(double requestedCacheSizeGB) {
+    double cacheSizeMB;
+    const double kMaxSizeCacheMB = 10 * 1000 * 1000;
+    if (requestedCacheSizeGB == 0) {
+        // Choose a reasonable amount of cache when not explicitly specified by user.
+        // Set a minimum of 256MB, otherwise use 50% of available memory over 1GB.
+        ProcessInfo pi;
+        double memSizeMB = pi.getMemSizeMB();
+        cacheSizeMB = std::max((memSizeMB - 1024) * 0.5, 256.0);
+    } else {
+        cacheSizeMB = 1024 * requestedCacheSizeGB;
+    }
+    if (cacheSizeMB > kMaxSizeCacheMB) {
+        log() << "Requested cache size: " << cacheSizeMB << "MB exceeds max; setting to "
+              << kMaxSizeCacheMB << "MB";
+        cacheSizeMB = kMaxSizeCacheMB;
+    }
+    return static_cast<size_t>(cacheSizeMB);
 }
 
 namespace {

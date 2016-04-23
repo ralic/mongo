@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -23,22 +23,21 @@ typedef struct {
 #define	WT_VRFY_DUMP(vs)						\
 	((vs)->dump_address ||						\
 	    (vs)->dump_blocks || (vs)->dump_pages || (vs)->dump_shape)
-	int dump_address;			/* Configure: dump special */
-	int dump_blocks;
-	int dump_pages;
-	int dump_shape;
+	bool dump_address;			/* Configure: dump special */
+	bool dump_blocks;
+	bool dump_pages;
+	bool dump_shape;
 
 	u_int depth, depth_internal[100], depth_leaf[100];
 
-	WT_ITEM *tmp1;				/* Temporary buffer */
-	WT_ITEM *tmp2;				/* Temporary buffer */
+	WT_ITEM *tmp1, *tmp2, *tmp3, *tmp4;	/* Temporary buffers */
 } WT_VSTUFF;
 
 static void __verify_checkpoint_reset(WT_VSTUFF *);
 static int  __verify_overflow(
 	WT_SESSION_IMPL *, const uint8_t *, size_t, WT_VSTUFF *);
 static int  __verify_overflow_cell(
-	WT_SESSION_IMPL *, WT_REF *, int *, WT_VSTUFF *);
+	WT_SESSION_IMPL *, WT_REF *, bool *, WT_VSTUFF *);
 static int  __verify_row_int_key_order(
 	WT_SESSION_IMPL *, WT_PAGE *, WT_REF *, uint32_t, WT_VSTUFF *);
 static int  __verify_row_leaf_key_order(
@@ -79,14 +78,15 @@ __verify_config(WT_SESSION_IMPL *session, const char *cfg[], WT_VSTUFF *vs)
  *	Debugging: optionally dump specific blocks from the file.
  */
 static int
-__verify_config_offsets(WT_SESSION_IMPL *session, const char *cfg[], int *quitp)
+__verify_config_offsets(
+    WT_SESSION_IMPL *session, const char *cfg[], bool *quitp)
 {
 	WT_CONFIG list;
 	WT_CONFIG_ITEM cval, k, v;
 	WT_DECL_RET;
-	u_long offset;
+	uint64_t offset;
 
-	*quitp = 0;
+	*quitp = false;
 
 	WT_RET(__wt_config_gets(session, cfg, "dump_offsets", &cval));
 	WT_RET(__wt_config_subinit(session, &list, &cval));
@@ -96,8 +96,8 @@ __verify_config_offsets(WT_SESSION_IMPL *session, const char *cfg[], int *quitp)
 		 * what the user wanted, all of this stuff is just hooked into
 		 * verify because that's where we "dump blocks" for debugging.)
 		 */
-		*quitp = 1;
-		if (v.len != 0 || sscanf(k.str, "%lu", &offset) != 1)
+		*quitp = true;
+		if (v.len != 0 || sscanf(k.str, "%" SCNu64, &offset) != 1)
 			WT_RET_MSG(session, EINVAL,
 			    "unexpected dump offset format");
 #if !defined(HAVE_DIAGNOSTIC)
@@ -156,12 +156,12 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_VSTUFF *vs, _vstuff;
 	size_t root_addr_size;
 	uint8_t root_addr[WT_BTREE_MAX_ADDR_COOKIE];
-	int bm_start, quit;
+	bool bm_start, quit;
 
 	btree = S2BT(session);
 	bm = btree->bm;
 	ckptbase = NULL;
-	bm_start = 0;
+	bm_start = false;
 
 	WT_CLEAR(_vstuff);
 	vs = &_vstuff;
@@ -169,6 +169,8 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_ERR(__wt_scr_alloc(session, 0, &vs->max_addr));
 	WT_ERR(__wt_scr_alloc(session, 0, &vs->tmp1));
 	WT_ERR(__wt_scr_alloc(session, 0, &vs->tmp2));
+	WT_ERR(__wt_scr_alloc(session, 0, &vs->tmp3));
+	WT_ERR(__wt_scr_alloc(session, 0, &vs->tmp4));
 
 	/* Check configuration strings. */
 	WT_ERR(__verify_config(session, cfg, vs));
@@ -184,7 +186,7 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
 
 	/* Inform the underlying block manager we're verifying. */
 	WT_ERR(bm->verify_start(bm, session, ckptbase, cfg));
-	bm_start = 1;
+	bm_start = true;
 
 	/* Loop through the file's checkpoints, verifying each one. */
 	WT_CKPT_FOREACH(ckptbase, ckpt) {
@@ -205,7 +207,7 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
 		/* Load the checkpoint. */
 		WT_ERR(bm->checkpoint_load(bm, session,
 		    ckpt->raw.data, ckpt->raw.size,
-		    root_addr, &root_addr_size, 1));
+		    root_addr, &root_addr_size, true));
 
 		/*
 		 * Ignore trees with no root page.
@@ -224,7 +226,7 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
 			WT_WITH_PAGE_INDEX(session,
 			    ret = __verify_tree(session, &btree->root, vs));
 
-			WT_TRET(__wt_cache_op(session, NULL, WT_SYNC_DISCARD));
+			WT_TRET(__wt_cache_op(session, WT_SYNC_DISCARD));
 		}
 
 		/* Unload the checkpoint. */
@@ -245,14 +247,13 @@ err:	/* Inform the underlying block manager we're done. */
 	if (ckptbase != NULL)
 		__wt_meta_ckptlist_free(session, ckptbase);
 
-	/* Wrap up reporting. */
-	WT_TRET(__wt_progress(session, NULL, vs->fcnt));
-
 	/* Free allocated memory. */
 	__wt_scr_free(session, &vs->max_key);
 	__wt_scr_free(session, &vs->max_addr);
 	__wt_scr_free(session, &vs->tmp1);
 	__wt_scr_free(session, &vs->tmp2);
+	__wt_scr_free(session, &vs->tmp3);
+	__wt_scr_free(session, &vs->tmp4);
 
 	return (ret);
 }
@@ -296,7 +297,7 @@ __verify_tree(WT_SESSION_IMPL *session, WT_REF *ref, WT_VSTUFF *vs)
 	WT_REF *child_ref;
 	uint64_t recno;
 	uint32_t entry, i;
-	int found;
+	bool found;
 
 	bm = S2BT(session)->bm;
 	page = ref->page;
@@ -343,9 +344,10 @@ __verify_tree(WT_SESSION_IMPL *session, WT_REF *ref, WT_VSTUFF *vs)
 	 * of the page to be built, and then a subsequent logical verification
 	 * which happens here.
 	 *
-	 * Report progress every 10 pages.
+	 * Report progress occasionally.
 	 */
-	if (++vs->fcnt % 10 == 0)
+#define	WT_VERIFY_PROGRESS_INTERVAL	100
+	if (++vs->fcnt % WT_VERIFY_PROGRESS_INTERVAL == 0)
 		WT_RET(__wt_progress(session, NULL, vs->fcnt));
 
 #ifdef HAVE_DIAGNOSTIC
@@ -571,10 +573,14 @@ __verify_row_int_key_order(WT_SESSION_IMPL *session,
 		WT_RET_MSG(session, WT_ERROR,
 		    "the internal key in entry %" PRIu32 " on the page at %s "
 		    "sorts before the last key appearing on page %s, earlier "
-		    "in the tree",
+		    "in the tree: %s, %s",
 		    entry,
 		    __wt_page_addr_string(session, ref, vs->tmp1),
-		    (char *)vs->max_addr->data);
+		    (char *)vs->max_addr->data,
+		    __wt_buf_set_printable(session,
+		    item.data, item.size, vs->tmp2),
+		    __wt_buf_set_printable(session,
+		    vs->max_key->data, vs->max_key->size, vs->tmp3));
 
 	/* Update the largest key we've seen to the key just checked. */
 	WT_RET(__wt_buf_set(session, vs->max_key, item.data, item.size));
@@ -629,11 +635,15 @@ __verify_row_leaf_key_order(
 		    btree->collator, vs->tmp1, (WT_ITEM *)vs->max_key, &cmp));
 		if (cmp < 0)
 			WT_RET_MSG(session, WT_ERROR,
-			    "the first key on the page at %s sorts equal to or "
-			    "less than a key appearing on the page at %s, "
-			    "earlier in the tree",
-			    __wt_page_addr_string(session, ref, vs->tmp1),
-				(char *)vs->max_addr->data);
+			    "the first key on the page at %s sorts equal to "
+			    "or less than the last key appearing on the page "
+			    "at %s, earlier in the tree: %s, %s",
+			    __wt_page_addr_string(session, ref, vs->tmp2),
+			    (char *)vs->max_addr->data,
+			    __wt_buf_set_printable(session,
+			    vs->tmp1->data, vs->tmp1->size, vs->tmp3),
+			    __wt_buf_set_printable(session,
+			    vs->max_key->data, vs->max_key->size, vs->tmp4));
 	}
 
 	/* Update the largest key we've seen to the last key on this page. */
@@ -650,7 +660,7 @@ __verify_row_leaf_key_order(
  */
 static int
 __verify_overflow_cell(
-    WT_SESSION_IMPL *session, WT_REF *ref, int *found, WT_VSTUFF *vs)
+    WT_SESSION_IMPL *session, WT_REF *ref, bool *found, WT_VSTUFF *vs)
 {
 	WT_BTREE *btree;
 	WT_CELL *cell;
@@ -661,7 +671,7 @@ __verify_overflow_cell(
 
 	btree = S2BT(session);
 	unpack = &_unpack;
-	*found = 0;
+	*found = false;
 
 	/*
 	 * If a tree is empty (just created), it won't have a disk image;
@@ -678,7 +688,7 @@ __verify_overflow_cell(
 		switch (unpack->type) {
 		case WT_CELL_KEY_OVFL:
 		case WT_CELL_VALUE_OVFL:
-			*found = 1;
+			*found = true;
 			WT_ERR(__verify_overflow(
 			    session, unpack->data, unpack->size, vs));
 			break;

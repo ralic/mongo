@@ -56,18 +56,21 @@ public:
     static const BSONField<std::string> ns;
     static const BSONField<BSONObj> min;
     static const BSONField<BSONObj> max;
-    static const BSONField<BSONArray> version;
     static const BSONField<std::string> shard;
     static const BSONField<bool> jumbo;
     static const BSONField<Date_t> DEPRECATED_lastmod;
     static const BSONField<OID> DEPRECATED_epoch;
-
 
     /**
      * Constructs a new ChunkType object from BSON.
      * Also does validation of the contents.
      */
     static StatusWith<ChunkType> fromBSON(const BSONObj& source);
+
+    /**
+     * Generates chunk id based on the namespace name and the lower bound of the chunk.
+     */
+    static std::string genID(StringData ns, const BSONObj& min);
 
     /**
      * Returns OK if all fields have been set. Otherwise returns NoSuchKey

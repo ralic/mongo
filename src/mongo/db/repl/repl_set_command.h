@@ -55,7 +55,7 @@ protected:
         return true;
     }
 
-    bool isWriteCommandForConfigServer() const override {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -74,14 +74,22 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 	TAILQ_HEAD(__cursors, __wt_cursor) cursors;
 
 	WT_CURSOR_BACKUP *bkp_cursor;	/* Hot backup cursor */
-	WT_COMPACT	 *compact;	/* Compact state */
 
-	WT_DATA_HANDLE *meta_dhandle;	/* Metadata file */
-	void	*meta_track;		/* Metadata operation tracking */
-	void	*meta_track_next;	/* Current position */
-	void	*meta_track_sub;	/* Child transaction / save point */
-	size_t	 meta_track_alloc;	/* Currently allocated */
-	int	 meta_track_nest;	/* Nesting level of meta transaction */
+	WT_COMPACT	 *compact;	/* Compaction information */
+	enum { WT_COMPACT_NONE=0,
+	    WT_COMPACT_RUNNING, WT_COMPACT_SUCCESS } compact_state;
+
+	/*
+	 * Lookaside table cursor, sweep and eviction worker threads only.
+	 */
+	WT_CURSOR	*las_cursor;	/* Lookaside table cursor */
+
+	WT_CURSOR *meta_cursor;		/* Metadata file */
+	void	  *meta_track;		/* Metadata operation tracking */
+	void	  *meta_track_next;	/* Current position */
+	void	  *meta_track_sub;	/* Child transaction / save point */
+	size_t	   meta_track_alloc;	/* Currently allocated */
+	int	   meta_track_nest;	/* Nesting level of meta transaction */
 #define	WT_META_TRACKING(session)	(session->meta_track_next != NULL)
 
 	/*
@@ -118,18 +126,26 @@ struct WT_COMPILER_TYPE_ALIGN(WT_CACHE_LINE_ALIGNMENT) __wt_session_impl {
 	void	*block_manager;		/* Block-manager support */
 	int	(*block_manager_cleanup)(WT_SESSION_IMPL *);
 
-					/* Checkpoint support */
-	struct {
-		WT_DATA_HANDLE *dhandle;
-		const char *name;
-	} *ckpt_handle;			/* Handle list */
+					/* Checkpoint handles */
+	WT_DATA_HANDLE **ckpt_handle;	/* Handle list */
 	u_int   ckpt_handle_next;	/* Next empty slot */
 	size_t  ckpt_handle_allocated;	/* Bytes allocated */
 
+	/*
+	 * Operations acting on handles.
+	 *
+	 * The preferred pattern is to gather all of the required handles at
+	 * the beginning of an operation, then drop any other locks, perform
+	 * the operation, then release the handles.  This cannot be easily
+	 * merged with the list of checkpoint handles because some operations
+	 * (such as compact) do checkpoints internally.
+	 */
+	WT_DATA_HANDLE **op_handle;	/* Handle list */
+	u_int   op_handle_next;		/* Next empty slot */
+	size_t  op_handle_allocated;	/* Bytes allocated */
+
 	void	*reconcile;		/* Reconciliation support */
 	int	(*reconcile_cleanup)(WT_SESSION_IMPL *);
-
-	int compaction;			/* Compaction did some work */
 
 	uint32_t flags;
 

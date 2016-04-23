@@ -35,6 +35,7 @@
 #include <boost/functional/hash.hpp>
 
 #include "mongo/base/compare_numbers.h"
+#include "mongo/base/data_type_endian.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/platform/decimal128.h"
@@ -102,9 +103,10 @@ void ValueStorage::putString(StringData s) {
         shortStrSize = s.size();
         s.copyTo(shortStrStorage, false);  // no NUL
 
-        // All memory is zeroed before this is called.
-        // Note this may be past end of shortStrStorage and into nulTerminator
-        dassert(shortStrStorage[sizeNoNUL] == '\0');
+        // All memory is zeroed before this is called, so we know that
+        // the nulTerminator field will definitely contain a NUL byte.
+        dassert(((sizeNoNUL < sizeof(shortStrStorage)) && (shortStrStorage[sizeNoNUL] == '\0')) ||
+                (((shortStrStorage + sizeNoNUL) == &nulTerminator) && (nulTerminator == '\0')));
     } else {
         putRefCountable(RCString::create(s));
     }
@@ -253,9 +255,9 @@ Value Value::createIntOrLong(long long longValue) {
 Decimal128 Value::getDecimal() const {
     BSONType type = getType();
     if (type == NumberInt)
-        return Decimal128(_storage.intValue);
+        return Decimal128(static_cast<int32_t>(_storage.intValue));
     if (type == NumberLong)
-        return Decimal128(_storage.longValue);
+        return Decimal128(static_cast<int64_t>(_storage.longValue));
     if (type == NumberDouble)
         return Decimal128(_storage.doubleValue);
     invariant(type == NumberDecimal);
@@ -479,10 +481,10 @@ Decimal128 Value::coerceToDecimal() const {
             return _storage.getDecimal();
 
         case NumberInt:
-            return Decimal128(_storage.intValue);
+            return Decimal128(static_cast<int32_t>(_storage.intValue));
 
         case NumberLong:
-            return Decimal128(_storage.longValue);
+            return Decimal128(static_cast<int64_t>(_storage.longValue));
 
         case NumberDouble:
             return Decimal128(_storage.doubleValue);
@@ -821,7 +823,9 @@ void Value::hash_combine(size_t& seed) const {
 
         case mongo::NumberDecimal: {
             const Decimal128 dcml = getDecimal();
-            if (dcml.toAbs().isGreater(Decimal128(std::numeric_limits<double>::max())) &&
+            if (dcml.toAbs().isGreater(Decimal128(std::numeric_limits<double>::max(),
+                                                  Decimal128::kRoundTo34Digits,
+                                                  Decimal128::kRoundTowardZero)) &&
                 !dcml.isInfinite() && !dcml.isNaN()) {
                 // Normalize our decimal to force equivalent decimals
                 // in the same cohort to hash to the same value
@@ -1215,17 +1219,17 @@ Value Value::deserializeForSorter(BufReader& buf, const SorterDeserializeSetting
         case jstOID:
             return Value(OID::from(buf.skip(OID::kOIDSize)));
         case NumberInt:
-            return Value(buf.read<int>());
+            return Value(buf.read<LittleEndian<int>>().value);
         case NumberLong:
-            return Value(buf.read<long long>());
+            return Value(buf.read<LittleEndian<long long>>().value);
         case NumberDouble:
-            return Value(buf.read<double>());
+            return Value(buf.read<LittleEndian<double>>().value);
         case NumberDecimal:
-            return Value(buf.read<Decimal128>());
+            return Value(Decimal128(buf.read<LittleEndian<Decimal128::Value>>().value));
         case Bool:
             return Value(bool(buf.read<char>()));
         case Date:
-            return Value(Date_t::fromMillisSinceEpoch(buf.read<long long>()));
+            return Value(Date_t::fromMillisSinceEpoch(buf.read<LittleEndian<long long>>().value));
         case bsonTimestamp:
             return Value(buf.read<Timestamp>());
 
@@ -1233,14 +1237,14 @@ Value Value::deserializeForSorter(BufReader& buf, const SorterDeserializeSetting
         case String:
         case Symbol:
         case Code: {
-            int size = buf.read<int>();
+            int size = buf.read<LittleEndian<int>>();
             const char* str = static_cast<const char*>(buf.skip(size));
             return Value(ValueStorage(type, StringData(str, size)));
         }
 
         case BinData: {
-            BinDataType bdt = BinDataType(buf.read<char>());
-            int size = buf.read<int>();
+            BinDataType bdt = BinDataType(buf.read<unsigned char>());
+            int size = buf.read<LittleEndian<int>>();
             const void* data = buf.skip(size);
             return Value(BSONBinData(data, size, bdt));
         }
@@ -1262,14 +1266,14 @@ Value Value::deserializeForSorter(BufReader& buf, const SorterDeserializeSetting
         }
 
         case CodeWScope: {
-            int size = buf.read<int>();
+            int size = buf.read<LittleEndian<int>>();
             const char* str = static_cast<const char*>(buf.skip(size));
             BSONObj bson = BSONObj::deserializeForSorter(buf, BSONObj::SorterDeserializeSettings());
             return Value(BSONCodeWScope(StringData(str, size), bson));
         }
 
         case Array: {
-            const int numElems = buf.read<int>();
+            const int numElems = buf.read<LittleEndian<int>>();
             vector<Value> array;
             array.reserve(numElems);
             for (int i = 0; i < numElems; i++)

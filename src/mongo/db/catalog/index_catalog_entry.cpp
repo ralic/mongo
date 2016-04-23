@@ -41,7 +41,9 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -99,16 +101,25 @@ void IndexCatalogEntry::init(OperationContext* txn, IndexAccessMethod* accessMet
     _head = _catalogHead(txn);
     _isMultikey = _catalogIsMultikey(txn);
 
-    BSONElement filterElement = _descriptor->getInfoElement("partialFilterExpression");
-    if (filterElement.type()) {
+    if (BSONElement filterElement = _descriptor->getInfoElement("partialFilterExpression")) {
         invariant(filterElement.isABSONObj());
         BSONObj filter = filterElement.Obj();
-        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(filter);
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filter, ExtensionsCallbackDisallowExtensions());
         // this should be checked in create, so can blow up here
         invariantOK(statusWithMatcher.getStatus());
         _filterExpression = std::move(statusWithMatcher.getValue());
         LOG(2) << "have filter expression for " << _ns << " " << _descriptor->indexName() << " "
                << filter;
+    }
+
+    if (BSONElement collationElement = _descriptor->getInfoElement("collation")) {
+        invariant(collationElement.isABSONObj());
+        BSONObj collation = collationElement.Obj();
+        auto statusWithCollator =
+            CollatorFactoryInterface::get(txn->getServiceContext())->makeFromBSON(collation);
+        invariantOK(statusWithCollator.getStatus());
+        _collator = std::move(statusWithCollator.getValue());
     }
 }
 

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,7 +13,7 @@
  *	Configure the underlying cache.
  */
 static int
-__cache_config_local(WT_SESSION_IMPL *session, int shared, const char *cfg[])
+__cache_config_local(WT_SESSION_IMPL *session, bool shared, const char *cfg[])
 {
 	WT_CACHE *cache;
 	WT_CONFIG_ITEM cval;
@@ -76,11 +76,11 @@ __cache_config_local(WT_SESSION_IMPL *session, int shared, const char *cfg[])
  *	Configure or reconfigure the current cache and shared cache.
  */
 int
-__wt_cache_config(WT_SESSION_IMPL *session, int reconfigure, const char *cfg[])
+__wt_cache_config(WT_SESSION_IMPL *session, bool reconfigure, const char *cfg[])
 {
 	WT_CONFIG_ITEM cval;
 	WT_CONNECTION_IMPL *conn;
-	int now_shared, was_shared;
+	bool now_shared, was_shared;
 
 	conn = S2C(session);
 
@@ -137,7 +137,13 @@ __wt_cache_create(WT_SESSION_IMPL *session, const char *cfg[])
 	cache = conn->cache;
 
 	/* Use a common routine for run-time configuration options. */
-	WT_RET(__wt_cache_config(session, 0, cfg));
+	WT_RET(__wt_cache_config(session, false, cfg));
+
+	/*
+	 * The lowest possible page read-generation has a special meaning, it
+	 * marks a page for forcible eviction; don't let it happen by accident.
+	 */
+	cache->read_gen = WT_READGEN_START_VALUE;
 
 	/*
 	 * The target size must be lower than the trigger size or we will never
@@ -147,16 +153,17 @@ __wt_cache_create(WT_SESSION_IMPL *session, const char *cfg[])
 		WT_ERR_MSG(session, EINVAL,
 		    "eviction target must be lower than the eviction trigger");
 
+	WT_ERR(__wt_cond_auto_alloc(session, "cache eviction server",
+	    false, 10000, WT_MILLION, &cache->evict_cond));
 	WT_ERR(__wt_cond_alloc(session,
-	    "cache eviction server", 0, &cache->evict_cond));
-	WT_ERR(__wt_cond_alloc(session,
-	    "eviction waiters", 0, &cache->evict_waiter_cond));
+	    "eviction waiters", false, &cache->evict_waiter_cond));
 	WT_ERR(__wt_spin_init(session, &cache->evict_lock, "cache eviction"));
 	WT_ERR(__wt_spin_init(session, &cache->evict_walk_lock, "cache walk"));
 
 	/* Allocate the LRU eviction queue. */
 	cache->evict_slots = WT_EVICT_WALK_BASE + WT_EVICT_WALK_INCR;
-	WT_ERR(__wt_calloc_def(session, cache->evict_slots, &cache->evict));
+	WT_ERR(__wt_calloc_def(session,
+	    cache->evict_slots, &cache->evict_queue));
 
 	/*
 	 * We get/set some values in the cache statistics (rather than have
@@ -245,12 +252,12 @@ __wt_cache_destroy(WT_SESSION_IMPL *session)
 		    " bytes dirty and %" PRIu64 " pages dirty",
 		    cache->bytes_dirty, cache->pages_dirty);
 
-	WT_TRET(__wt_cond_destroy(session, &cache->evict_cond));
+	WT_TRET(__wt_cond_auto_destroy(session, &cache->evict_cond));
 	WT_TRET(__wt_cond_destroy(session, &cache->evict_waiter_cond));
 	__wt_spin_destroy(session, &cache->evict_lock);
 	__wt_spin_destroy(session, &cache->evict_walk_lock);
 
-	__wt_free(session, cache->evict);
+	__wt_free(session, cache->evict_queue);
 	__wt_free(session, conn->cache);
 	return (ret);
 }

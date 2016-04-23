@@ -34,6 +34,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/sync_source_feedback.h"
+#include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
@@ -43,16 +44,22 @@ namespace repl {
 
 class SnapshotThread;
 
-class ReplicationCoordinatorExternalStateImpl : public ReplicationCoordinatorExternalState {
+class ReplicationCoordinatorExternalStateImpl : public ReplicationCoordinatorExternalState,
+                                                public JournalListener {
     MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalStateImpl);
 
 public:
     ReplicationCoordinatorExternalStateImpl();
     virtual ~ReplicationCoordinatorExternalStateImpl();
-    void startThreads(executor::TaskExecutor* taskExecutor) override;
+    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startInitialSync(OnInitialSyncFinishedFn finished) override;
+    virtual void startSteadyStateReplication() override;
+
     virtual void startMasterSlave(OperationContext* txn);
     virtual void shutdown();
-    virtual void initiateOplog(OperationContext* txn, bool updateReplOpTime);
+    virtual Status initializeReplSetStorage(OperationContext* txn,
+                                            const BSONObj& config,
+                                            bool updateReplOpTime);
     virtual void logTransitionToPrimaryToOplog(OperationContext* txn);
     virtual void forwardSlaveProgress();
     virtual OID ensureMe(OperationContext* txn);
@@ -63,19 +70,28 @@ public:
     virtual Status storeLocalLastVoteDocument(OperationContext* txn, const LastVote& lastVote);
     virtual void setGlobalTimestamp(const Timestamp& newTime);
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* txn);
+    virtual void cleanUpLastApplyBatch(OperationContext* txn);
     virtual HostAndPort getClientHostAndPort(const OperationContext* txn);
     virtual void closeConnections();
     virtual void killAllUserOperations(OperationContext* txn);
     virtual void clearShardingState();
+    virtual void recoverShardingState(OperationContext* txn);
     virtual void signalApplierToChooseNewSyncSource();
-    virtual OperationContext* createOperationContext(const std::string& threadName);
+    virtual void signalApplierToCancelFetcher();
     virtual void dropAllTempCollections(OperationContext* txn);
     void dropAllSnapshots() final;
     void updateCommittedSnapshot(SnapshotName newCommitPoint) final;
     void forceSnapshotCreation() final;
     virtual bool snapshotsEnabled() const;
+    virtual void notifyOplogMetadataWaiters();
+    virtual double getElectionTimeoutOffsetLimitFraction() const;
+    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* txn) const;
 
     std::string getNextOpContextThreadName();
+
+    // Methods from JournalListener.
+    virtual JournalListener::Token getToken();
+    virtual void onDurable(const JournalListener::Token& token);
 
 private:
     // Guards starting threads and setting _startedThreads
@@ -104,6 +120,11 @@ private:
     long long _nextThreadId;
 
     std::unique_ptr<SnapshotThread> _snapshotThread;
+
+    // Initial sync stuff
+    StartInitialSyncFn _startInitialSyncIfNeededFn;
+    StartSteadyReplicationFn _startSteadReplicationFn;
+    std::unique_ptr<stdx::thread> _initialSyncThread;
 };
 
 }  // namespace repl

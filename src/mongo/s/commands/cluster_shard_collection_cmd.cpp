@@ -44,6 +44,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/chunk_manager.h"
@@ -51,6 +52,7 @@
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -75,7 +77,7 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -165,6 +167,23 @@ public:
 
         if (ns.find(".system.") != string::npos) {
             errmsg = "can't shard system namespaces";
+            return false;
+        }
+
+        vector<ShardId> shardIds;
+        grid.shardRegistry()->getAllShardIds(&shardIds);
+        int numShards = shardIds.size();
+
+        // Cannot have more than 8192 initial chunks per shard. Setting a maximum of 1,000,000
+        // chunks in total to limit the amount of memory this command consumes so there is less
+        // danger of an OOM error.
+        const int maxNumInitialChunksForShards = numShards * 8192;
+        const int maxNumInitialChunksTotal = 1000 * 1000;  // Arbitrary limit to memory consumption
+        int numChunks = cmdObj["numInitialChunks"].numberInt();
+        if (numChunks > maxNumInitialChunksForShards || numChunks > maxNumInitialChunksTotal) {
+            errmsg = str::stream()
+                << "numInitialChunks cannot be more than either: " << maxNumInitialChunksForShards
+                << ", 8192 * number of shards; or " << maxNumInitialChunksTotal;
             return false;
         }
 
@@ -324,7 +343,7 @@ public:
             // 5. If no useful index exists, and collection empty, create one on proposedKey.
             //    Only need to call ensureIndex on primary shard, since indexes get copied to
             //    receiving shard whenever a migrate occurs.
-            Status status = clusterCreateIndex(txn, ns, proposedKey, careAboutUnique, NULL);
+            Status status = clusterCreateIndex(txn, ns, proposedKey, careAboutUnique);
             if (!status.isOK()) {
                 errmsg = str::stream() << "ensureIndex failed to create index on "
                                        << "primary shard: " << status.reason();
@@ -346,16 +365,11 @@ public:
         // 2. move them one at a time
         // 3. split the big chunks to achieve the desired total number of initial chunks
 
-        vector<ShardId> shardIds;
-        grid.shardRegistry()->getAllShardIds(&shardIds);
-        int numShards = shardIds.size();
-
         vector<BSONObj> initSplits;  // there will be at most numShards-1 of these
         vector<BSONObj> allSplits;   // all of the initial desired split points
 
         // only pre-split when using a hashed shard key and collection is still empty
         if (isHashedShardKey && isEmpty) {
-            int numChunks = cmdObj["numInitialChunks"].numberInt();
             if (numChunks <= 0) {
                 // default number of initial chunks
                 numChunks = 2 * numShards;
@@ -403,6 +417,10 @@ public:
             return appendCommandStatus(result, status);
         }
 
+        // Make sure the cached metadata for the collection knows that we are now sharded
+        config = uassertStatusOK(grid.catalogCache()->getDatabase(txn, nsStr.db().toString()));
+        config->getChunkManager(txn, nsStr.ns(), true /* force */);
+
         result << "collectionsharded" << ns;
 
         // Only initially move chunks when using a hashed shard key
@@ -431,7 +449,14 @@ public:
                 BSONObj moveResult;
                 WriteConcernOptions noThrottle;
                 if (!chunk->moveAndCommit(
-                        txn, to->getId(), Chunk::MaxChunkSize, &noThrottle, true, 0, moveResult)) {
+                        txn,
+                        to->getId(),
+                        Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
+                        MigrationSecondaryThrottleOptions::create(
+                            MigrationSecondaryThrottleOptions::kOff),
+                        true,
+                        0,
+                        moveResult)) {
                     warning() << "couldn't move chunk " << chunk->toString() << " to shard " << *to
                               << " while sharding collection " << ns << "."
                               << " Reason: " << moveResult;

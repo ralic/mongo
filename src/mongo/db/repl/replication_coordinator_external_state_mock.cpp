@@ -34,8 +34,6 @@
 #include "mongo/bson/oid.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/repl/operation_context_repl_mock.h"
 #include "mongo/db/storage/snapshot_name.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/sequence_util.h"
@@ -52,14 +50,26 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
       _storeLocalLastVoteDocumentStatus(Status::OK()),
       _storeLocalConfigDocumentShouldHang(false),
       _storeLocalLastVoteDocumentShouldHang(false),
-      _connectionsClosed(false) {}
+      _isApplierSignaledToCancelFetcher(false),
+      _connectionsClosed(false),
+      _threadsStarted(false) {}
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
-void ReplicationCoordinatorExternalStateMock::startThreads(executor::TaskExecutor* taskExecutor) {}
+void ReplicationCoordinatorExternalStateMock::startThreads(const ReplSettings& settings) {
+    _threadsStarted = true;
+}
+
+void ReplicationCoordinatorExternalStateMock::startInitialSync(OnInitialSyncFinishedFn finished) {}
+void ReplicationCoordinatorExternalStateMock::startSteadyStateReplication() {}
+
 void ReplicationCoordinatorExternalStateMock::startMasterSlave(OperationContext*) {}
-void ReplicationCoordinatorExternalStateMock::initiateOplog(OperationContext* txn,
-                                                            bool updateReplOpTime) {}
+Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* txn,
+                                                                         const BSONObj& config,
+                                                                         bool updateReplOpTime) {
+    return storeLocalConfigDocument(txn, config);
+}
+
 void ReplicationCoordinatorExternalStateMock::shutdown() {}
 void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
 
@@ -137,6 +147,8 @@ void ReplicationCoordinatorExternalStateMock::setLocalLastVoteDocument(
 
 void ReplicationCoordinatorExternalStateMock::setGlobalTimestamp(const Timestamp& newTime) {}
 
+void ReplicationCoordinatorExternalStateMock::cleanUpLastApplyBatch(OperationContext* txn) {}
+
 StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(OperationContext* txn) {
     return _lastOpTime;
 }
@@ -155,6 +167,14 @@ void ReplicationCoordinatorExternalStateMock::setStoreLocalConfigDocumentToHang(
     if (!hang) {
         _shouldHangConfigCondVar.notify_all();
     }
+}
+
+bool ReplicationCoordinatorExternalStateMock::isApplierSignaledToCancelFetcher() const {
+    return _isApplierSignaledToCancelFetcher;
+}
+
+bool ReplicationCoordinatorExternalStateMock::threadsStarted() const {
+    return _threadsStarted;
 }
 
 void ReplicationCoordinatorExternalStateMock::setStoreLocalLastVoteDocumentStatus(Status status) {
@@ -177,11 +197,12 @@ void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationCon
 
 void ReplicationCoordinatorExternalStateMock::clearShardingState() {}
 
+void ReplicationCoordinatorExternalStateMock::recoverShardingState(OperationContext* txn) {}
+
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 
-OperationContext* ReplicationCoordinatorExternalStateMock::createOperationContext(
-    const std::string& threadName) {
-    return new OperationContextReplMock;
+void ReplicationCoordinatorExternalStateMock::signalApplierToCancelFetcher() {
+    _isApplierSignaledToCancelFetcher = true;
 }
 
 void ReplicationCoordinatorExternalStateMock::dropAllTempCollections(OperationContext* txn) {}
@@ -194,7 +215,26 @@ void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(SnapshotNa
 void ReplicationCoordinatorExternalStateMock::forceSnapshotCreation() {}
 
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
-    return true;
+    return _areSnapshotsEnabled;
+}
+
+void ReplicationCoordinatorExternalStateMock::setAreSnapshotsEnabled(bool val) {
+    _areSnapshotsEnabled = val;
+}
+
+void ReplicationCoordinatorExternalStateMock::notifyOplogMetadataWaiters() {}
+
+double ReplicationCoordinatorExternalStateMock::getElectionTimeoutOffsetLimitFraction() const {
+    return 0.15;
+}
+
+bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageEngine(
+    OperationContext* txn) const {
+    return _isReadCommittedSupported;
+}
+
+void ReplicationCoordinatorExternalStateMock::setIsReadCommittedEnabled(bool val) {
+    _isReadCommittedSupported = val;
 }
 
 void ReplicationCoordinatorExternalStateMock::logTransitionToPrimaryToOplog(OperationContext* txn) {

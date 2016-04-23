@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
@@ -39,8 +40,6 @@
 namespace mongo {
 
 class DBClientBase;
-template <typename T>
-class StatusWith;
 
 /**
  * ConnectionString handles parsing different ways to connect to mongo and determining method
@@ -48,10 +47,6 @@ class StatusWith;
  *    server
  *    server:port
  *    foo/server:port,server:port   SET
- *    server,server,server          SYNC
- *                                    Warning - you usually don't want "SYNC", it's used
- *                                    for some special things such as sharding config servers.
- *                                    See syncclusterconnection.h for more info.
  *
  * Typical use:
  *
@@ -61,7 +56,7 @@ class StatusWith;
  */
 class ConnectionString {
 public:
-    enum ConnectionType { INVALID, MASTER, SET, SYNC, CUSTOM };
+    enum ConnectionType { INVALID, MASTER, SET, CUSTOM };
 
     ConnectionString() = default;
 
@@ -75,9 +70,19 @@ public:
      */
     explicit ConnectionString(const HostAndPort& server);
 
+    /**
+     * Creates a connection string from an unparsed list of servers, type, and setName.
+     */
     ConnectionString(ConnectionType type, const std::string& s, const std::string& setName);
 
-    ConnectionString(const std::string& s, ConnectionType favoredMultipleType);
+    /**
+     * Creates a connection string from a pre-parsed list of servers, type, and setName.
+     */
+    ConnectionString(ConnectionType type,
+                     std::vector<HostAndPort> servers,
+                     const std::string& setName);
+
+    ConnectionString(const std::string& s, ConnectionType connType);
 
     bool isValid() const {
         return _type != INVALID;

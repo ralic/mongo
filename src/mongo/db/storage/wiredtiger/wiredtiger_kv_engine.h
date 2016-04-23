@@ -44,15 +44,21 @@
 
 namespace mongo {
 
+class JournalListener;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 
 class WiredTigerKVEngine final : public KVEngine {
 public:
-    WiredTigerKVEngine(const std::string& path,
-                       const std::string& extraOpenOptions = "",
-                       bool durable = true,
-                       bool repair = false);
+    WiredTigerKVEngine(const std::string& canonicalName,
+                       const std::string& path,
+                       const std::string& extraOpenOptions,
+                       size_t cacheSizeGB,
+                       bool durable,
+                       bool ephemeral,
+                       bool repair,
+                       bool readOnly);
+
     virtual ~WiredTigerKVEngine();
 
     void setRecordStoreExtraOptions(const std::string& options);
@@ -64,6 +70,10 @@ public:
 
     virtual bool isDurable() const {
         return _durable;
+    }
+
+    virtual bool isEphemeral() const {
+        return _ephemeral;
     }
 
     virtual RecoveryUnit* newRecoveryUnit();
@@ -96,6 +106,10 @@ public:
 
     virtual int flushAllFiles(bool sync);
 
+    virtual Status beginBackup(OperationContext* txn);
+
+    virtual void endBackup(OperationContext* txn);
+
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
 
     virtual Status repairIdent(OperationContext* opCtx, StringData ident);
@@ -109,6 +123,8 @@ public:
     SnapshotManager* getSnapshotManager() const final {
         return &_sessionCache->snapshotManager();
     }
+
+    void setJournalListener(JournalListener* jl) final;
 
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
@@ -131,7 +147,11 @@ public:
      */
     static bool initRsOplogBackgroundThread(StringData ns);
 
+    static void appendGlobalStats(BSONObjBuilder& b);
+
 private:
+    class WiredTigerJournalFlusher;
+
     Status _salvageIfNeeded(const char* uri);
     void _checkIdentPath(StringData ident);
 
@@ -143,19 +163,26 @@ private:
     WT_CONNECTION* _conn;
     WT_EVENT_HANDLER _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
+    std::string _canonicalName;
     std::string _path;
-    bool _durable;
-
-    std::string _rsOptions;
-    std::string _indexOptions;
-
-    std::set<std::string> _identToDrop;
-    mutable stdx::mutex _identToDropMutex;
 
     std::unique_ptr<WiredTigerSizeStorer> _sizeStorer;
     std::string _sizeStorerUri;
     mutable ElapsedTracker _sizeStorerSyncTracker;
 
+    bool _durable;
+    bool _ephemeral;
+    bool _readOnly;
+    std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
+
+    std::string _rsOptions;
+    std::string _indexOptions;
+
+    mutable stdx::mutex _identToDropMutex;
+    std::set<std::string> _identToDrop;
+
     mutable Date_t _previousCheckedDropsQueued;
+
+    std::unique_ptr<WiredTigerSession> _backupSession;
 };
 }

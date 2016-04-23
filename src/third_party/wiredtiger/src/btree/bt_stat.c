@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -35,10 +35,10 @@ __wt_btree_stat_init(WT_SESSION_IMPL *session, WT_CURSOR_STAT *cst)
 
 	WT_STAT_SET(session, stats, btree_fixed_len, btree->bitcnt);
 	WT_STAT_SET(session, stats, btree_maximum_depth, btree->maximum_depth);
-	WT_STAT_SET(session, stats, btree_maxintlpage, btree->maxintlpage);
 	WT_STAT_SET(session, stats, btree_maxintlkey, btree->maxintlkey);
-	WT_STAT_SET(session, stats, btree_maxleafpage, btree->maxleafpage);
+	WT_STAT_SET(session, stats, btree_maxintlpage, btree->maxintlpage);
 	WT_STAT_SET(session, stats, btree_maxleafkey, btree->maxleafkey);
+	WT_STAT_SET(session, stats, btree_maxleafpage, btree->maxleafpage);
 	WT_STAT_SET(session, stats, btree_maxleafvalue, btree->maxleafvalue);
 
 	/* Everything else is really, really expensive. */
@@ -51,6 +51,7 @@ __wt_btree_stat_init(WT_SESSION_IMPL *session, WT_CURSOR_STAT *cst)
 	WT_STAT_SET(session, stats, btree_column_deleted, 0);
 	WT_STAT_SET(session, stats, btree_column_fix, 0);
 	WT_STAT_SET(session, stats, btree_column_internal, 0);
+	WT_STAT_SET(session, stats, btree_column_rle, 0);
 	WT_STAT_SET(session, stats, btree_column_variable, 0);
 	WT_STAT_SET(session, stats, btree_entries, 0);
 	WT_STAT_SET(session, stats, btree_overflow, 0);
@@ -58,8 +59,8 @@ __wt_btree_stat_init(WT_SESSION_IMPL *session, WT_CURSOR_STAT *cst)
 	WT_STAT_SET(session, stats, btree_row_leaf, 0);
 
 	next_walk = NULL;
-	while ((ret = __wt_tree_walk(session, &next_walk, NULL, 0)) == 0 &&
-	    next_walk != NULL) {
+	while ((ret = __wt_tree_walk(
+	    session, &next_walk, 0)) == 0 && next_walk != NULL) {
 		WT_WITH_PAGE_INDEX(session,
 		    ret = __stat_page(session, next_walk->page, stats));
 		WT_RET(ret);
@@ -114,12 +115,12 @@ __stat_page_col_var(
 	WT_COL *cip;
 	WT_INSERT *ins;
 	WT_UPDATE *upd;
-	uint64_t deleted_cnt, entry_cnt, ovfl_cnt;
+	uint64_t deleted_cnt, entry_cnt, ovfl_cnt, rle_cnt;
 	uint32_t i;
-	int orig_deleted;
+	bool orig_deleted;
 
 	unpack = &_unpack;
-	deleted_cnt = entry_cnt = ovfl_cnt = 0;
+	deleted_cnt = entry_cnt = ovfl_cnt = rle_cnt = 0;
 
 	WT_STAT_INCR(session, stats, btree_column_variable);
 
@@ -133,15 +134,17 @@ __stat_page_col_var(
 	 */
 	WT_COL_FOREACH(page, cip, i) {
 		if ((cell = WT_COL_PTR(page, cip)) == NULL) {
-			orig_deleted = 1;
+			orig_deleted = true;
 			++deleted_cnt;
 		} else {
-			orig_deleted = 0;
+			orig_deleted = false;
 			__wt_cell_unpack(cell, unpack);
 			if (unpack->type == WT_CELL_ADDR_DEL)
-				orig_deleted = 1;
-			else
+				orig_deleted = true;
+			else {
 				entry_cnt += __wt_cell_rle(unpack);
+				rle_cnt += __wt_cell_rle(unpack) - 1;
+			}
 			if (unpack->ovfl)
 				++ovfl_cnt;
 		}
@@ -173,6 +176,7 @@ __stat_page_col_var(
 			++entry_cnt;
 
 	WT_STAT_INCRV(session, stats, btree_column_deleted, deleted_cnt);
+	WT_STAT_INCRV(session, stats, btree_column_rle, rle_cnt);
 	WT_STAT_INCRV(session, stats, btree_entries, entry_cnt);
 	WT_STAT_INCRV(session, stats, btree_overflow, ovfl_cnt);
 }

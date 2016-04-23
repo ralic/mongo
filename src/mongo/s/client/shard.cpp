@@ -32,34 +32,34 @@
 
 #include "mongo/s/client/shard.h"
 
-#include <string>
-
-#include "mongo/client/remote_command_targeter.h"
-#include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/grid.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
-
 namespace mongo {
 
-using std::string;
-using std::stringstream;
+Shard::Shard(const ShardId& id) : _id(id) {}
 
-Shard::Shard(const ShardId& id,
-             const ConnectionString& connStr,
-             std::unique_ptr<RemoteCommandTargeter> targeter)
-    : _id(id), _cs(connStr), _targeter(std::move(targeter)) {}
-
-Shard::~Shard() = default;
+const ShardId Shard::getId() const {
+    return _id;
+}
 
 bool Shard::isConfig() const {
     return _id == "config";
 }
 
-std::string Shard::toString() const {
-    return _id + ":" + _cs.toString();
+StatusWith<Shard::CommandResponse> Shard::runCommand(OperationContext* txn,
+                                                     const ReadPreferenceSetting& readPref,
+                                                     const std::string& dbName,
+                                                     const BSONObj& cmdObj,
+                                                     const BSONObj& metadata) {
+    return _runCommand(txn, readPref, dbName, cmdObj, metadata);
+}
+
+StatusWith<Shard::QueryResponse> Shard::exhaustiveFindOnConfig(
+    OperationContext* txn,
+    const ReadPreferenceSetting& readPref,
+    const NamespaceString& nss,
+    const BSONObj& query,
+    const BSONObj& sort,
+    const boost::optional<long long> limit) {
+    return _exhaustiveFindOnConfig(txn, readPref, nss, query, sort, limit);
 }
 
 }  // namespace mongo

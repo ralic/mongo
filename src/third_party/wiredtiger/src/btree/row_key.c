@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -52,6 +52,7 @@ __wt_row_leaf_keys(WT_SESSION_IMPL *session, WT_PAGE *page)
 	WT_RET(__wt_scr_alloc(session, 0, &key));
 	WT_RET(__wt_scr_alloc(session,
 	    (uint32_t)__bitstr_size(page->pg_row_entries), &tmp));
+	memset(tmp->mem, 0, tmp->memsize);
 
 	if ((gap = btree->key_gap) == 0)
 		gap = 1;
@@ -61,7 +62,7 @@ __wt_row_leaf_keys(WT_SESSION_IMPL *session, WT_PAGE *page)
 	for (rip = page->pg_row_d, i = 0; i < page->pg_row_entries; ++rip, ++i)
 		if (__bit_test(tmp->mem, i))
 			WT_ERR(__wt_row_leaf_key_work(
-			    session, page, rip, key, 1));
+			    session, page, rip, key, true));
 
 	F_SET_ATOMIC(page, WT_PAGE_BUILD_KEYS);
 
@@ -112,7 +113,7 @@ int
 __wt_row_leaf_key_copy(
     WT_SESSION_IMPL *session, WT_PAGE *page, WT_ROW *rip, WT_ITEM *key)
 {
-	WT_RET(__wt_row_leaf_key(session, page, rip, key, 0));
+	WT_RET(__wt_row_leaf_key(session, page, rip, key, false));
 
 	/* The return buffer may only hold a reference to a key, copy it. */
 	if (!WT_DATA_IN_ITEM(key))
@@ -128,7 +129,7 @@ __wt_row_leaf_key_copy(
  */
 int
 __wt_row_leaf_key_work(WT_SESSION_IMPL *session,
-    WT_PAGE *page, WT_ROW *rip_arg, WT_ITEM *keyb, int instantiate)
+    WT_PAGE *page, WT_ROW *rip_arg, WT_ITEM *keyb, bool instantiate)
 {
 	enum { FORWARD, BACKWARD } direction;
 	WT_BTREE *btree;

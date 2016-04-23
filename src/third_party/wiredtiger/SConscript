@@ -4,9 +4,19 @@ import textwrap
 
 Import("env debugBuild")
 Import("get_option")
+Import("endian")
 
 env = env.Clone()
 env.InjectThirdPartyIncludePaths(libraries=['snappy', 'zlib'])
+
+if endian == "big":
+    env.Append(CPPDEFINES=[('WORDS_BIGENDIAN', 1)])
+
+# WiredTiger is not currently alignment clean; see
+# https://jira.mongodb.org/browse/WT-2402.
+sanitizer_list = get_option('sanitize')
+if sanitizer_list and ('undefined' in sanitizer_list.split(',')):
+    env.Append(CCFLAGS=["-fno-sanitize=alignment"])
 
 env.Append(CPPPATH=[
         "src/include",
@@ -31,18 +41,26 @@ if conf.CheckFunc("sync_file_range"):
                 "HAVE_SYNC_FILE_RANGE"
     ])
 
+if conf.CheckCHeader('x86intrin.h'):
+        env.Append(CPPDEFINES=[
+            "HAVE_X86INTRIN_H"
+    ])
+
 if env.TargetOSIs('windows'):
     env.Append(CPPPATH=["build_win"])
     env.Append(CFLAGS=[
         "/wd4090" # Ignore warning about mismatched const qualifiers
     ])
-    if get_option('allocator') == 'tcmalloc':
+    if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         env.InjectThirdPartyIncludePaths(libraries=['gperftools'])
         env.Append(CPPDEFINES=['HAVE_LIBTCMALLOC'])
 elif env.TargetOSIs('osx'):
     env.Append(CPPPATH=["build_darwin"])
 elif env.TargetOSIs('solaris'):
     env.Append(CPPPATH=["build_solaris"])
+    # For an explanation of __EXTENSIONS__,
+    # see http://docs.oracle.com/cd/E19253-01/816-5175/standards-5/index.html
+    env.Append(CPPDEFINES=["__EXTENSIONS__"])
 elif env.TargetOSIs('freebsd'):
     env.Append(CPPPATH=["build_freebsd"])
 elif env.TargetOSIs('openbsd'):
@@ -105,6 +123,8 @@ env.Substfile(
         'src/include/wiredtiger.in',
     ],
     SUBST_DICT=replacements)
+
+env.Alias('generated-sources', "wiredtiger.h")
 
 #
 # WiredTiger library

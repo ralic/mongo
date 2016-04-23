@@ -39,6 +39,8 @@
 namespace mongo {
 
 class OperationContext;
+class OpDebug;
+struct PlanSummaryStats;
 
 struct UpdateStageParams {
     UpdateStageParams(const UpdateRequest* r, UpdateDriver* d, OpDebug* o)
@@ -82,7 +84,7 @@ public:
                 PlanStage* child);
 
     bool isEOF() final;
-    StageState work(WorkingSetID* out) final;
+    StageState doWork(WorkingSetID* out) final;
 
     void doRestoreState() final;
 
@@ -97,15 +99,22 @@ public:
     static const char* kStageType;
 
     /**
-     * Converts the execution stats (stored by the update stage as an UpdateStats) for the
-     * update plan represented by 'exec' into the UpdateResult format used to report the results
-     * of writes.
+     * Gets a pointer to the UpdateStats inside 'exec'.
      *
-     * Also responsible for filling out 'opDebug' with execution info.
-     *
-     * Should only be called once this stage is EOF.
+     * The 'exec' must have an UPDATE stage as its root stage, and the plan must be EOF before
+     * calling this method.
      */
-    static UpdateResult makeUpdateResult(const PlanExecutor& exec, OpDebug* opDebug);
+    static const UpdateStats* getUpdateStats(const PlanExecutor* exec);
+
+    /**
+     * Populate 'opDebug' with stats from 'updateStats' describing the execution of this update.
+     */
+    static void recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpDebug* opDebug);
+
+    /**
+     * Converts 'updateStats' into an UpdateResult.
+     */
+    static UpdateResult makeUpdateResult(const UpdateStats* updateStats);
 
     /**
      * Computes the document to insert if the upsert flag is set to true and no matching
@@ -136,11 +145,11 @@ public:
 
 private:
     /**
-     * Computes the result of applying mods to the document 'oldObj' at RecordId 'loc' in
+     * Computes the result of applying mods to the document 'oldObj' at RecordId 'recordId' in
      * memory, then commits these changes to the database. Returns a possibly unowned copy
      * of the newly-updated version of the document.
      */
-    BSONObj transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& loc);
+    BSONObj transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& recordId);
 
     /**
      * Computes the document to insert and inserts it into the collection. Used if the
@@ -164,6 +173,12 @@ private:
      * Helper for restoring the state of this update.
      */
     Status restoreUpdateState();
+
+    /**
+     * Stores 'idToRetry' in '_idRetrying' so the update can be retried during the next call to
+     * work(). Always returns NEED_YIELD and sets 'out' to WorkingSet::INVALID_ID.
+     */
+    StageState prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
 
     UpdateStageParams _params;
 
@@ -194,8 +209,8 @@ private:
     // document and we wouldn't want to update that.
     //
     // So, no matter what, we keep track of where the doc wound up.
-    typedef unordered_set<RecordId, RecordId::Hasher> DiskLocSet;
-    const std::unique_ptr<DiskLocSet> _updatedLocs;
+    typedef unordered_set<RecordId, RecordId::Hasher> RecordIdSet;
+    const std::unique_ptr<RecordIdSet> _updatedRecordIds;
 
     // These get reused for each update.
     mutablebson::Document& _doc;

@@ -34,7 +34,6 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageIxscan {
@@ -42,8 +41,7 @@ namespace QueryStageIxscan {
 class IndexScanTest {
 public:
     IndexScanTest()
-        : _txn(),
-          _scopedXact(&_txn, MODE_IX),
+        : _scopedXact(&_txn, MODE_IX),
           _dbLock(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X),
           _ctx(&_txn, ns()),
           _coll(NULL) {}
@@ -66,7 +64,8 @@ public:
 
     void insert(const BSONObj& doc) {
         WriteUnitOfWork wunit(&_txn);
-        ASSERT_OK(_coll->insertDocument(&_txn, doc, false).getStatus());
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT_OK(_coll->insertDocument(&_txn, doc, nullOpDebug, false));
         wunit.commit();
     }
 
@@ -139,7 +138,8 @@ public:
     }
 
 protected:
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
 
     ScopedTransaction _scopedXact;
     Lock::DBLock _dbLock;
@@ -185,10 +185,10 @@ public:
 
         // Expect to get key {'': 5} and then key {'': 6}.
         WorkingSetMember* member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 5));
         member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 6));
 
         // Save state and insert a few indexed docs.
@@ -198,7 +198,7 @@ public:
         ixscan->restoreState();
 
         member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 10));
 
         WorkingSetID id;
@@ -222,7 +222,7 @@ public:
 
         // Expect to get key {'': 6}.
         WorkingSetMember* member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 6));
 
         // Save state and insert an indexed doc.
@@ -231,7 +231,7 @@ public:
         ixscan->restoreState();
 
         member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 7));
 
         WorkingSetID id;
@@ -255,7 +255,7 @@ public:
 
         // Expect to get key {'': 6}.
         WorkingSetMember* member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 6));
 
         // Save state and insert an indexed doc.
@@ -285,10 +285,10 @@ public:
 
         // Expect to get key {'': 10} and then {'': 8}.
         WorkingSetMember* member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 10));
         member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 8));
 
         // Save state and insert an indexed doc.
@@ -299,7 +299,7 @@ public:
 
         // Ensure that we don't erroneously return {'': 9} or {'':3}.
         member = getNext(ixscan.get());
-        ASSERT_EQ(WorkingSetMember::LOC_AND_IDX, member->getState());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
         ASSERT_EQ(member->keyData[0].keyData, BSON("" << 6));
 
         WorkingSetID id;

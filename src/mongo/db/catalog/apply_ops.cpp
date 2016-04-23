@@ -38,9 +38,9 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
@@ -76,9 +76,9 @@ Status applyOps(OperationContext* txn,
             DBDirectClient db(txn);
             BSONObj realres = db.findOne(f["ns"].String(), f["q"].Obj());
 
-            // Apply-ops would never have a $where matcher, so use the default callback,
-            // which will throw an error if $where is found.
-            Matcher m(f["res"].Obj());
+            // Apply-ops would never have a $where/$text matcher. Using the "DisallowExtensions"
+            // callback ensures that parsing will throw an error if $where or $text are found.
+            Matcher m(f["res"].Obj(), ExtensionsCallbackDisallowExtensions());
             if (!m.matches(realres)) {
                 result->append("got", realres);
                 result->append("whatFailed", f);
@@ -129,18 +129,27 @@ Status applyOps(OperationContext* txn,
 
         Status status(ErrorCodes::InternalError, "");
 
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            if (*opType == 'c') {
-                status = repl::applyCommand_inlock(txn, temp);
-                break;
-            } else {
-                OldClientContext ctx(txn, ns);
+        try {
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                if (*opType == 'c') {
+                    status = repl::applyCommand_inlock(txn, temp);
+                    break;
+                } else {
+                    OldClientContext ctx(txn, ns);
 
-                status = repl::applyOperation_inlock(txn, ctx.db(), temp, alwaysUpsert);
-                break;
+                    status = repl::applyOperation_inlock(txn, ctx.db(), temp, alwaysUpsert);
+                    break;
+                }
             }
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "applyOps", ns);
+        } catch (const DBException& ex) {
+            ab.append(false);
+            result->append("applied", ++num);
+            result->append("code", ex.getCode());
+            result->append("errmsg", ex.what());
+            result->append("results", ab.arr());
+            return Status(ErrorCodes::UnknownError, "");
         }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "applyOps", ns);
 
         ab.append(status.isOK());
         if (!status.isOK()) {

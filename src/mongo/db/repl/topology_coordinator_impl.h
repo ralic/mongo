@@ -52,7 +52,7 @@ class ReplSetMetadata;
 
 namespace repl {
 
-static const Milliseconds UninitializedPing{};
+static const Milliseconds UninitializedPing{-1};
 
 /**
  * Represents a latency measurement for each replica set member based on heartbeat requests.
@@ -90,9 +90,10 @@ public:
 
     /**
      * Gets the weighted average round trip time for heartbeat messages to the target.
+     * Returns 0 if there have been no pings recorded yet.
      */
     Milliseconds getMillis() const {
-        return value;
+        return value == UninitializedPing ? Milliseconds(0) : value;
     }
 
     /**
@@ -126,12 +127,8 @@ public:
         // A sync source is re-evaluated after it lags behind further than this amount.
         Seconds maxSyncSourceLagSecs{0};
 
-        // Whether or not this node is running as a config server, and if so whether it was started
-        // with --configsvrMode=SCCC.
-        CatalogManager::ConfigServerMode configServerMode{CatalogManager::ConfigServerMode::NONE};
-
-        // Whether or not the storage engine supports read committed.
-        bool storageEngineSupportsReadCommitted{true};
+        // Whether or not this node is running as a config server.
+        ClusterRole clusterRole{ClusterRole::None};
     };
 
     /**
@@ -150,20 +147,23 @@ public:
     virtual HostAndPort getSyncSourceAddress() const;
     virtual std::vector<HostAndPort> getMaybeUpHostAndPorts() const;
     virtual int getMaintenanceCount() const;
-    virtual long long getTerm() const;
-    virtual bool updateTerm(long long term);
+    virtual long long getTerm();
+    virtual UpdateTermResult updateTerm(long long term, Date_t now);
     virtual void setForceSyncSourceIndex(int index);
     virtual HostAndPort chooseNewSyncSource(Date_t now, const Timestamp& lastTimestampApplied);
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
     virtual void unblacklistSyncSource(const HostAndPort& host, Date_t now);
     virtual void clearSyncSourceBlacklist();
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource, Date_t now) const;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& myLastOpTime,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource,
+                                        Date_t now) const;
     virtual bool becomeCandidateIfStepdownPeriodOverAndSingleNodeSet(Date_t now);
     virtual void setElectionSleepUntil(Date_t newTime);
     virtual void setFollowerMode(MemberState::MS newMode);
     virtual void adjustMaintenanceCountBy(int inc);
-    virtual void prepareSyncFromResponse(const ReplicationExecutor::CallbackArgs& data,
-                                         const HostAndPort& target,
+    virtual void prepareSyncFromResponse(const HostAndPort& target,
                                          const OpTime& lastOpApplied,
                                          BSONObjBuilder* response,
                                          Status* result);
@@ -181,16 +181,15 @@ public:
                                             const ReplSetHeartbeatArgs& args,
                                             const std::string& ourSetName,
                                             const OpTime& lastOpApplied,
+                                            const OpTime& lastOpDurable,
                                             ReplSetHeartbeatResponse* response);
     virtual Status prepareHeartbeatResponseV1(Date_t now,
                                               const ReplSetHeartbeatArgsV1& args,
                                               const std::string& ourSetName,
                                               const OpTime& lastOpApplied,
+                                              const OpTime& lastOpDurable,
                                               ReplSetHeartbeatResponse* response);
-    virtual void prepareStatusResponse(const ReplicationExecutor::CallbackArgs& data,
-                                       Date_t now,
-                                       unsigned uptime,
-                                       const OpTime& lastOpApplied,
+    virtual void prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                        BSONObjBuilder* response,
                                        Status* result);
     virtual void fillIsMasterForReplSet(IsMasterResponse* response);
@@ -210,9 +209,10 @@ public:
         const StatusWith<ReplSetHeartbeatResponse>& hbResponse,
         const OpTime& myLastOpApplied);
     virtual bool voteForMyself(Date_t now);
+    virtual void setElectionInfo(OID electionId, Timestamp electionOpTime);
     virtual void processWinElection(OID electionId, Timestamp electionOpTime);
     virtual void processLoseElection();
-    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied);
+    virtual Status checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const;
     virtual void setMyHeartbeatMessage(const Date_t now, const std::string& message);
     virtual bool stepDown(Date_t until, bool force, const OpTime& lastOpApplied);
     virtual bool stepDownIfPending();
@@ -220,20 +220,19 @@ public:
     virtual void prepareReplResponseMetadata(rpc::ReplSetMetadata* metadata,
                                              const OpTime& lastVisibleOpTime,
                                              const OpTime& lastCommitttedOpTime) const;
-    Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                               long long* responseTerm);
     virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
                                             ReplSetRequestVotesResponse* response,
                                             const OpTime& lastAppliedOpTime);
     virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
     virtual void loadLastVote(const LastVote& lastVote);
     virtual void voteForMyselfV1();
-    virtual long long getTerm();
     virtual void prepareForStepDown();
     virtual void setPrimaryIndex(long long primaryIndex);
     virtual HeartbeatResponseAction setMemberAsDown(Date_t now,
                                                     const int memberIndex,
                                                     const OpTime& myLastOpApplied);
+    virtual Status becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied);
+    virtual void setStorageEngineSupportsReadCommitted(bool supported);
 
     ////////////////////////////////////////////////////////////
     //
@@ -358,8 +357,6 @@ private:
 
     void _stepDownSelfAndReplaceWith(int newPrimary);
 
-    MemberState _getMyState() const;
-
     /**
      * Looks up the provided member in the blacklist and returns true if the member's blacklist
      * expire time is after 'now'.  If the member is found but the expire time is before 'now',
@@ -420,6 +417,8 @@ private:
     Date_t _stepDownUntil;
 
     // A time before which this node will not stand for election.
+    // In protocol version 1, this is used to prevent running for election after seeing
+    // a new term.
     Date_t _electionSleepUntil;
 
     // The number of calls we have had to enter maintenance mode
@@ -448,6 +447,15 @@ private:
 
     // V1 last vote info for elections
     LastVote _lastVote;
+
+    enum class ReadCommittedSupport {
+        kUnknown,
+        kNo,
+        kYes,
+    };
+
+    // Whether or not the storage engine supports read committed.
+    ReadCommittedSupport _storageEngineSupportsReadCommitted{ReadCommittedSupport::kUnknown};
 };
 
 }  // namespace repl

@@ -69,8 +69,7 @@ class MongoDFixture(interface.Fixture):
             pass
 
         if "port" not in self.mongod_options:
-            with core.network.UnusedPort() as port:
-                self.mongod_options["port"] = port.num
+            self.mongod_options["port"] = core.network.PortAllocator.next_fixture_port(self.job_num)
         self.port = self.mongod_options["port"]
 
         mongod = core.programs.mongod_program(self.logger,
@@ -94,9 +93,10 @@ class MongoDFixture(interface.Fixture):
         # be established.
         while True:
             # Check whether the mongod exited for some reason.
-            if self.mongod.poll() is not None:
+            exit_code = self.mongod.poll()
+            if exit_code is not None:
                 raise errors.ServerFailure("Could not connect to mongod on port %d, process ended"
-                                           " unexpectedly." % (self.port))
+                                           " unexpectedly with code %d." % (self.port, exit_code))
 
             try:
                 # Use a shorter connection timeout to more closely satisfy the requested deadline.
@@ -111,7 +111,7 @@ class MongoDFixture(interface.Fixture):
                         % (self.port, MongoDFixture.AWAIT_READY_TIMEOUT_SECS))
 
                 self.logger.info("Waiting to connect to mongod on port %d.", self.port)
-                time.sleep(1)  # Wait a little bit before trying again.
+                time.sleep(0.1)  # Wait a little bit before trying again.
 
         self.logger.info("Successfully contacted the mongod on port %d.", self.port)
 

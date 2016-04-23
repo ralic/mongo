@@ -54,6 +54,8 @@
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -117,7 +119,7 @@ class StageDebugCmd : public Command {
 public:
     StageDebugCmd() : Command("stageDebug") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     bool slaveOk() const {
@@ -152,20 +154,24 @@ public:
         if (collElt.eoo() || (String != collElt.type())) {
             return false;
         }
-        string collName = collElt.String();
+
+        const NamespaceString nss(dbname, collElt.String());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << nss.toString() << " is not a valid namespace",
+                nss.isValid());
 
         // Need a context to get the actual Collection*
         // TODO A write lock is currently taken here to accommodate stages that perform writes
         //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
         //      execution trees.
         ScopedTransaction transaction(txn, MODE_IX);
-        Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
+        AutoGetCollection autoColl(txn, nss, MODE_IX);
 
         // Make sure the collection is valid.
-        Database* db = ctx.db();
-        Collection* collection = db->getCollection(db->name() + '.' + collName);
-        uassert(17446, "Couldn't find the collection " + collName, NULL != collection);
+        Collection* collection = autoColl.getCollection();
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Couldn't find collection " << nss.ns(),
+                collection);
 
         // Pull out the plan
         BSONElement planElt = argObj["plan"];
@@ -202,9 +208,9 @@ public:
         resultBuilder.done();
 
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            const std::unique_ptr<PlanStageStats> stats(exec->getStats());
             error() << "Plan executor error during StageDebug command: "
-                    << PlanExecutor::statestr(state) << ", stats: " << Explain::statsToBSON(*stats);
+                    << PlanExecutor::statestr(state)
+                    << ", stats: " << Explain::getWinningPlanStats(exec.get());
 
             return appendCommandStatus(
                 result,
@@ -244,7 +250,7 @@ public:
             BSONObj argObj = e.Obj();
             if (filterTag == e.fieldName()) {
                 StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                    argObj, WhereCallbackReal(txn, collection->ns().db()));
+                    argObj, ExtensionsCallbackReal(txn, &collection->ns()));
                 if (!statusWithMatcher.isOK()) {
                     return NULL;
                 }
@@ -457,11 +463,11 @@ public:
 
             params.spec = fam->getSpec();
 
-            if (!params.query.parse(search,
-                                    fam->getSpec().defaultLanguage().str().c_str(),
-                                    fts::FTSQuery::caseSensitiveDefault,
-                                    fts::FTSQuery::diacriticSensitiveDefault,
-                                    fam->getSpec().getTextIndexVersion()).isOK()) {
+            params.query.setQuery(search);
+            params.query.setLanguage(fam->getSpec().defaultLanguage().str());
+            params.query.setCaseSensitive(TextMatchExpressionBase::kCaseSensitiveDefault);
+            params.query.setDiacriticSensitive(TextMatchExpressionBase::kDiacriticSensitiveDefault);
+            if (!params.query.parse(fam->getSpec().getTextIndexVersion()).isOK()) {
                 return NULL;
             }
 

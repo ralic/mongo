@@ -35,11 +35,16 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/connpool.h"
+
+#include <string>
+
+#include "mongo/client/connection_string.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/client/syncclusterconnection.h"
+#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/socket_exception.h"
 
 namespace mongo {
 
@@ -66,6 +71,8 @@ void PoolForHost::clear() {
 
 void PoolForHost::done(DBConnectionPool* pool, DBClientBase* c) {
     bool isFailed = c->isFailed();
+
+    --_checkedOut;
 
     // Remember that this host had a broken connection for later
     if (isFailed)
@@ -115,6 +122,7 @@ DBClientBase* PoolForHost::get(DBConnectionPool* pool, double socketTimeout) {
 
         verify(sc.conn->getSoTimeout() == socketTimeout);
 
+        ++_checkedOut;
         return sc.conn;
     }
 
@@ -162,7 +170,10 @@ bool PoolForHost::StoredConnection::ok(time_t now) {
 void PoolForHost::createdOne(DBClientBase* base) {
     if (_created == 0)
         _type = base->type();
-    _created++;
+    ++_created;
+    // _checkedOut is used to indicate the number of in-use connections so
+    // though we didn't actually check this connection out, we bump it here.
+    ++_checkedOut;
 }
 
 void PoolForHost::initializeHostName(const std::string& hostName) {
@@ -335,53 +346,28 @@ void DBConnectionPool::onDestroy(DBClientBase* conn) {
     }
 }
 
-void DBConnectionPool::appendInfo(BSONObjBuilder& b) {
-    int avail = 0;
-    long long created = 0;
-
-
-    map<ConnectionString::ConnectionType, long long> createdByType;
-
-    BSONObjBuilder bb(b.subobjStart("hosts"));
+void DBConnectionPool::appendConnectionStats(executor::ConnectionPoolStats* stats) const {
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        for (PoolMap::iterator i = _pools.begin(); i != _pools.end(); ++i) {
+        for (PoolMap::const_iterator i = _pools.begin(); i != _pools.end(); ++i) {
             if (i->second.numCreated() == 0)
                 continue;
 
-            string s = str::stream() << i->first.ident << "::" << i->first.timeout;
+            // Mongos may use either a replica set uri or a list of addresses as
+            // the identifier here, so we always take the first server parsed out
+            // as our label for connPoolStats. Note that these stats will collide
+            // with any existing stats for the chosen host.
+            auto uri = ConnectionString::parse(i->first.ident);
+            invariant(uri.isOK());
+            HostAndPort host = uri.getValue().getServers().front();
 
-            BSONObjBuilder temp(bb.subobjStart(s));
-            temp.append("available", i->second.numAvailable());
-            temp.appendNumber("created", i->second.numCreated());
-            temp.done();
-
-            avail += i->second.numAvailable();
-            created += i->second.numCreated();
-
-            long long& x = createdByType[i->second.type()];
-            x += i->second.numCreated();
+            executor::ConnectionStatsPerHost hostStats{
+                static_cast<size_t>(i->second.numInUse()),
+                static_cast<size_t>(i->second.numAvailable()),
+                static_cast<size_t>(i->second.numCreated())};
+            stats->updateStatsForHost(host, hostStats);
         }
     }
-    bb.done();
-
-    // Always report all replica sets being tracked
-    BSONObjBuilder setBuilder(b.subobjStart("replicaSets"));
-    globalRSMonitorManager.report(&setBuilder);
-    setBuilder.done();
-
-    {
-        BSONObjBuilder temp(bb.subobjStart("createdByType"));
-        for (map<ConnectionString::ConnectionType, long long>::iterator i = createdByType.begin();
-             i != createdByType.end();
-             ++i) {
-            temp.appendNumber(ConnectionString::typeToString(i->first), i->second);
-        }
-        temp.done();
-    }
-
-    b.append("totalAvailable", avail);
-    b.appendNumber("totalCreated", created);
 }
 
 bool DBConnectionPool::serverNameCompare::operator()(const string& a, const string& b) const {
@@ -488,10 +474,9 @@ void ScopedDbConnection::done() {
 void ScopedDbConnection::_setSocketTimeout() {
     if (!_conn)
         return;
+
     if (_conn->type() == ConnectionString::MASTER)
-        ((DBClientConnection*)_conn)->setSoTimeout(_socketTimeout);
-    else if (_conn->type() == ConnectionString::SYNC)
-        ((SyncClusterConnection*)_conn)->setAllSoTimeouts(_socketTimeout);
+        static_cast<DBClientConnection*>(_conn)->setSoTimeout(_socketTimeout);
 }
 
 ScopedDbConnection::~ScopedDbConnection() {

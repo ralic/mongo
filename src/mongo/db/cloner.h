@@ -30,8 +30,9 @@
 
 #pragma once
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/base/disallow_copying.h"
+#include "mongo/client/dbclientinterface.h"
+#include "mongo/s/catalog/catalog_manager.h"
 
 namespace mongo {
 
@@ -64,9 +65,7 @@ public:
                         const std::string& ns,
                         const BSONObj& query,
                         std::string& errmsg,
-                        bool mayYield,
-                        bool mayBeInterrupted,
-                        bool copyIndexes = true);
+                        bool copyIndexes);
 
 private:
     void copy(OperationContext* txn,
@@ -75,9 +74,7 @@ private:
               const BSONObj& from_opts,
               const NamespaceString& to_ns,
               bool masterSameProcess,
-              bool slaveOk,
-              bool mayYield,
-              bool mayBeInterrupted,
+              const CloneOptions& opts,
               Query q);
 
     void copyIndexes(OperationContext* txn,
@@ -86,9 +83,7 @@ private:
                      const BSONObj& from_opts,
                      const NamespaceString& to_ns,
                      bool masterSameProcess,
-                     bool slaveOk,
-                     bool mayYield,
-                     bool mayBeInterrupted);
+                     bool slaveOk);
 
     struct Fun;
     std::unique_ptr<DBClientBase> _conn;
@@ -100,30 +95,22 @@ private:
  *  snapshot    - use snapshot mode for copying collections.  note this should not be used
  *                when it isn't required, as it will be slower.  for example,
  *                repairDatabase need not use it.
+ *  checkForCatalogChange - Internal option set for clone commands initiated by a mongos that are
+ *                holding a distributed lock (such as movePrimary).  Indicates that we need to
+ *                be periodically checking to see if the catalog manager has swapped and fail
+ *                if it has so that we don't block the mongos that initiated the command.
  */
 struct CloneOptions {
-    CloneOptions() {
-        slaveOk = false;
-        useReplAuth = false;
-        snapshot = true;
-        mayYield = true;
-        mayBeInterrupted = false;
-
-        syncData = true;
-        syncIndexes = true;
-    }
-
     std::string fromDB;
     std::set<std::string> collsToIgnore;
 
-    bool slaveOk;
-    bool useReplAuth;
-    bool snapshot;
-    bool mayYield;
-    bool mayBeInterrupted;
+    bool slaveOk = false;
+    bool useReplAuth = false;
+    bool snapshot = true;
 
-    bool syncData;
-    bool syncIndexes;
+    bool syncData = true;
+    bool syncIndexes = true;
+    bool checkForCatalogChange = false;
 };
 
 }  // namespace mongo

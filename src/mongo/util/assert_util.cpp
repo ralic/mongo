@@ -74,7 +74,7 @@ void AssertionCount::condrollover(int newvalue) {
         rollover();
 }
 
-bool DBException::traceExceptions = false;
+std::atomic<bool> DBException::traceExceptions(false);  // NOLINT
 
 string DBException::toString() const {
     stringstream ss;
@@ -90,9 +90,10 @@ void DBException::traceIfNeeded(const DBException& e) {
 }
 
 ErrorCodes::Error DBException::convertExceptionCode(int exCode) {
-    if (exCode == 0)
+    if (exCode == 0) {
         return ErrorCodes::UnknownError;
-    return static_cast<ErrorCodes::Error>(exCode);
+    }
+    return ErrorCodes::fromInt(exCode);
 }
 
 void ExceptionInfo::append(BSONObjBuilder& b, const char* m, const char* c) const {
@@ -159,10 +160,9 @@ NOINLINE_DECL void invariantOKFailed(const char* expr,
                                      unsigned line) {
     log() << "Invariant failure: " << expr << " resulted in status " << status << " at " << file
           << ' ' << dec << line;
-    logContext();
     breakpoint();
     log() << "\n\n***aborting after invariant() failure\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 }
 
 NOINLINE_DECL void fassertFailed(int msgid) {
@@ -181,10 +181,9 @@ NOINLINE_DECL void fassertFailedNoTrace(int msgid) {
 
 MONGO_COMPILER_NORETURN void fassertFailedWithStatus(int msgid, const Status& status) {
     log() << "Fatal assertion " << msgid << " " << status;
-    logContext();
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-    quickExit(EXIT_ABRUPT);
+    std::abort();
 }
 
 MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTrace(int msgid, const Status& status) {
@@ -218,7 +217,6 @@ void msgasserted(int msgid, const string& msg) {
 NOINLINE_DECL void msgasserted(int msgid, const char* msg) {
     assertionCount.condrollover(++assertionCount.warning);
     log() << "Assertion: " << msgid << ":" << msg << endl;
-    // breakpoint();
     logContext();
     throw MsgAssertionException(msgid, msg);
 }
@@ -249,19 +247,16 @@ std::string causedBy(const std::string& e) {
     return causedBy(e.c_str());
 }
 
-std::string causedBy(const std::string* e) {
-    return (e && *e != "") ? causedBy(*e) : "";
-}
-
 std::string causedBy(const Status& e) {
-    return causedBy(e.reason());
+    return causedBy(e.toString());
 }
 
-string errnoWithPrefix(const char* prefix) {
+string errnoWithPrefix(StringData prefix) {
+    const auto suffix = errnoWithDescription();
     stringstream ss;
-    if (prefix)
+    if (!prefix.empty())
         ss << prefix << ": ";
-    ss << errnoWithDescription();
+    ss << suffix;
     return ss.str();
 }
 

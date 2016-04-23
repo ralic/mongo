@@ -82,7 +82,7 @@ public:
 
     bool isEOF() final;
 
-    StageState work(WorkingSetID* out) final;
+    StageState doWork(WorkingSetID* out) final;
 
     void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
@@ -149,12 +149,6 @@ public:
     //
     // Used by explain.
     //
-
-    /**
-     * Gathers execution stats for all losing plans. Caller takes ownership of
-     * all pointers in the returned vector.
-     */
-    std::vector<PlanStageStats*> generateCandidateStats();
 
     static const char* kStageType;
 

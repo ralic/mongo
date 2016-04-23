@@ -28,15 +28,15 @@
 
 #pragma once
 
-#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
 
 namespace mongo {
 
 class ChunkManager;
+class ChunkType;
+class MigrationSecondaryThrottleOptions;
 class OperationContext;
-struct WriteConcernOptions;
 
 /**
    config.chunks
@@ -63,18 +63,14 @@ public:
         autoSplitInternal
     };
 
-    Chunk(OperationContext* txn, const ChunkManager* info, const ChunkType& from);
-    Chunk(const ChunkManager* info,
+    Chunk(OperationContext* txn, ChunkManager* manager, const ChunkType& from);
+
+    Chunk(ChunkManager* manager,
           const BSONObj& min,
           const BSONObj& max,
           const ShardId& shardId,
-          ChunkVersion lastmod = ChunkVersion());
-
-    //
-    // serialization support
-    //
-
-    void serialize(BSONObjBuilder& to, ChunkVersion myLastMod = ChunkVersion(0, 0, OID()));
+          ChunkVersion lastmod,
+          uint64_t initialDataWritten);
 
     //
     // chunk boundary support
@@ -83,6 +79,7 @@ public:
     const BSONObj& getMin() const {
         return _min;
     }
+
     const BSONObj& getMax() const {
         return _max;
     }
@@ -94,9 +91,6 @@ public:
     //  to a subset of fields).
     bool containsKey(const BSONObj& shardKey) const;
 
-    std::string genID() const;
-    static std::string genID(const std::string& ns, const BSONObj& min);
-
     //
     // chunk version support
     //
@@ -106,9 +100,6 @@ public:
     ChunkVersion getLastmod() const {
         return _lastmod;
     }
-    void setLastmod(ChunkVersion v) {
-        _lastmod = v;
-    }
 
     //
     // split support
@@ -117,18 +108,13 @@ public:
     long long getBytesWritten() const {
         return _dataWritten;
     }
-    // Const since _dataWritten is mutable and a heuristic
-    // TODO: Split data tracking and chunk information
-    void setBytesWritten(long long bytesWritten) const {
-        _dataWritten = bytesWritten;
-    }
 
     /**
      * if the amount of data written nears the max size of a shard
      * then we check the real size, and if its too big, we split
      * @return if something was split
      */
-    bool splitIfShould(OperationContext* txn, long dataWritten) const;
+    bool splitIfShould(OperationContext* txn, long dataWritten);
 
     /**
      * Splits this chunk at a non-specificed split key to be chosen by the
@@ -157,26 +143,6 @@ public:
                       const std::vector<BSONObj>& splitPoints,
                       BSONObj* res) const;
 
-    /**
-     * Asks the mongod holding this chunk to find a key that approximately divides this chunk in two
-     *
-     * @param medianKey the key that divides this chunk, if there is one, or empty
-     */
-    void pickMedianKey(OperationContext* txn, BSONObj& medianKey) const;
-
-    /**
-     * Ask the mongod holding this chunk to figure out the split points.
-     * @param splitPoints vector to be filled in
-     * @param chunkSize chunk size to target in bytes
-     * @param maxPoints limits the number of split points that are needed, zero is max (optional)
-     * @param maxObjs limits the number of objects in each chunk, zero is as max (optional)
-     */
-    void pickSplitVector(OperationContext* txn,
-                         std::vector<BSONObj>& splitPoints,
-                         long long chunkSize,
-                         int maxPoints = 0,
-                         int maxObjs = 0) const;
-
     //
     // migration support
     //
@@ -195,7 +161,7 @@ public:
     bool moveAndCommit(OperationContext* txn,
                        const ShardId& to,
                        long long chunkSize,
-                       const WriteConcernOptions* writeConcern,
+                       const MigrationSecondaryThrottleOptions& secondaryThrottle,
                        bool waitForDelete,
                        int maxTimeMS,
                        BSONObj& res) const;
@@ -210,25 +176,11 @@ public:
         return _jumbo;
     }
 
-    /**
-     * Attempt to refresh maximum chunk size from config.
-     */
-    static void refreshChunkSize(OperationContext* txn);
-
-    /**
-     * sets MaxChunkSize
-     * 1 <= newMaxChunkSize <= 1024
-     * @return true if newMaxChunkSize is valid and was set
-     */
-    static bool setMaxChunkSizeSizeMB(int newMaxChunkSize);
-
     //
     // public constants
     //
 
-    static long long MaxChunkSize;
-    static int MaxObjectPerChunk;
-    static bool ShouldAutoSplit;
+    static const int MaxObjectPerChunk{250000};
 
     //
     // accessors and helpers
@@ -269,12 +221,11 @@ private:
     BSONObj _min;
     BSONObj _max;
     ShardId _shardId;
-    ChunkVersion _lastmod;
+    const ChunkVersion _lastmod;
     mutable bool _jumbo;
 
-    // transient stuff
-
-    mutable long long _dataWritten;
+    // Statistics for the approximate data written by this chunk
+    uint64_t _dataWritten;
 
     // methods, etc..
 
@@ -297,9 +248,7 @@ private:
      * @param atMedian perform a single split at the middle of this chunk.
      * @param splitPoints out parameter containing the chosen split points. Can be empty.
      */
-    void determineSplitPoints(OperationContext* txn,
-                              bool atMedian,
-                              std::vector<BSONObj>* splitPoints) const;
+    std::vector<BSONObj> _determineSplitPoints(OperationContext* txn, bool atMedian) const;
 
     /**
      * initializes _dataWritten with a random value so that a mongos restart

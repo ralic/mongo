@@ -56,8 +56,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -92,7 +93,7 @@ public:
 
         auto status = grid.catalogCache()->getDatabase(txn, dbname);
         if (!status.isOK()) {
-            if (status == ErrorCodes::DatabaseNotFound) {
+            if (status == ErrorCodes::NamespaceNotFound) {
                 result.append("info", "database does not exist");
                 return true;
             }

@@ -28,7 +28,6 @@
 
 #pragma once
 
-
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/field_ref_set.h"
@@ -40,9 +39,6 @@ namespace mongo {
 
 class ChunkType;
 class MetadataLoader;
-class CollectionMetadata;
-
-typedef std::shared_ptr<const CollectionMetadata> CollectionMetadataPtr;
 
 /**
  * The collection metadata has metadata information about a collection, in particular the
@@ -60,45 +56,40 @@ class CollectionMetadata {
     MONGO_DISALLOW_COPYING(CollectionMetadata);
 
 public:
+    /**
+     * Use the MetadataLoader to fill the empty metadata from the config server, or use
+     * clone*() methods to use existing metadatas to build new ones.
+     *
+     * Unless you are the MetadataLoader or a test you should probably not be using this
+     * directly.
+     */
+    CollectionMetadata();
     ~CollectionMetadata();
-
-    //
-    // cloning support
-    //
 
     /**
      * Returns a new metadata's instance based on 'this's state by removing a 'pending' chunk.
      *
      * The shard and collection version of the new metadata are unaffected.  The caller owns the
      * new metadata.
-     *
-     * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-     * provided.
      */
-    CollectionMetadata* cloneMinusPending(const ChunkType& pending, std::string* errMsg) const;
+    std::unique_ptr<CollectionMetadata> cloneMinusPending(const ChunkType& chunk) const;
 
     /**
      * Returns a new metadata's instance based on 'this's state by adding a 'pending' chunk.
      *
      * The shard and collection version of the new metadata are unaffected.  The caller owns the
      * new metadata.
-     *
-     * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-     * provided.
      */
-    CollectionMetadata* clonePlusPending(const ChunkType& pending, std::string* errMsg) const;
+    std::unique_ptr<CollectionMetadata> clonePlusPending(const ChunkType& chunk) const;
 
     /**
-     * Returns a new metadata's instance based on 'this's state by removing 'chunk'.
-     * When cloning away the last chunk, 'newShardVersion' must be zero. In any case,
-     * the caller owns the new metadata when the cloning is successful.
+     * Returns a new metadata's instance based on 'this's state by removing 'chunk'. When cloning
+     * away the last chunk, the resulting metadata's shard version will be zero.
      *
-     * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-     * provided.
+     * The chunk to be migrated must exist, otherwise the call will fassert.
      */
-    CollectionMetadata* cloneMigrate(const ChunkType& chunk,
-                                     const ChunkVersion& newShardVersion,
-                                     std::string* errMsg) const;
+    std::unique_ptr<CollectionMetadata> cloneMigrate(
+        const ChunkType& chunk, const ChunkVersion& newCollectionVersion) const;
 
     /**
      * Returns a new metadata's instance by splitting an existing 'chunk' at the points
@@ -106,32 +97,25 @@ public:
      * subsequent one would have that with the minor version incremented at each chunk. The
      * caller owns the metadata.
      *
-     * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-     * provided.
+     * If a new metadata can't be created returns a failed status.
      *
      * Note: 'splitKeys' must be sorted in ascending order.
      */
-    CollectionMetadata* cloneSplit(const ChunkType& chunk,
-                                   const std::vector<BSONObj>& splitKeys,
-                                   const ChunkVersion& newShardVersion,
-                                   std::string* errMsg) const;
+    StatusWith<std::unique_ptr<CollectionMetadata>> cloneSplit(
+        const BSONObj& minKey,
+        const BSONObj& maxKey,
+        const std::vector<BSONObj>& splitKeys,
+        const ChunkVersion& newShardVersion) const;
 
     /**
      * Returns a new metadata instance by merging a key range which starts and ends at existing
-     * chunks into a single chunk.  The range may not have holes.  The resulting metadata will
-     * have the 'newShardVersion'.  The caller owns the new metadata.
+     *chunks into a single chunk. The range may not have holes. The resulting metadata will have the
+     *'newShardVersion'.
      *
-     * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-     * provided.
+     * If a new metadata can't be created, returns a failed status.
      */
-    CollectionMetadata* cloneMerge(const BSONObj& minKey,
-                                   const BSONObj& maxKey,
-                                   const ChunkVersion& newShardVersion,
-                                   std::string* errMsg) const;
-
-    //
-    // verification logic
-    //
+    StatusWith<std::unique_ptr<CollectionMetadata>> cloneMerge(
+        const BSONObj& minKey, const BSONObj& maxKey, const ChunkVersion& newShardVersion) const;
 
     /**
      * Returns true if the document key 'key' is a valid instance of a shard key for this
@@ -178,10 +162,6 @@ public:
      */
     bool getNextOrphanRange(const BSONObj& lookupKey, KeyRange* orphanRange) const;
 
-    //
-    // accessors
-    //
-
     ChunkVersion getCollVersion() const {
         return _collVersion;
     }
@@ -210,10 +190,6 @@ public:
         return _pendingMap.size();
     }
 
-    //
-    // reporting
-    //
-
     /**
      * BSON output of the metadata information.
      */
@@ -240,30 +216,18 @@ public:
     std::string toString() const;
 
     /**
-     * Use the MetadataLoader to fill the empty metadata from the config server, or use
-     * clone*() methods to use existing metadatas to build new ones.
+     * This method is used only for unit-tests and it returns a new metadata's instance based on
+     * 'this's state by adding 'chunk'. The new metadata can never be zero.
      *
-     * Unless you are the MetadataLoader or a test you should probably not be using this
-     * directly.
+     * It will fassert if the chunk bounds are incorrect or overlap an existing chunk.
      */
-    CollectionMetadata();
-
-    /**
-     * TESTING ONLY
-     *
-     * Returns a new metadata's instance based on 'this's state by adding 'chunk'. The new
-     * metadata can never be zero, though (see cloneMinus). The caller owns the new metadata.
-     *
-     * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-     * provided.
-     */
-    CollectionMetadata* clonePlusChunk(const ChunkType& chunk,
-                                       const ChunkVersion& newShardVersion,
-                                       std::string* errMsg) const;
+    std::unique_ptr<CollectionMetadata> clonePlusChunk(const BSONObj& minKey,
+                                                       const BSONObj& maxKey,
+                                                       const ChunkVersion& newShardVersion) const;
 
 private:
-    // Effectively, the MetadataLoader is this class's builder. So we open an exception
-    // and grant it friendship.
+    // Effectively, the MetadataLoader is this class's builder. So we open an exception and grant it
+    // friendship.
     friend class MetadataLoader;
 
     // a version for this collection that identifies the collection incarnation (ie, a

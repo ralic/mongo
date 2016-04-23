@@ -5,12 +5,16 @@ selector:
 
 executor:
   js_test:
+    config:
+      shell_options:
+        readMode: commands
     hooks:
+    - class: ValidateCollections
     - class: CleanEveryN
       n: 20
     fixture:
       class: MongoDFixture
       mongod_options:
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1
+          enableBSON1_1: 1

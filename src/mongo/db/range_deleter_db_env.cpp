@@ -40,8 +40,8 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/d_state.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -73,7 +73,7 @@ bool RangeDeleterDBEnv::deleteRange(OperationContext* txn,
     Client::initThreadIfNotAlready("RangeDeleter");
 
     *deletedDocs = 0;
-    ShardForceVersionOkModeBlock forceVersion(txn->getClient());
+    OperationShardingState::IgnoreVersioningBlock forceVersion(txn, NamespaceString(ns));
 
     Helpers::RemoveSaver removeSaver("moveChunk", ns, taskDetails.options.removeSaverReason);
     Helpers::RemoveSaver* removeSaverPtr = NULL;

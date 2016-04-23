@@ -42,17 +42,22 @@
 namespace mongo {
 
 class BtreeKeyGenerator;
+class CollatorInterface;
 
 // Parameters that must be provided to a SortStage
 class SortStageParams {
 public:
-    SortStageParams() : collection(NULL), limit(0) {}
+    SortStageParams() : collection(NULL), collator(NULL), limit(0) {}
 
     // Used for resolving RecordIds to BSON
     const Collection* collection;
 
     // How we're sorting.
     BSONObj pattern;
+
+    // Null if this sort stage orders strings according to simple binary compare. If non-null,
+    // represents the collator used to compare strings.
+    CollatorInterface* collator;
 
     // Equal to 0 for no limit.
     size_t limit;
@@ -75,7 +80,7 @@ public:
     ~SortStage();
 
     bool isEOF() final;
-    StageState work(WorkingSetID* out) final;
+    StageState doWork(WorkingSetID* out) final;
 
     void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
 
@@ -103,6 +108,10 @@ private:
     // The raw sort _pattern as expressed by the user
     BSONObj _pattern;
 
+    // Null if this sort stage orders strings according to simple binary compare. If non-null,
+    // represents the collator used to compare strings.
+    CollatorInterface* _collator;
+
     // Equal to 0 for no limit.
     size_t _limit;
 
@@ -121,19 +130,22 @@ private:
         // Since we must replicate the behavior of a covered sort as much as possible we use the
         // RecordId to break sortKey ties.
         // See sorta.js.
-        RecordId loc;
+        RecordId recordId;
     };
 
     // Comparison object for data buffers (vector and set).
     // Items are compared on (sortKey, loc). This is also how the items are
     // ordered in the indices.
-    // Keys are compared using BSONObj::woCompare() with RecordId as a tie-breaker.
+    // Keys are compared using BSONObj::woCompare() with RecordId as a tie-breaker. 'collator' is
+    // passed to woCompare() to perform string comparisons.
     struct WorkingSetComparator {
-        explicit WorkingSetComparator(BSONObj p);
+        explicit WorkingSetComparator(BSONObj p, CollatorInterface* collator);
 
         bool operator()(const SortableDataItem& lhs, const SortableDataItem& rhs) const;
 
         BSONObj pattern;
+
+        CollatorInterface* collator;
     };
 
     /**
@@ -170,7 +182,7 @@ private:
 
     // We buffer a lot of data and we want to look it up by RecordId quickly upon invalidation.
     typedef unordered_map<RecordId, WorkingSetID, RecordId::Hasher> DataMap;
-    DataMap _wsidByDiskLoc;
+    DataMap _wsidByRecordId;
 
     SortStats _specificStats;
 

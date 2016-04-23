@@ -64,12 +64,7 @@ bool ShardFilterStage::isEOF() {
     return child()->isEOF();
 }
 
-PlanStage::StageState ShardFilterStage::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
     // If we've returned as many results as we're limited to, isEOF will be true.
     if (isEOF()) {
         return PlanStage::IS_EOF;
@@ -121,12 +116,7 @@ PlanStage::StageState ShardFilterStage::work(WorkingSetID* out) {
 
         // If we're here either we have shard state and our doc passed, or we have no shard
         // state.  Either way, we advance.
-        ++_commonStats.advanced;
         return status;
-    } else if (PlanStage::NEED_TIME == status) {
-        ++_commonStats.needTime;
-    } else if (PlanStage::NEED_YIELD == status) {
-        ++_commonStats.needYield;
     }
 
     return status;
@@ -136,7 +126,7 @@ unique_ptr<PlanStageStats> ShardFilterStage::getStats() {
     _commonStats.isEOF = isEOF();
     unique_ptr<PlanStageStats> ret =
         make_unique<PlanStageStats>(_commonStats, STAGE_SHARDING_FILTER);
-    ret->children.push_back(child()->getStats().release());
+    ret->children.emplace_back(child()->getStats());
     ret->specific = make_unique<ShardingFilterStats>(_specificStats);
     return ret;
 }

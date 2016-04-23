@@ -36,12 +36,12 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/client/version_manager.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/stale_exception.h"
-#include "mongo/s/version_manager.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -93,7 +93,7 @@ public:
     virtual void help(stringstream& help) const {
         help << "stats about the shard connection pool";
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -115,10 +115,12 @@ public:
                      int options,
                      std::string& errmsg,
                      mongo::BSONObjBuilder& result) {
-        // Base pool info
-        shardConnectionPool.appendInfo(result);
+        // Connection information
+        executor::ConnectionPoolStats stats{};
+        shardConnectionPool.appendConnectionStats(&stats);
+        stats.appendToBSON(result);
 
-        // Thread connection info
+        // Thread connection information
         activeClientConnections.appendInfo(result);
 
         return true;
@@ -267,15 +269,6 @@ public:
         // see the s->avail connection of other threads.
 
         s->avail = conn;
-    }
-
-    void sync() {
-        for (HostMap::iterator i = _hosts.begin(); i != _hosts.end(); ++i) {
-            string addr = i->first;
-            Status* ss = i->second;
-            if (ss->avail)
-                ss->avail->getLastError();
-        }
     }
 
     void checkVersions(OperationContext* txn, const string& ns) {
@@ -485,10 +478,6 @@ void ShardConnection::kill() {
         _conn = 0;
         _finishedInit = true;
     }
-}
-
-void ShardConnection::sync() {
-    ClientConnections::threadInstance()->sync();
 }
 
 void ShardConnection::checkMyConnectionVersions(OperationContext* txn, const string& ns) {

@@ -35,6 +35,7 @@
 namespace mongo {
 
 using DistLockHandle = OID;
+class OperationContext;
 class Status;
 template <typename T>
 class StatusWith;
@@ -60,7 +61,15 @@ class StatusWith;
  */
 class DistLockManager {
 public:
-    static const stdx::chrono::milliseconds kDefaultSingleLockAttemptTimeout;
+    // Default timeout which will be used if one is not passed to the lock method.
+    static const stdx::chrono::seconds kDefaultLockTimeout;
+
+    // Timeout value, which specifies that if the lock is not available immediately, no attempt
+    // should be made to wait for it to become free.
+    static const stdx::chrono::milliseconds kSingleLockAttemptTimeout;
+
+    // If timeout is passed to the lock call, what is the default frequency with which the lock will
+    // be checked for availability.
     static const stdx::chrono::milliseconds kDefaultLockRetryInterval;
 
     /**
@@ -70,7 +79,9 @@ public:
         MONGO_DISALLOW_COPYING(ScopedDistLock);
 
     public:
-        ScopedDistLock(DistLockHandle lockHandle, DistLockManager* lockManager);
+        ScopedDistLock(OperationContext* txn,
+                       DistLockHandle lockHandle,
+                       DistLockManager* lockManager);
         ~ScopedDistLock();
 
         ScopedDistLock(ScopedDistLock&& other);
@@ -82,6 +93,7 @@ public:
         Status checkStatus();
 
     private:
+        OperationContext* _txn;
         DistLockHandle _lockID;
         DistLockManager* _lockManager;  // Not owned here.
     };
@@ -95,11 +107,15 @@ public:
     virtual void startUp() = 0;
 
     /**
-     * Cleanup the manager's resources. Pass false to allowNetworking in order to do work that
-     * involves sending network messages. Implementation do not need to guarantee thread safety
+     * Cleanup the manager's resources. Implementations do not need to guarantee thread safety
      * so callers should employ proper synchronization when calling this method.
      */
-    virtual void shutDown(bool allowNetworking) = 0;
+    virtual void shutDown(OperationContext* txn) = 0;
+
+    /**
+     * Returns the process ID for this DistLockManager.
+     */
+    virtual std::string getProcessID() = 0;
 
     /**
      * Tries multiple times to lock, using the specified lock try interval, until
@@ -115,21 +131,45 @@ public:
      * Returns ErrorCodes::LockBusy if the lock is being held.
      */
     virtual StatusWith<ScopedDistLock> lock(
+        OperationContext* txn,
         StringData name,
         StringData whyMessage,
-        stdx::chrono::milliseconds waitFor = kDefaultSingleLockAttemptTimeout,
+        stdx::chrono::milliseconds waitFor = kDefaultLockTimeout,
         stdx::chrono::milliseconds lockTryInterval = kDefaultLockRetryInterval) = 0;
+
+    /**
+     * Same behavior as lock(...) above, except takes a specific lock session ID "lockSessionID"
+     * instead of randomly generating one internally.
+     *
+     * This is useful for a process running on the config primary after a failover. A lock can be
+     * immediately reacquired if "lockSessionID" matches that of the lock, rather than waiting for
+     * the inactive lock to expire.
+     */
+    virtual StatusWith<ScopedDistLock> lockWithSessionID(
+        OperationContext* txn,
+        StringData name,
+        StringData whyMessage,
+        const OID lockSessionID,
+        stdx::chrono::milliseconds waitFor = kDefaultLockTimeout,
+        stdx::chrono::milliseconds lockTryInterval = kDefaultLockRetryInterval) = 0;
+
+    /**
+     * Makes a best-effort attempt to unlock all locks owned by the given processID.
+     * Only implemented for the ReplSetDistLockManager and only used after catalog manager swap
+     * during upgrade to CSRS.
+     */
+    virtual void unlockAll(OperationContext* txn, const std::string& processID) = 0;
 
 protected:
     /**
      * Unlocks the given lockHandle. Will attempt to retry again later if the config
      * server is not reachable.
      */
-    virtual void unlock(const DistLockHandle& lockHandle) = 0;
+    virtual void unlock(OperationContext* txn, const DistLockHandle& lockHandle) = 0;
 
     /**
      * Checks if the lockHandle still exists in the config server.
      */
-    virtual Status checkStatus(const DistLockHandle& lockHandle) = 0;
+    virtual Status checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) = 0;
 };
 }

@@ -37,7 +37,7 @@
 #include "mongo/rpc/metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/assert_util.h"
 
@@ -169,10 +169,10 @@ rpc::UniqueReply MockRemoteDBServer::runCommandWithMetadata(MockRemoteDBServer::
     // We need to construct a reply message - it will always be read through a view so it
     // doesn't matter whether we use CommandReplBuilder or LegacyReplyBuilder
     auto message = rpc::CommandReplyBuilder{}
-                       .setMetadata(rpc::makeEmptyMetadata())
                        .setCommandReply(reply)
+                       .setMetadata(rpc::makeEmptyMetadata())
                        .done();
-    auto replyView = stdx::make_unique<rpc::CommandReply>(message.get());
+    auto replyView = stdx::make_unique<rpc::CommandReply>(&message);
     return rpc::UniqueReply(std::move(message), std::move(replyView));
 }
 

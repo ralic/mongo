@@ -42,6 +42,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/scopeguard.h"
@@ -79,8 +80,11 @@ public:
     void closeAll(unsigned skip_mask) {
         stdx::lock_guard<stdx::mutex> bl(m);
         for (std::set<MessagingPort*>::iterator i = ports.begin(); i != ports.end(); i++) {
-            if ((*i)->tag & skip_mask)
+            if ((*i)->tag & skip_mask) {
+                LOG(3) << "Skip closing connection # " << (*i)->connectionId();
                 continue;
+            }
+            LOG(3) << "Closing connection # " << (*i)->connectionId();
             (*i)->shutdown();
         }
     }
@@ -102,16 +106,15 @@ void MessagingPort::closeAllSockets(unsigned mask) {
     ports.closeAll(mask);
 }
 
-MessagingPort::MessagingPort(int fd, const SockAddr& remote) : psock(new Socket(fd, remote)) {
-    ports.insert(this);
-}
+MessagingPort::MessagingPort(int fd, const SockAddr& remote)
+    : MessagingPort(std::make_shared<Socket>(fd, remote)) {}
 
 MessagingPort::MessagingPort(double timeout, logger::LogSeverity ll)
-    : psock(new Socket(timeout, ll)) {
-    ports.insert(this);
-}
+    : MessagingPort(std::make_shared<Socket>(timeout, ll)) {}
 
-MessagingPort::MessagingPort(std::shared_ptr<Socket> sock) : psock(sock) {
+MessagingPort::MessagingPort(std::shared_ptr<Socket> sock) : psock(std::move(sock)) {
+    SockAddr sa = psock->remoteAddr();
+    _remoteParsed = HostAndPort(sa.getAddr(), sa.getPort());
     ports.insert(this);
 }
 
@@ -155,14 +158,14 @@ bool MessagingPort::recv(Message& m) {
         // If responseTo is not 0 or -1 for first packet assume SSL
         else if (psock->isAwaitingHandshake()) {
 #ifndef MONGO_CONFIG_SSL
-            if (header.constView().getResponseTo() != 0 &&
-                header.constView().getResponseTo() != -1) {
+            if (header.constView().getResponseToMsgId() != 0 &&
+                header.constView().getResponseToMsgId() != -1) {
                 uasserted(17133,
                           "SSL handshake requested, SSL feature not available in this build");
             }
 #else
-            if (header.constView().getResponseTo() != 0 &&
-                header.constView().getResponseTo() != -1) {
+            if (header.constView().getResponseToMsgId() != 0 &&
+                header.constView().getResponseToMsgId() != -1) {
                 uassert(17132,
                         "SSL handshake received but server is started without SSL support",
                         sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled);
@@ -213,8 +216,8 @@ void MessagingPort::reply(Message& received, Message& response) {
     say(/*received.from, */ response, received.header().getId());
 }
 
-void MessagingPort::reply(Message& received, Message& response, MSGID responseTo) {
-    say(/*received.from, */ response, responseTo);
+void MessagingPort::reply(Message& received, Message& response, int32_t responseToMsgId) {
+    say(/*received.from, */ response, responseToMsgId);
 }
 
 bool MessagingPort::call(Message& toSend, Message& response) {
@@ -229,15 +232,14 @@ bool MessagingPort::recv(const Message& toSend, Message& response) {
             mmm(log() << "recv not ok" << endl;) return false;
         }
         // log() << "got response: " << response.data->responseTo << endl;
-        if (response.header().getResponseTo() == toSend.header().getId())
+        if (response.header().getResponseToMsgId() == toSend.header().getId())
             break;
         error() << "MessagingPort::call() wrong id got:" << std::hex
-                << (unsigned)response.header().getResponseTo()
-                << " expect:" << (unsigned)toSend.header().getId() << '\n' << std::dec
-                << "  toSend op: " << (unsigned)toSend.operation() << '\n'
+                << response.header().getResponseToMsgId() << " expect:" << toSend.header().getId()
+                << '\n' << std::dec << "  toSend op: " << (unsigned)toSend.operation() << '\n'
                 << "  response msgid:" << (unsigned)response.header().getId() << '\n'
                 << "  response len:  " << (unsigned)response.header().getLen() << '\n'
-                << "  response op:  " << response.operation() << '\n'
+                << "  response op:  " << static_cast<int>(response.operation()) << '\n'
                 << "  remote: " << psock->remoteString();
         verify(false);
         response.reset();
@@ -249,15 +251,11 @@ void MessagingPort::say(Message& toSend, int responseTo) {
     verify(!toSend.empty());
     mmm(log() << "*  say()  thr:" << GetCurrentThreadId() << endl;)
         toSend.header().setId(nextMessageId());
-    toSend.header().setResponseTo(responseTo);
+    toSend.header().setResponseToMsgId(responseTo);
     toSend.send(*this, "say");
 }
 
 HostAndPort MessagingPort::remote() const {
-    if (!_remoteParsed.hasPort()) {
-        SockAddr sa = psock->remoteAddr();
-        _remoteParsed = HostAndPort(sa.getAddr(), sa.getPort());
-    }
     return _remoteParsed;
 }
 

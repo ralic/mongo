@@ -39,6 +39,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/pipeline_proxy.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
@@ -50,8 +51,10 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -86,21 +89,25 @@ static bool handleCursorCommand(OperationContext* txn,
 
     // can't use result BSONObjBuilder directly since it won't handle exceptions correctly.
     BSONArrayBuilder resultsArray;
-    const int byteLimit = FindCommon::kMaxBytesToReturnToClientAtOnce;
     BSONObj next;
     for (int objCount = 0; objCount < batchSize; objCount++) {
         // The initial getNext() on a PipelineProxyStage may be very expensive so we don't
         // do it when batchSize is 0 since that indicates a desire for a fast return.
-        if (exec->getNext(&next, NULL) != PlanExecutor::ADVANCED) {
+        PlanExecutor::ExecState state;
+        if ((state = exec->getNext(&next, NULL)) == PlanExecutor::IS_EOF) {
             // make it an obvious error to use cursor or executor after this point
             cursor = NULL;
             exec = NULL;
             break;
         }
 
-        // If adding this object will cause us to exceed the BSON size limit, then we stash it for
-        // later.
-        if (resultsArray.len() + next.objsize() > byteLimit) {
+        uassert(34426,
+                "Plan executor error during aggregation: " + WorkingSetCommon::toStatusString(next),
+                PlanExecutor::ADVANCED == state);
+
+        // If adding this object will cause us to exceed the message size limit, then we stash it
+        // for later.
+        if (!FindCommon::haveSpaceForNext(next, objCount, resultsArray.len())) {
             exec->enqueue(next);
             break;
         }
@@ -149,8 +156,8 @@ public:
     PipelineCommand() : Command(Pipeline::commandName) {}  // command is called "aggregate"
 
     // Locks are managed manually, in particular by DocumentSourceCursor.
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return Pipeline::aggSupportsWriteConcern(cmd);
     }
     virtual bool slaveOk() const {
         return false;
@@ -197,6 +204,11 @@ public:
         if (!pPipeline.get())
             return false;
 
+        // Save and reset the write concern so that it doesn't get changed accidentally by
+        // DBDirectClient.
+        auto oldWC = txn->getWriteConcern();
+        ON_BLOCK_EXIT([txn, oldWC] { txn->setWriteConcern(oldWC); });
+
         // This is outside of the if block to keep the object alive until the pipeline is finished.
         BSONObj parsed;
         if (kDebugBuild && !pPipeline->isExplain() && !pCtx->inShard) {
@@ -225,8 +237,22 @@ public:
             // This does mongod-specific stuff like creating the input PlanExecutor and adding
             // it to the front of the pipeline if needed.
             std::shared_ptr<PlanExecutor> input =
-                PipelineD::prepareCursorSource(txn, collection, pPipeline, pCtx);
+                PipelineD::prepareCursorSource(txn, collection, nss, pPipeline, pCtx);
             pPipeline->stitch();
+
+            if (collection && input) {
+                // Record the indexes used by the input executor. Retrieval of summary stats for a
+                // PlanExecutor is normally done post execution. DocumentSourceCursor however will
+                // destroy the input PlanExecutor once the result set has been exhausted. For
+                // that reason we need to collect the indexes used prior to plan execution.
+                PlanSummaryStats stats;
+                Explain::getSummaryStats(*input, &stats);
+                collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
+
+                // TODO SERVER-23265: Confirm whether this is the correct place to gather all
+                // metrics. There is no harm adding here for the time being.
+                CurOp::get(txn)->debug().setPlanSummaryMetrics(stats);
+            }
 
             // Create the PlanExecutor which returns results from the pipeline. The WorkingSet
             // ('ws') and the PipelineProxyStage ('proxy') will be owned by the created

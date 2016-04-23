@@ -204,8 +204,7 @@ Status checkAuthForCreateRoleCommand(ClientBasic* client,
         return status;
     }
 
-    if (!authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forDatabaseName(args.roleName.getDB()), ActionType::createRole)) {
+    if (!authzSession->isAuthorizedToCreateRole(args)) {
         return Status(ErrorCodes::Unauthorized,
                       str::stream()
                           << "Not authorized to create roles on db: " << args.roleName.getDB());
@@ -522,6 +521,14 @@ Status checkAuthForMergeAuthzCollectionsCommand(ClientBasic* client, const BSONO
     return Status::OK();
 }
 
+Status checkAuthForAuthSchemaUpgradeCommand(ClientBasic* client) {
+    AuthorizationSession* authzSession = AuthorizationSession::get(client);
+    if (!authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                        ActionType::authSchemaUpgrade)) {
+        return Status(ErrorCodes::Unauthorized, "Not authorized to run authSchemaUpgrade command.");
+    }
+    return Status::OK();
+}
 
 }  // namespace auth
 }  // namespace mongo

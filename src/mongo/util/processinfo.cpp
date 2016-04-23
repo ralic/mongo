@@ -58,6 +58,15 @@ public:
         path = p;
         ofstream out(path.c_str(), ios_base::out);
         out << ProcessId::getCurrent() << endl;
+        if (!out.good()) {
+            auto errAndStr = errnoAndDescription();
+            if (errAndStr.first == 0) {
+                log() << "ERROR: Cannot write pid file to " << path
+                      << ": Unable to determine OS error";
+            } else {
+                log() << "ERROR: Cannot write pid file to " << path << ": " << errAndStr.second;
+            }
+        }
         return out.good();
     }
 
@@ -65,11 +74,7 @@ public:
 } pidFileWiper;
 
 bool writePidFile(const string& path) {
-    bool e = pidFileWiper.write(path);
-    if (!e) {
-        log() << "ERROR: Cannot write pid file to " << path << ": " << strerror(errno);
-    }
-    return e;
+    return pidFileWiper.write(path);
 }
 
 ProcessInfo::SystemInfo* ProcessInfo::systemInfo = NULL;
@@ -80,7 +85,13 @@ void ProcessInfo::initializeSystemInfo() {
     }
 }
 
-MONGO_INITIALIZER(SystemInfo)(InitializerContext* context) {
+/**
+ * We need this get the system page size for the secure allocator, which the enterprise modules need
+ * for storage for command line parameters.
+ */
+MONGO_INITIALIZER_GENERAL(SystemInfo,
+                          MONGO_NO_PREREQUISITES,
+                          MONGO_NO_DEPENDENTS)(InitializerContext* context) {
     ProcessInfo::initializeSystemInfo();
     return Status::OK();
 }

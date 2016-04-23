@@ -75,7 +75,6 @@ public:
         _secOkCmdList.insert("find");
         _secOkCmdList.insert("geoNear");
         _secOkCmdList.insert("geoSearch");
-        _secOkCmdList.insert("geoWalk");
         _secOkCmdList.insert("group");
     }
 } _populateReadPrefSecOkCmdList;
@@ -198,6 +197,14 @@ void DBClientReplicaSet::setReplyMetadataReader(rpc::ReplyMetadataReader reader)
     DBClientWithCommands::setReplyMetadataReader(std::move(reader));
 }
 
+int DBClientReplicaSet::getMinWireVersion() {
+    return _getMonitor()->getMinWireVersion();
+}
+
+int DBClientReplicaSet::getMaxWireVersion() {
+    return _getMonitor()->getMaxWireVersion();
+}
+
 // A replica set connection is never disconnected, since it controls its own reconnection
 // logic.
 //
@@ -229,7 +236,7 @@ bool _isSecondaryCommand(StringData commandName, const BSONObj& commandArgs) {
         }
 
         BSONElement outElem(commandArgs["out"]);
-        if (outElem.isABSONObj() && outElem["inline"].trueValue()) {
+        if (outElem.isABSONObj() && outElem["inline"].ok()) {
             return true;
         }
     }
@@ -303,7 +310,7 @@ DBClientConnection* DBClientReplicaSet::checkMaster() {
 
     if (newConn == NULL || !errmsg.empty()) {
         monitor->failedHost(_masterHost);
-        uasserted(13639,
+        uasserted(ErrorCodes::FailedToSatisfyReadPreference,
                   str::stream() << "can't connect to new replica set master ["
                                 << _masterHost.toString() << "]"
                                 << (errmsg.empty() ? "" : ", err: ") << errmsg);
@@ -317,7 +324,7 @@ DBClientConnection* DBClientReplicaSet::checkMaster() {
     _master->setRequestMetadataWriter(getRequestMetadataWriter());
     _master->setReplyMetadataReader(getReplyMetadataReader());
 
-    _auth(_master.get());
+    _authConnection(_master.get());
     return _master.get();
 }
 
@@ -341,7 +348,7 @@ bool DBClientReplicaSet::checkLastHost(const ReadPreferenceSetting* readPref) {
     return true;
 }
 
-void DBClientReplicaSet::_auth(DBClientConnection* conn) {
+void DBClientReplicaSet::_authConnection(DBClientConnection* conn) {
     for (map<string, BSONObj>::const_iterator i = _auths.begin(); i != _auths.end(); ++i) {
         try {
             conn->auth(i->second);
@@ -384,7 +391,7 @@ DBClientConnection& DBClientReplicaSet::slaveConn() {
 bool DBClientReplicaSet::connect() {
     // Returns true if there are any up hosts.
     const ReadPreferenceSetting anyUpHost(ReadPreference::Nearest, TagSet());
-    return !_getMonitor()->getHostOrRefresh(anyUpHost).empty();
+    return _getMonitor()->getHostOrRefresh(anyUpHost).isOK();
 }
 
 static bool isAuthenticationException(const DBException& ex) {
@@ -629,7 +636,7 @@ unique_ptr<DBClientCursor> DBClientReplicaSet::checkSlaveQueryResult(
 
     // If the error code here ever changes, we need to change this code also
     BSONElement code = error["code"];
-    if (code.isNumber() && code.Int() == NotMasterOrSecondaryCode /* not master or secondary */) {
+    if (code.isNumber() && code.Int() == ErrorCodes::NotMasterOrSecondary) {
         isntSecondary();
         throw DBException(str::stream() << "slave " << _lastSlaveOkHost.toString()
                                         << " is no longer secondary",
@@ -650,19 +657,21 @@ void DBClientReplicaSet::isntSecondary() {
 DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
     shared_ptr<ReadPreferenceSetting> readPref) {
     if (checkLastHost(readPref.get())) {
-        LOG(3) << "dbclient_rs selecting compatible last used node " << _lastSlaveOkHost << endl;
+        LOG(3) << "dbclient_rs selecting compatible last used node " << _lastSlaveOkHost;
 
         return _lastSlaveOkConn.get();
     }
 
     ReplicaSetMonitorPtr monitor = _getMonitor();
-    HostAndPort selectedNode = monitor->getHostOrRefresh(*readPref);
 
-    if (selectedNode.empty()) {
-        LOG(3) << "dbclient_rs no compatible node found" << endl;
-
-        return NULL;
+    auto selectedNodeStatus = monitor->getHostOrRefresh(*readPref);
+    if (!selectedNodeStatus.isOK()) {
+        LOG(3) << "dbclient_rs no compatible node found"
+               << causedBy(selectedNodeStatus.getStatus());
+        return nullptr;
     }
+
+    const HostAndPort selectedNode = std::move(selectedNodeStatus.getValue());
 
     // We are now about to get a new connection from the pool, so cleanup
     // the current one and release it back to the pool.
@@ -703,7 +712,7 @@ DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
     _lastSlaveOkConn->setReplyMetadataReader(getReplyMetadataReader());
 
     if (_authPooledSecondaryConn) {
-        _auth(_lastSlaveOkConn.get());
+        _authConnection(_lastSlaveOkConn.get());
     } else {
         // Mongos pooled connections are authenticated through
         // ShardingConnectionHook::onCreate().
@@ -847,7 +856,7 @@ void DBClientReplicaSet::checkResponse(const char* data,
 
         if (nReturned == -1 /* no result, maybe network problem */ ||
             (hasErrField(dataObj) && !dataObj["code"].eoo() &&
-             dataObj["code"].Int() == NotMasterOrSecondaryCode)) {
+             dataObj["code"].Int() == ErrorCodes::NotMasterOrSecondary)) {
             if (_lazyState._lastClient == _lastSlaveOkConn.get()) {
                 isntSecondary();
             } else if (_lazyState._lastClient == _master.get()) {
@@ -871,7 +880,7 @@ void DBClientReplicaSet::checkResponse(const char* data,
 
         if (nReturned == -1 /* no result, maybe network problem */ ||
             (hasErrField(dataObj) && !dataObj["code"].eoo() &&
-             dataObj["code"].Int() == NotMasterNoSlaveOkCode)) {
+             dataObj["code"].Int() == ErrorCodes::NotMasterNoSlaveOk)) {
             if (_lazyState._lastClient == _master.get()) {
                 isntMaster();
             }
@@ -890,7 +899,8 @@ rpc::UniqueReply DBClientReplicaSet::runCommandWithMetadata(StringData database,
     // so we don't have to re-parse it, however, that will come with its own set of
     // complications (e.g. some kind of base class or concept for MetadataSerializable
     // objects). For now we do it the stupid way.
-    auto ssm = uassertStatusOK(rpc::ServerSelectionMetadata::readFromMetadata(metadata));
+    auto ssm = uassertStatusOK(rpc::ServerSelectionMetadata::readFromMetadata(
+        metadata.getField(rpc::ServerSelectionMetadata::fieldName())));
 
     // If we didn't get a readPref with this query, we assume SecondaryPreferred if secondaryOk
     // is true, and PrimaryOnly otherwise. This logic is replicated from _extractReadPref.
@@ -963,7 +973,7 @@ bool DBClientReplicaSet::call(Message& toSend,
                         *actualServer = conn->getServerAddress();
                     }
 
-                    return conn->call(toSend, response, assertOk);
+                    return conn->call(toSend, response, assertOk, nullptr);
                 } catch (const DBException& dbExcep) {
                     LOG(1) << "can't call replica set node " << _lastSlaveOkHost << ": "
                            << causedBy(dbExcep) << endl;
@@ -986,7 +996,7 @@ bool DBClientReplicaSet::call(Message& toSend,
     if (actualServer)
         *actualServer = m->getServerAddress();
 
-    if (!m->call(toSend, response, assertOk))
+    if (!m->call(toSend, response, assertOk, nullptr))
         return false;
 
     if (ns) {
@@ -1052,4 +1062,5 @@ void DBClientReplicaSet::resetSlaveOkConn() {
 
     _lastSlaveOkHost = HostAndPort();
 }
-}
+
+}  // namespace mongo

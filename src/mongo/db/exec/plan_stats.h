@@ -106,12 +106,6 @@ private:
 struct PlanStageStats {
     PlanStageStats(const CommonStats& c, StageType t) : stageType(t), common(c) {}
 
-    ~PlanStageStats() {
-        for (size_t i = 0; i < children.size(); ++i) {
-            delete children[i];
-        }
-    }
-
     /**
      * Make a deep copy.
      */
@@ -122,7 +116,7 @@ struct PlanStageStats {
         }
         for (size_t i = 0; i < children.size(); ++i) {
             invariant(children[i]);
-            stats->children.push_back(children[i]->clone());
+            stats->children.emplace_back(children[i]->clone());
         }
         return stats;
     }
@@ -137,7 +131,7 @@ struct PlanStageStats {
     std::unique_ptr<SpecificStats> specific;
 
     // The stats of the node's children.
-    std::vector<PlanStageStats*> children;
+    std::vector<std::unique_ptr<PlanStageStats>> children;
 
 private:
     MONGO_DISALLOW_COPYING(PlanStageStats);
@@ -189,11 +183,13 @@ struct AndSortedStats : public SpecificStats {
 };
 
 struct CachedPlanStats : public SpecificStats {
-    CachedPlanStats() {}
+    CachedPlanStats() : replanned(false) {}
 
     SpecificStats* clone() const final {
         return new CachedPlanStats(*this);
     }
+
+    bool replanned;
 };
 
 struct CollectionScanStats : public SpecificStats {
@@ -213,7 +209,7 @@ struct CollectionScanStats : public SpecificStats {
 };
 
 struct CountStats : public SpecificStats {
-    CountStats() : nCounted(0), nSkipped(0), trivialCount(false) {}
+    CountStats() : nCounted(0), nSkipped(0), recordStoreCount(false) {}
 
     SpecificStats* clone() const final {
         CountStats* specific = new CountStats(*this);
@@ -226,9 +222,8 @@ struct CountStats : public SpecificStats {
     // The number of results we skipped over.
     long long nSkipped;
 
-    // A "trivial count" is one that we can answer by calling numRecords() on the
-    // collection, without actually going through any query logic.
-    bool trivialCount;
+    // True if we computed the count via Collection::numRecords().
+    bool recordStoreCount;
 };
 
 struct CountScanStats : public SpecificStats {
@@ -304,6 +299,18 @@ struct DistinctScanStats : public SpecificStats {
     BSONObj indexBounds;
 };
 
+struct EnsureSortedStats : public SpecificStats {
+    EnsureSortedStats() : nDropped(0) {}
+
+    SpecificStats* clone() const final {
+        EnsureSortedStats* specific = new EnsureSortedStats(*this);
+        return specific;
+    }
+
+    // The number of out-of-order results that were dropped.
+    long long nDropped;
+};
+
 struct FetchStats : public SpecificStats {
     FetchStats() : alreadyHasObj(0), forcedFetches(0), docsExamined(0) {}
 
@@ -342,6 +349,8 @@ struct IDHackStats : public SpecificStats {
         return specific;
     }
 
+    std::string indexName;
+
     // Number of entries retrieved from the index while executing the idhack.
     size_t keysExamined;
 
@@ -360,7 +369,8 @@ struct IndexScanStats : public SpecificStats {
           dupsTested(0),
           dupsDropped(0),
           seenInvalidated(0),
-          keysExamined(0) {}
+          keysExamined(0),
+          seeks(0) {}
 
     SpecificStats* clone() const final {
         IndexScanStats* specific = new IndexScanStats(*this);
@@ -403,6 +413,9 @@ struct IndexScanStats : public SpecificStats {
 
     // Number of entries retrieved from the index during the scan.
     size_t keysExamined;
+
+    // Number of times the index cursor is re-positioned during the execution of the scan.
+    size_t seeks;
 };
 
 struct LimitStats : public SpecificStats {
@@ -433,7 +446,7 @@ struct MultiPlanStats : public SpecificStats {
 };
 
 struct OrStats : public SpecificStats {
-    OrStats() : dupsTested(0), dupsDropped(0), locsForgotten(0) {}
+    OrStats() : dupsTested(0), dupsDropped(0), recordIdsForgotten(0) {}
 
     SpecificStats* clone() const final {
         OrStats* specific = new OrStats(*this);
@@ -444,7 +457,7 @@ struct OrStats : public SpecificStats {
     size_t dupsDropped;
 
     // How many calls to invalidate(...) actually removed a RecordId from our deduping map?
-    size_t locsForgotten;
+    size_t recordIdsForgotten;
 };
 
 struct ProjectionStats : public SpecificStats {
@@ -537,9 +550,8 @@ struct IntervalStats {
     bool inclusiveMaxDistanceAllowed = false;
 };
 
-class NearStats : public SpecificStats {
-public:
-    NearStats() {}
+struct NearStats : public SpecificStats {
+    NearStats() : indexVersion(0) {}
 
     SpecificStats* clone() const final {
         return new NearStats(*this);
@@ -547,6 +559,8 @@ public:
 
     std::vector<IntervalStats> intervalStats;
     std::string indexName;
+    // btree index version, not geo index version
+    int indexVersion;
     BSONObj keyPattern;
 };
 
@@ -596,7 +610,7 @@ struct UpdateStats : public SpecificStats {
 };
 
 struct TextStats : public SpecificStats {
-    TextStats() : parsedTextQuery() {}
+    TextStats() : parsedTextQuery(), textIndexVersion(0) {}
 
     SpecificStats* clone() const final {
         TextStats* specific = new TextStats(*this);
@@ -607,6 +621,8 @@ struct TextStats : public SpecificStats {
 
     // Human-readable form of the FTSQuery associated with the text stage.
     BSONObj parsedTextQuery;
+
+    int textIndexVersion;
 
     // Index keys that precede the "text" index key.
     BSONObj indexPrefix;

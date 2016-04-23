@@ -31,6 +31,7 @@
 #include <string>
 #include <map>
 #include <utility>
+#include <vector>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
@@ -46,6 +47,7 @@ using std::string;
 using std::pair;
 using std::make_pair;
 using std::map;
+using std::vector;
 
 // Generates pseudorandom values
 PseudoRandom rand(1);
@@ -91,10 +93,10 @@ public:
 /**
  * Converts array of raw BSONObj chunks to a vector of ChunkType.
  */
-void convertBSONArrayToChunkTypes(const BSONArray& chunksArray,
+void convertBSONArrayToChunkTypes(const vector<BSONObj>& chunksArray,
                                   std::vector<ChunkType>* chunksVector) {
-    for (const BSONElement& obj : chunksArray) {
-        auto chunkTypeRes = ChunkType::fromBSON(obj.Obj());
+    for (const BSONObj& obj : chunksArray) {
+        auto chunkTypeRes = ChunkType::fromBSON(obj);
         ASSERT(chunkTypeRes.isOK());
         chunksVector->push_back(chunkTypeRes.getValue());
     }
@@ -109,7 +111,6 @@ protected:
     ~ChunkDiffUnitTest() = default;
 
     void runTest(bool isInverse) {
-        OperationContextNoop txn;
         int numShards = 10;
         int numInitialChunks = 5;
 
@@ -117,7 +118,7 @@ protected:
         int maxChunks = 100000;
         int keySize = 2;
 
-        BSONArrayBuilder chunksB;
+        vector<BSONObj> chunksB;
 
         BSONObj lastSplitPt;
         ChunkVersion version(1, 0, OID());
@@ -153,13 +154,13 @@ protected:
                 rand(2) ? version.incMajor() : version.incMinor();
                 version.addToBSON(chunkB, ChunkType::DEPRECATED_lastmod());
 
-                chunksB.append(chunkB.obj());
+                chunksB.push_back(chunkB.obj());
             }
 
             lastSplitPt = splitPt;
         }
 
-        BSONArray chunks = chunksB.arr();
+        vector<BSONObj> chunks(std::move(chunksB));
 
         // Setup the empty ranges and versions first
         RangeMap ranges;
@@ -175,7 +176,7 @@ protected:
         convertBSONArrayToChunkTypes(chunks, &chunksVector);
 
         // Validate initial load
-        differ->calculateConfigDiff(&txn, chunksVector);
+        differ->calculateConfigDiff(nullptr, chunksVector);
         validate(isInverse, chunksVector, ranges, maxVersion, maxShardVersions);
 
         // Generate a lot of diffs, and keep validating that updating from the diffs always gives us
@@ -186,12 +187,13 @@ protected:
         int numChunks = numInitialChunks;
 
         for (int i = 0; i < numDiffs; i++) {
-            BSONArrayBuilder diffsB;
-            BSONArrayBuilder newChunksB;
-            BSONObjIterator chunksIt(chunks);
+            vector<BSONObj> newChunksB;
 
-            while (chunksIt.more()) {
-                BSONObj chunk = chunksIt.next().Obj();
+            vector<BSONObj>::iterator it = chunks.begin();
+
+            while (it != chunks.end()) {
+                BSONObj chunk = *it;
+                ++it;
 
                 int randChoice = rand(10);
 
@@ -250,25 +252,23 @@ protected:
                     BSONObj left = leftB.obj();
                     BSONObj right = rightB.obj();
 
-                    newChunksB.append(left);
-                    newChunksB.append(right);
-
-                    diffsB.append(right);
-                    diffsB.append(left);
+                    newChunksB.push_back(left);
+                    newChunksB.push_back(right);
 
                     numChunks++;
-                } else if (randChoice < 4 && chunksIt.more()) {
+                } else if (randChoice < 4 && it != chunks.end()) {
                     // Simulate a migrate
                     BSONObj prevShardChunk;
-                    while (chunksIt.more()) {
-                        prevShardChunk = chunksIt.next().Obj();
+                    while (it != chunks.end()) {
+                        prevShardChunk = *it;
+                        ++it;
 
                         if (prevShardChunk[ChunkType::shard()].String() ==
                             chunk[ChunkType::shard()].String()) {
                             break;
                         }
 
-                        newChunksB.append(prevShardChunk);
+                        newChunksB.push_back(prevShardChunk);
 
                         prevShardChunk = BSONObj();
                     }
@@ -302,26 +302,20 @@ protected:
                         BSONObj newShard = newShardB.obj();
                         BSONObj prevShard = prevShardB.obj();
 
-                        newChunksB.append(newShard);
-                        newChunksB.append(prevShard);
-
-                        diffsB.append(newShard);
-                        diffsB.append(prevShard);
-
+                        newChunksB.push_back(newShard);
+                        newChunksB.push_back(prevShard);
                     } else {
-                        newChunksB.append(chunk);
+                        newChunksB.push_back(chunk);
                     }
                 } else {
-                    newChunksB.append(chunk);
+                    newChunksB.push_back(chunk);
                 }
             }
 
-            BSONArray diffs = diffsB.arr();
-            chunks = newChunksB.arr();
+            chunks = std::move(newChunksB);
 
             // Rarely entirely clear out our data
             if (rand(10) < 1) {
-                diffs = chunks;
                 ranges.clear();
                 maxVersion = ChunkVersion(0, 0, OID());
                 maxShardVersions.clear();
@@ -330,7 +324,7 @@ protected:
             std::vector<ChunkType> chunksVector;
             convertBSONArrayToChunkTypes(chunks, &chunksVector);
 
-            differ->calculateConfigDiff(&txn, chunksVector);
+            differ->calculateConfigDiff(nullptr, chunksVector);
 
             validate(isInverse, chunksVector, ranges, maxVersion, maxShardVersions);
         }
@@ -381,8 +375,7 @@ private:
                        0);
             }
 
-            ChunkVersion version =
-                ChunkVersion::fromBSON(chunk.toBSON()[ChunkType::DEPRECATED_lastmod()]);
+            ChunkVersion version = chunk.getVersion();
             if (version > foundMaxVersion)
                 foundMaxVersion = version;
 

@@ -85,9 +85,13 @@ void getKeysForUpgradeChecking(const BSONObj& infoObj, const BSONObj& doc, BSONO
         }
 
         // XXX: do we care about version
-        BtreeKeyGeneratorV1 keyGen(fieldNames, fixed, infoObj["sparse"].trueValue());
+        // TODO: change nullptr to a collator, if a collation spec is given.
+        BtreeKeyGeneratorV1 keyGen(fieldNames, fixed, infoObj["sparse"].trueValue(), nullptr);
 
-        keyGen.getKeys(doc, keys);
+        // There's no need to compute the prefixes of the indexed fields that cause the index to be
+        // multikey when checking if any index key is too large.
+        MultikeyPaths* multikeyPaths = nullptr;
+        keyGen.getKeys(doc, keys, multikeyPaths);
     }
 }
 

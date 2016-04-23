@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/shell/shell_options.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -34,13 +36,13 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/client/mongo_uri.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/version.h"
@@ -118,6 +120,17 @@ Status addMongoShellOptions(moe::OptionSection* options) {
     options->addOptionChaining(
         "ipv6", "ipv6", moe::Switch, "enable IPv6 support (disabled by default)");
 
+    options->addOptionChaining("disableJavaScriptJIT",
+                               "disableJavaScriptJIT",
+                               moe::Switch,
+                               "disable the Javascript Just In Time compiler");
+
+    options->addOptionChaining("disableJavaScriptProtection",
+                               "disableJavaScriptProtection",
+                               moe::Switch,
+                               "allow automatic JavaScript function marshalling")
+        .incompatibleWith("enableJavaScriptProtection");
+
     Status ret = Status::OK();
 #ifdef MONGO_CONFIG_SSL
     ret = addSSLClientOptions(options);
@@ -125,6 +138,14 @@ Status addMongoShellOptions(moe::OptionSection* options) {
         return ret;
     }
 #endif
+
+    options->addOptionChaining(
+                 "enableJavaScriptProtection",
+                 "enableJavaScriptProtection",
+                 moe::Switch,
+                 "disable automatic JavaScript function marshalling (defaults to true)")
+        .hidden()
+        .incompatibleWith("disableJavaScriptProtection");
 
     options->addOptionChaining("dbaddress", "dbaddress", moe::String, "dbaddress")
         .hidden()
@@ -156,7 +177,7 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                                "readMode",
                                moe::String,
                                "mode to determine how .find() queries are done:"
-                               " commands, compatibility").hidden();
+                               " commands, compatibility, legacy").hidden();
 
     options->addOptionChaining("rpcProtocols",
                                "rpcProtocols",
@@ -172,8 +193,8 @@ std::string getMongoShellHelp(StringData name, const moe::OptionSection& options
     sb << "usage: " << name << " [options] [db address] [file names (ending in .js)]\n"
        << "db address can be:\n"
        << "  foo                   foo database on local machine\n"
-       << "  192.169.0.5/foo       foo database on 192.168.0.5 machine\n"
-       << "  192.169.0.5:9999/foo  foo database on 192.168.0.5 machine on port 9999\n"
+       << "  192.168.0.5/foo       foo database on 192.168.0.5 machine\n"
+       << "  192.168.0.5:9999/foo  foo database on 192.168.0.5 machine on port 9999\n"
        << options.helpString() << "\n"
        << "file names: a list of files to run. files have to end in .js and will exit after "
        << "unless --shell is specified";
@@ -254,8 +275,14 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("nodb")) {
         shellGlobalParams.nodb = true;
     }
+    if (params.count("disableJavaScriptProtection")) {
+        shellGlobalParams.javascriptProtection = false;
+    }
     if (params.count("norc")) {
         shellGlobalParams.norc = true;
+    }
+    if (params.count("disableJavaScriptJIT")) {
+        shellGlobalParams.nojit = true;
     }
     if (params.count("files")) {
         shellGlobalParams.files = params["files"].as<vector<string>>();
@@ -279,11 +306,12 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
     if (params.count("readMode")) {
         std::string mode = params["readMode"].as<string>();
-        if (mode != "commands" && mode != "compatibility") {
-            throw MsgAssertionException(17397,
-                                        mongoutils::str::stream()
-                                            << "Unknown readMode option: '" << mode
-                                            << "'. Valid modes are: {commands, compatibility}");
+        if (mode != "commands" && mode != "compatibility" && mode != "legacy") {
+            throw MsgAssertionException(
+                17397,
+                mongoutils::str::stream()
+                    << "Unknown readMode option: '" << mode
+                    << "'. Valid modes are: {commands, compatibility, legacy}");
         }
         shellGlobalParams.readMode = mode;
     }
@@ -330,16 +358,36 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    return Status::OK();
-}
+    if (shellGlobalParams.url.find("mongodb://") == 0) {
+        auto cs_status = MongoURI::parse(shellGlobalParams.url);
+        if (!cs_status.isOK()) {
+            return cs_status.getStatus();
+        }
 
-Status validateMongoShellOptions(const moe::Environment& params) {
-#ifdef MONGO_CONFIG_SSL
-    Status ret = validateSSLMongoShellOptions(params);
-    if (!ret.isOK()) {
-        return ret;
+        auto cs = cs_status.getValue();
+        StringBuilder sb;
+        sb << "ERROR: Cannot specify ";
+        auto uriOptions = cs.getOptions();
+        if (!shellGlobalParams.username.empty() && !cs.getUser().empty()) {
+            sb << "username";
+        } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty()) {
+            sb << "password";
+        } else if (!shellGlobalParams.authenticationMechanism.empty() &&
+                   uriOptions.count("authMechanism")) {
+            sb << "the authentication mechanism";
+        } else if (!shellGlobalParams.authenticationDatabase.empty() &&
+                   uriOptions.count("authSource")) {
+            sb << "the authentication database";
+        } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
+                   uriOptions.count("gssapiServiceName")) {
+            sb << "the GSSAPI service name";
+        } else {
+            return Status::OK();
+        }
+        sb << " in connection URI and as a command-line option";
+        return Status(ErrorCodes::InvalidOptions, sb.str());
     }
-#endif
+
     return Status::OK();
 }
 }

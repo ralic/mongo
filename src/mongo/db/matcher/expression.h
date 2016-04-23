@@ -41,7 +41,10 @@
 
 namespace mongo {
 
+class MatchExpression;
 class TreeMatchExpression;
+
+typedef StatusWith<std::unique_ptr<MatchExpression>> StatusWithMatchExpression;
 
 class MatchExpression {
     MONGO_DISALLOW_COPYING(MatchExpression);
@@ -82,7 +85,6 @@ public:
         WHERE,
 
         // things that maybe shouldn't even be nodes
-        ATOMIC,
         ALWAYS_FALSE,
 
         // Things that we parse but cannot be answered without an index.
@@ -186,12 +188,16 @@ public:
     // XXX document
     virtual bool equivalent(const MatchExpression* other) const = 0;
 
-    //
-    // Determine if a document satisfies the tree-predicate.
-    //
-
+    /**
+    * Determine if a document satisfies the tree-predicate.
+    *
+    * The caller may optionally provide a non-null MatchDetails as an out-parameter. For matching
+    *documents, the MatchDetails provide further info on how the document was
+    *matched---specifically, which array element matched an array predicate.
+    *
+    * The caller must check that the MatchDetails is valid via the isValid() method before using.
+    */
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const = 0;
-
     virtual bool matchesBSON(const BSONObj& doc, MatchDetails* details = 0) const;
 
     /**
@@ -227,12 +233,18 @@ public:
         }
     }
 
+    /**
+     * Serialize the MatchExpression to BSON, appending to 'out'. Output of this method is expected
+     * to be a valid query object, that, when parsed, produces a logically equivalent
+     * MatchExpression.
+     */
+    virtual void serialize(BSONObjBuilder* out) const = 0;
+
     //
     // Debug information
     //
     virtual std::string toString() const;
     virtual void debugString(StringBuilder& debug, int level = 0) const = 0;
-    virtual void toBSON(BSONObjBuilder* out) const = 0;
 
 protected:
     void _debugAddSpace(StringBuilder& debug, int level) const;
@@ -242,38 +254,11 @@ private:
     std::unique_ptr<TagData> _tagData;
 };
 
-/**
- * this isn't really an expression, but a hint to other things
- * not sure where to put it in the end
- */
-class AtomicMatchExpression : public MatchExpression {
-public:
-    AtomicMatchExpression() : MatchExpression(ATOMIC) {}
-
-    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const {
-        return true;
-    }
-
-    virtual bool matchesSingleElement(const BSONElement& e) const {
-        return true;
-    }
-
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        return stdx::make_unique<AtomicMatchExpression>();
-    }
-
-    virtual void debugString(StringBuilder& debug, int level = 0) const;
-
-    virtual void toBSON(BSONObjBuilder* out) const;
-
-    virtual bool equivalent(const MatchExpression* other) const {
-        return other->matchType() == ATOMIC;
-    }
-};
-
 class FalseMatchExpression : public MatchExpression {
 public:
-    FalseMatchExpression() : MatchExpression(ALWAYS_FALSE) {}
+    FalseMatchExpression(StringData path) : MatchExpression(ALWAYS_FALSE) {
+        _path = path;
+    }
 
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const {
         return false;
@@ -284,15 +269,18 @@ public:
     }
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
-        return stdx::make_unique<FalseMatchExpression>();
+        return stdx::make_unique<FalseMatchExpression>(_path);
     }
 
     virtual void debugString(StringBuilder& debug, int level = 0) const;
 
-    virtual void toBSON(BSONObjBuilder* out) const;
+    virtual void serialize(BSONObjBuilder* out) const;
 
     virtual bool equivalent(const MatchExpression* other) const {
         return other->matchType() == ALWAYS_FALSE;
     }
+
+private:
+    StringData _path;
 };
 }

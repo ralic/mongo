@@ -34,20 +34,18 @@
 
 #include <memory.h>
 
-
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/snapshot_name.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
 class BSONObjBuilder;
-class WiredTigerSession;
-class WiredTigerSessionCache;
 
 class WiredTigerRecoveryUnit final : public RecoveryUnit {
 public:
@@ -62,16 +60,12 @@ public:
     void abortUnitOfWork() final;
 
     virtual bool waitUntilDurable();
-    virtual void goingToWaitUntilDurable();
 
-    virtual void registerChange(Change*);
+    virtual void registerChange(Change* change);
 
     virtual void abandonSnapshot();
 
-    // un-used API
-    virtual void* writingPtr(void* data, size_t len) {
-        invariant(!"don't call writingPtr");
-    }
+    virtual void* writingPtr(void* data, size_t len);
 
     virtual void setRollbackWritesDisabled() {}
 
@@ -87,6 +81,14 @@ public:
     // ---- WT STUFF
 
     WiredTigerSession* getSession(OperationContext* opCtx);
+
+    /**
+     * Returns a session without starting a new WT txn on the session. Will not close any already
+     * running session.
+     */
+
+    WiredTigerSession* getSessionNoTxn(OperationContext* opCtx);
+
     WiredTigerSessionCache* getSessionCache() {
         return _sessionCache;
     }
@@ -99,12 +101,10 @@ public:
         return _everStartedWrite;
     }
 
-    void setOplogReadTill(const RecordId& loc);
+    void setOplogReadTill(const RecordId& id);
     RecordId getOplogReadTill() const {
         return _oplogReadTill;
     }
-
-    void markNoTicketRequired();
 
     static WiredTigerRecoveryUnit* get(OperationContext* txn);
 
@@ -114,7 +114,7 @@ public:
      * Prepares this RU to be the basis for a named snapshot.
      *
      * Begins a WT transaction, and invariants if we are already in one.
-     * Bans being in a WriteUnitOfWork until the next call to commitAndRestart().
+     * Bans being in a WriteUnitOfWork until the next call to abandonSnapshot().
      */
     void prepareForCreateSnapshot(OperationContext* opCtx);
 
@@ -122,30 +122,24 @@ private:
     void _abort();
     void _commit();
 
+    void _ensureSession();
     void _txnClose(bool commit);
     void _txnOpen(OperationContext* opCtx);
 
     WiredTigerSessionCache* _sessionCache;  // not owned
-    WiredTigerSession* _session;            // owned, but from pool
-    bool _defaultCommit;
+    UniqueWiredTigerSession _session;
     bool _areWriteUnitOfWorksBanned = false;
     bool _inUnitOfWork;
     bool _active;
-    uint64_t _myTransactionCount;
+    uint64_t _mySnapshotId;
     bool _everStartedWrite;
     Timer _timer;
-    bool _currentlySquirreled;
-    bool _syncing;
     RecordId _oplogReadTill;
     bool _readFromMajorityCommittedSnapshot = false;
     SnapshotName _majorityCommittedSnapshot = SnapshotName::min();
 
     typedef OwnedPointerVector<Change> Changes;
     Changes _changes;
-
-    bool _noTicketNeeded;
-    void _getTicket(OperationContext* opCtx);
-    TicketHolderReleaser _ticket;
 };
 
 /**

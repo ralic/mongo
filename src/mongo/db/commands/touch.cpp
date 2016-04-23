@@ -46,7 +46,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/touch_pages.h"
 
@@ -57,7 +56,7 @@ using std::stringstream;
 
 class TouchCmd : public Command {
 public:
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool adminOnly() const {
@@ -90,9 +89,7 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
-
-        const NamespaceString nss(ns);
+        const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
         if (!nss.isNormal()) {
             errmsg = "bad namespace name";
             return false;

@@ -36,6 +36,7 @@
 #ifdef MONGO_CONFIG_SSL
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/time_support.h"
@@ -69,21 +70,20 @@ public:
 };
 
 struct SSLConfiguration {
-    SSLConfiguration() : serverSubjectName(""), clientSubjectName(""), hasCA(false) {}
+    SSLConfiguration() : serverSubjectName(""), clientSubjectName("") {}
     SSLConfiguration(const std::string& serverSubjectName,
                      const std::string& clientSubjectName,
-                     const Date_t& serverCertificateExpirationDate,
-                     bool hasCA)
+                     const Date_t& serverCertificateExpirationDate)
         : serverSubjectName(serverSubjectName),
           clientSubjectName(clientSubjectName),
-          serverCertificateExpirationDate(serverCertificateExpirationDate),
-          hasCA(hasCA) {}
+          serverCertificateExpirationDate(serverCertificateExpirationDate) {}
 
+    bool isClusterMember(StringData subjectName) const;
     BSONObj getServerStatusBSON() const;
     std::string serverSubjectName;
     std::string clientSubjectName;
     Date_t serverCertificateExpirationDate;
-    bool hasCA;
+    bool hasCA = false;
 };
 
 class SSLManagerInterface {
@@ -119,12 +119,6 @@ public:
         const SSLConnection* conn, const std::string& remoteHost) = 0;
 
     /**
-     * Cleans up SSL thread local memory; use at thread exit
-     * to avoid memory leaks
-     */
-    virtual void cleanupThreadLocals() = 0;
-
-    /**
      * Gets the SSLConfiguration containing all information about the current SSL setup
      * @return the SSLConfiguration
      */
@@ -152,11 +146,16 @@ public:
 
     virtual void SSL_free(SSLConnection* conn) = 0;
 
+    enum class ConnectionDirection { kIncoming, kOutgoing };
+
     /**
      * Initializes an OpenSSL context according to the provided settings. Only settings which are
-     * acceptable on non-blocking connections are set.
+     * acceptable on non-blocking connections are set. "direction" specifies whether the SSL_CTX
+     * will be used to make outgoing connections or accept incoming connections.
      */
-    virtual Status initSSLContext(SSL_CTX* context, const SSLParams& params) = 0;
+    virtual Status initSSLContext(SSL_CTX* context,
+                                  const SSLParams& params,
+                                  ConnectionDirection direction) = 0;
 
     /**
      * Fetches a peer certificate and validates it if it exists. If validation fails, but weak

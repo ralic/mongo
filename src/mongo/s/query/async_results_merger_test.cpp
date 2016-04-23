@@ -30,6 +30,8 @@
 
 #include "mongo/s/query/async_results_merger.h"
 
+#include "mongo/client/remote_command_targeter_factory_mock.h"
+#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
@@ -37,6 +39,10 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/sharding_test_fixture.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
@@ -48,21 +54,42 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
-class AsyncResultsMergerTest : public executor::ThreadPoolExecutorTest {
+const HostAndPort kTestConfigShardHost = HostAndPort("FakeConfigHost", 12345);
+const std::vector<std::string> kTestShardIds = {"FakeShard1", "FakeShard2", "FakeShard3"};
+const std::vector<HostAndPort> kTestShardHosts = {HostAndPort("FakeShard1Host", 12345),
+                                                  HostAndPort("FakeShard2Host", 12345),
+                                                  HostAndPort("FakeShard3Host", 12345)};
+
+class AsyncResultsMergerTest : public ShardingTestFixture {
 public:
-    AsyncResultsMergerTest()
-        : _nss("testdb.testcoll"),
-          _remotes({HostAndPort("localhost", -1),
-                    HostAndPort("localhost", -2),
-                    HostAndPort("localhost", -3)}) {}
+    AsyncResultsMergerTest() : _nss("testdb.testcoll") {}
 
-    void setUp() final {
-        ThreadPoolExecutorTest::setUp();
-        launchExecutorThread();
-        executor = &getExecutor();
+    void setUp() override {
+        ShardingTestFixture::setUp();
+
+        getMessagingPort()->setRemote(HostAndPort("ClientHost", 12345));
+        configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
+
+        std::vector<ShardType> shards;
+
+        for (size_t i = 0; i < kTestShardIds.size(); i++) {
+            ShardType shardType;
+            shardType.setName(kTestShardIds[i]);
+            shardType.setHost(kTestShardHosts[i].toString());
+
+            shards.push_back(shardType);
+
+            std::unique_ptr<RemoteCommandTargeterMock> targeter(
+                stdx::make_unique<RemoteCommandTargeterMock>());
+            targeter->setConnectionStringReturnValue(ConnectionString(kTestShardHosts[i]));
+            targeter->setFindHostReturnValue(kTestShardHosts[i]);
+
+            targeterFactory()->addTargeterToReturn(ConnectionString(kTestShardHosts[i]),
+                                                   std::move(targeter));
+        }
+
+        setupShards(shards);
     }
-
-    void postExecutorThreadLaunch() final {}
 
 protected:
     /**
@@ -72,25 +99,29 @@ protected:
      * If 'batchSize' is set (i.e. not equal to boost::none), this batchSize is used for each
      * getMore. If 'findCmd' has a batchSize, this is used just for the initial find operation.
      */
-    void makeCursorFromFindCmd(const BSONObj& findCmd,
-                               const std::vector<HostAndPort>& remotes,
-                               boost::optional<long long> getMoreBatchSize = boost::none) {
+    void makeCursorFromFindCmd(
+        const BSONObj& findCmd,
+        const std::vector<ShardId>& shardIds,
+        boost::optional<long long> getMoreBatchSize = boost::none,
+        ReadPreferenceSetting readPref = ReadPreferenceSetting(ReadPreference::PrimaryOnly)) {
         const bool isExplain = true;
         const auto lpq =
             unittest::assertGet(LiteParsedQuery::makeFromFindCommand(_nss, findCmd, isExplain));
 
-        params = ClusterClientCursorParams(_nss);
+        ClusterClientCursorParams params = ClusterClientCursorParams(_nss, readPref);
         params.sort = lpq->getSort();
         params.limit = lpq->getLimit();
         params.batchSize = getMoreBatchSize ? getMoreBatchSize : lpq->getBatchSize();
         params.skip = lpq->getSkip();
         params.isTailable = lpq->isTailable();
+        params.isAwaitData = lpq->isAwaitData();
+        params.isAllowPartialResults = lpq->isAllowPartialResults();
 
-        for (const auto& hostAndPort : remotes) {
-            params.remotes.emplace_back(hostAndPort, findCmd);
+        for (const auto& shardId : shardIds) {
+            params.remotes.emplace_back(shardId, findCmd);
         }
 
-        arm = stdx::make_unique<AsyncResultsMerger>(executor, params);
+        arm = stdx::make_unique<AsyncResultsMerger>(executor(), std::move(params));
     }
 
     /**
@@ -99,13 +130,13 @@ protected:
      */
     void makeCursorFromExistingCursors(
         const std::vector<std::pair<HostAndPort, CursorId>>& remotes) {
-        params = ClusterClientCursorParams(_nss);
+        ClusterClientCursorParams params = ClusterClientCursorParams(_nss);
 
         for (const auto& hostIdPair : remotes) {
             params.remotes.emplace_back(hostIdPair.first, hostIdPair.second);
         }
 
-        arm = stdx::make_unique<AsyncResultsMerger>(executor, params);
+        arm = stdx::make_unique<AsyncResultsMerger>(executor(), std::move(params));
     }
 
     /**
@@ -124,7 +155,7 @@ protected:
      * Schedules a list of raw BSON command responses to be returned by the mock network.
      */
     void scheduleNetworkResponseObjs(std::vector<BSONObj> objs) {
-        executor::NetworkInterfaceMock* net = getNet();
+        executor::NetworkInterfaceMock* net = network();
         net->enterNetwork();
         for (const auto& obj : objs) {
             ASSERT_TRUE(net->hasReadyRequests());
@@ -137,19 +168,19 @@ protected:
         net->exitNetwork();
     }
 
-    BSONObj getCommandFromNextReadyRequest() {
-        executor::NetworkInterfaceMock* net = getNet();
+    RemoteCommandRequest getFirstPendingRequest() {
+        executor::NetworkInterfaceMock* net = network();
         net->enterNetwork();
         ASSERT_TRUE(net->hasReadyRequests());
         NetworkInterfaceMock::NetworkOperationIterator noi = net->getFrontOfUnscheduledQueue();
-        BSONObj retCmd = noi->getRequest().cmdObj;
+        RemoteCommandRequest retRequest = noi->getRequest();
         net->exitNetwork();
-        return retCmd;
+        return retRequest;
     }
 
     void scheduleErrorResponse(Status status) {
         invariant(!status.isOK());
-        executor::NetworkInterfaceMock* net = getNet();
+        executor::NetworkInterfaceMock* net = network();
         net->enterNetwork();
         ASSERT_TRUE(net->hasReadyRequests());
         net->scheduleResponse(net->getNextReadyRequest(), net->now(), status);
@@ -158,46 +189,37 @@ protected:
     }
 
     void blackHoleNextRequest() {
-        executor::NetworkInterfaceMock* net = getNet();
+        executor::NetworkInterfaceMock* net = network();
         net->enterNetwork();
         ASSERT_TRUE(net->hasReadyRequests());
         net->blackHole(net->getNextReadyRequest());
         net->exitNetwork();
     }
 
-    void runReadyNetworkOperations() {
-        executor::NetworkInterfaceMock* net = getNet();
-        net->enterNetwork();
-        net->runReadyNetworkOperations();
-        net->exitNetwork();
-    }
-
     const NamespaceString _nss;
-    const std::vector<HostAndPort> _remotes;
 
-    executor::TaskExecutor* executor;
-
-    ClusterClientCursorParams params;
     std::unique_ptr<AsyncResultsMerger> arm;
 };
 
 TEST_F(AsyncResultsMergerTest, ClusterFind) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
+    ASSERT_FALSE(arm->remotesExhausted());
 
     // First shard responds.
     std::vector<CursorResponse> responses;
     std::vector<BSONObj> batch1 = {
         fromjson("{_id: 1}"), fromjson("{_id: 2}"), fromjson("{_id: 3}")};
     responses.emplace_back(_nss, CursorId(0), batch1);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
 
     // Can't return any results until we have a response from all three shards.
     ASSERT_FALSE(arm->ready());
+    ASSERT_FALSE(arm->remotesExhausted());
 
     // Second two shards respond.
     responses.clear();
@@ -205,10 +227,12 @@ TEST_F(AsyncResultsMergerTest, ClusterFind) {
     responses.emplace_back(_nss, CursorId(0), batch2);
     std::vector<BSONObj> batch3 = {fromjson("{_id: 5}"), fromjson("{_id: 6}")};
     responses.emplace_back(_nss, CursorId(0), batch3);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
 
-    executor->waitForEvent(readyEvent);
+    executor()->waitForEvent(readyEvent);
 
+    ASSERT_TRUE(arm->remotesExhausted());
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
@@ -227,7 +251,7 @@ TEST_F(AsyncResultsMergerTest, ClusterFind) {
 
 TEST_F(AsyncResultsMergerTest, ClusterFindAndGetMore) {
     BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -240,9 +264,10 @@ TEST_F(AsyncResultsMergerTest, ClusterFindAndGetMore) {
     responses.emplace_back(_nss, CursorId(11), batch2);
     std::vector<BSONObj> batch3 = {fromjson("{_id: 5}"), fromjson("{_id: 6}")};
     responses.emplace_back(_nss, CursorId(12), batch3);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
+    ASSERT_FALSE(arm->remotesExhausted());
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
@@ -259,6 +284,7 @@ TEST_F(AsyncResultsMergerTest, ClusterFindAndGetMore) {
     ASSERT_FALSE(arm->ready());
     readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
+    ASSERT_FALSE(arm->remotesExhausted());
 
     responses.clear();
     std::vector<BSONObj> batch4 = {fromjson("{_id: 7}"), fromjson("{_id: 8}")};
@@ -267,9 +293,11 @@ TEST_F(AsyncResultsMergerTest, ClusterFindAndGetMore) {
     responses.emplace_back(_nss, CursorId(0), batch5);
     std::vector<BSONObj> batch6 = {fromjson("{_id: 10}")};
     responses.emplace_back(_nss, CursorId(0), batch6);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
+    ASSERT_FALSE(arm->remotesExhausted());
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 10}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
@@ -282,13 +310,16 @@ TEST_F(AsyncResultsMergerTest, ClusterFindAndGetMore) {
     ASSERT_FALSE(arm->ready());
     readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
+    ASSERT_FALSE(arm->remotesExhausted());
 
     responses.clear();
     std::vector<BSONObj> batch7 = {fromjson("{_id: 11}")};
     responses.emplace_back(_nss, CursorId(0), batch7);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
+    ASSERT_TRUE(arm->remotesExhausted());
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 11}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
@@ -297,108 +328,181 @@ TEST_F(AsyncResultsMergerTest, ClusterFindAndGetMore) {
 
 TEST_F(AsyncResultsMergerTest, ClusterFindSorted) {
     BSONObj findCmd = fromjson("{find: 'testcoll', sort: {_id: 1}, batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
 
     std::vector<CursorResponse> responses;
-    std::vector<BSONObj> batch1 = {fromjson("{_id: 5}"), fromjson("{_id: 6}")};
+    std::vector<BSONObj> batch1 = {fromjson("{_id: 5, $sortKey: {'': 5}}"),
+                                   fromjson("{_id: 6, $sortKey: {'': 6}}")};
     responses.emplace_back(_nss, CursorId(0), batch1);
-    std::vector<BSONObj> batch2 = {fromjson("{_id: 3}"), fromjson("{_id: 9}")};
+    std::vector<BSONObj> batch2 = {fromjson("{_id: 3, $sortKey: {'': 3}}"),
+                                   fromjson("{_id: 9, $sortKey: {'': 9}}")};
     responses.emplace_back(_nss, CursorId(0), batch2);
-    std::vector<BSONObj> batch3 = {fromjson("{_id: 4}"), fromjson("{_id: 8}")};
+    std::vector<BSONObj> batch3 = {fromjson("{_id: 4, $sortKey: {'': 4}}"),
+                                   fromjson("{_id: 8, $sortKey: {'': 8}}")};
     responses.emplace_back(_nss, CursorId(0), batch3);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 3}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{_id: 3, $sortKey: {'': 3}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 4}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{_id: 4, $sortKey: {'': 4}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 5}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{_id: 5, $sortKey: {'': 5}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 6}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{_id: 6, $sortKey: {'': 6}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 8}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{_id: 8, $sortKey: {'': 8}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 9}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{_id: 9, $sortKey: {'': 9}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
     ASSERT(!unittest::assertGet(arm->nextReady()));
 }
 
 TEST_F(AsyncResultsMergerTest, ClusterFindAndGetMoreSorted) {
     BSONObj findCmd = fromjson("{find: 'testcoll', sort: {_id: 1}, batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
 
     std::vector<CursorResponse> responses;
-    std::vector<BSONObj> batch1 = {fromjson("{_id: 5}"), fromjson("{_id: 6}")};
+    std::vector<BSONObj> batch1 = {fromjson("{$sortKey: {'': 5}}"),
+                                   fromjson("{$sortKey: {'': 6}}")};
     responses.emplace_back(_nss, CursorId(1), batch1);
-    std::vector<BSONObj> batch2 = {fromjson("{_id: 3}"), fromjson("{_id: 4}")};
+    std::vector<BSONObj> batch2 = {fromjson("{$sortKey: {'': 3}}"),
+                                   fromjson("{$sortKey: {'': 4}}")};
     responses.emplace_back(_nss, CursorId(0), batch2);
-    std::vector<BSONObj> batch3 = {fromjson("{_id: 7}"), fromjson("{_id: 8}")};
+    std::vector<BSONObj> batch3 = {fromjson("{$sortKey: {'': 7}}"),
+                                   fromjson("{$sortKey: {'': 8}}")};
     responses.emplace_back(_nss, CursorId(2), batch3);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 3}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 3}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 4}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 4}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 5}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 5}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 6}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 6}}"), *unittest::assertGet(arm->nextReady()));
 
     ASSERT_FALSE(arm->ready());
     readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
 
     responses.clear();
-    std::vector<BSONObj> batch4 = {fromjson("{_id: 7}"), fromjson("{_id: 10}")};
+    std::vector<BSONObj> batch4 = {fromjson("{$sortKey: {'': 7}}"),
+                                   fromjson("{$sortKey: {'': 10}}")};
     responses.emplace_back(_nss, CursorId(0), batch4);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 7}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 7}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 7}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 7}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 8}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 8}}"), *unittest::assertGet(arm->nextReady()));
 
     ASSERT_FALSE(arm->ready());
     readyEvent = unittest::assertGet(arm->nextEvent());
     ASSERT_FALSE(arm->ready());
 
     responses.clear();
-    std::vector<BSONObj> batch5 = {fromjson("{_id: 9}"), fromjson("{_id: 10}")};
+    std::vector<BSONObj> batch5 = {fromjson("{$sortKey: {'': 9}}"),
+                                   fromjson("{$sortKey: {'': 10}}")};
     responses.emplace_back(_nss, CursorId(0), batch5);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 9}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 9}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 10}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 10}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
-    ASSERT_EQ(fromjson("{_id: 10}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_EQ(fromjson("{$sortKey: {'': 10}}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
     ASSERT(!unittest::assertGet(arm->nextReady()));
 }
+
+TEST_F(AsyncResultsMergerTest, ClusterFindCompoundSortKey) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', sort: {a: -1, b: 1}, batchSize: 2}");
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch1 = {fromjson("{$sortKey: {'': 5, '': 9}}"),
+                                   fromjson("{$sortKey: {'': 4, '': 20}}")};
+    responses.emplace_back(_nss, CursorId(0), batch1);
+    std::vector<BSONObj> batch2 = {fromjson("{$sortKey: {'': 10, '': 11}}"),
+                                   fromjson("{$sortKey: {'': 4, '': 4}}")};
+    responses.emplace_back(_nss, CursorId(0), batch2);
+    std::vector<BSONObj> batch3 = {fromjson("{$sortKey: {'': 10, '': 12}}"),
+                                   fromjson("{$sortKey: {'': 5, '': 9}}")};
+    responses.emplace_back(_nss, CursorId(0), batch3);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{$sortKey: {'': 10, '': 11}}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{$sortKey: {'': 10, '': 12}}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{$sortKey: {'': 5, '': 9}}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{$sortKey: {'': 5, '': 9}}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{$sortKey: {'': 4, '': 4}}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{$sortKey: {'': 4, '': 20}}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT(!unittest::assertGet(arm->nextReady()));
+}
+
+TEST_F(AsyncResultsMergerTest, ClusterFindSortedButNoSortKey) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', sort: {a: -1, b: 1}, batchSize: 2}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // Parsing the batch results in an error because the sort key is missing.
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch1 = {fromjson("{a: 2, b: 1}"), fromjson("{a: 1, b: 2}")};
+    responses.emplace_back(_nss, CursorId(1), batch1);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    auto statusWithNext = arm->nextReady();
+    ASSERT(!statusWithNext.isOK());
+    ASSERT_EQ(statusWithNext.getStatus().code(), ErrorCodes::InternalError);
+
+    // Required to kill the 'arm' on error before destruction.
+    auto killEvent = arm->kill();
+    executor()->waitForEvent(killEvent);
+}
+
 
 TEST_F(AsyncResultsMergerTest, ClusterFindInitialBatchSizeIsZero) {
     // Initial batchSize sent with the find command is zero; batchSize sent with each getMore
     // command is one.
     BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 0}");
     const long long getMoreBatchSize = 1LL;
-    makeCursorFromFindCmd(findCmd, {_remotes[0], _remotes[1]}, getMoreBatchSize);
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0], kTestShardIds[1]}, getMoreBatchSize);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -409,7 +513,7 @@ TEST_F(AsyncResultsMergerTest, ClusterFindInitialBatchSizeIsZero) {
     std::vector<CursorResponse> responses;
     responses.emplace_back(_nss, CursorId(1), std::vector<BSONObj>());
     responses.emplace_back(_nss, CursorId(0), std::vector<BSONObj>());
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
 
     // In handling the responses from the first shard, the ARM should have already asked
     // for an additional batch from that shard. It won't have anything to return until it
@@ -418,8 +522,9 @@ TEST_F(AsyncResultsMergerTest, ClusterFindInitialBatchSizeIsZero) {
     responses.clear();
     std::vector<BSONObj> batch1 = {fromjson("{_id: 1}")};
     responses.emplace_back(_nss, CursorId(1), batch1);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
@@ -432,15 +537,17 @@ TEST_F(AsyncResultsMergerTest, ClusterFindInitialBatchSizeIsZero) {
     // do this, but there's no reason the ARM can't handle this by asking for more.
     responses.clear();
     responses.emplace_back(_nss, CursorId(1), std::vector<BSONObj>());
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
 
     // The shard responds with another batch and closes the cursor.
     ASSERT_FALSE(arm->ready());
     responses.clear();
     std::vector<BSONObj> batch2 = {fromjson("{_id: 2}")};
     responses.emplace_back(_nss, CursorId(0), batch2);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 2}"), *unittest::assertGet(arm->nextReady()));
@@ -449,7 +556,7 @@ TEST_F(AsyncResultsMergerTest, ClusterFindInitialBatchSizeIsZero) {
 }
 
 TEST_F(AsyncResultsMergerTest, ExistingCursors) {
-    makeCursorFromExistingCursors({{_remotes[0], 5}, {_remotes[1], 6}});
+    makeCursorFromExistingCursors({{kTestShardHosts[0], 5}, {kTestShardHosts[1], 6}});
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -460,9 +567,9 @@ TEST_F(AsyncResultsMergerTest, ExistingCursors) {
     responses.emplace_back(_nss, CursorId(0), batch1);
     std::vector<BSONObj> batch2 = {fromjson("{_id: 3}"), fromjson("{_id: 4}")};
     responses.emplace_back(_nss, CursorId(0), batch2);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
 
-    executor->waitForEvent(readyEvent);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
@@ -479,7 +586,7 @@ TEST_F(AsyncResultsMergerTest, ExistingCursors) {
 
 TEST_F(AsyncResultsMergerTest, StreamResultsFromOneShardIfOtherDoesntRespond) {
     BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0], _remotes[1]});
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0], kTestShardIds[0]});
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -491,8 +598,8 @@ TEST_F(AsyncResultsMergerTest, StreamResultsFromOneShardIfOtherDoesntRespond) {
     responses.emplace_back(_nss, CursorId(1), batch1);
     std::vector<BSONObj> batch2 = {fromjson("{_id: 3}"), fromjson("{_id: 4}")};
     responses.emplace_back(_nss, CursorId(2), batch2);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
@@ -512,9 +619,10 @@ TEST_F(AsyncResultsMergerTest, StreamResultsFromOneShardIfOtherDoesntRespond) {
     responses.clear();
     std::vector<BSONObj> batch3 = {fromjson("{_id: 5}"), fromjson("{_id: 6}")};
     responses.emplace_back(_nss, CursorId(1), batch3);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
     blackHoleNextRequest();
-    executor->waitForEvent(readyEvent);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 5}"), *unittest::assertGet(arm->nextReady()));
@@ -529,8 +637,9 @@ TEST_F(AsyncResultsMergerTest, StreamResultsFromOneShardIfOtherDoesntRespond) {
     responses.clear();
     std::vector<BSONObj> batch4 = {fromjson("{_id: 7}"), fromjson("{_id: 8}")};
     responses.emplace_back(_nss, CursorId(0), batch4);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 7}"), *unittest::assertGet(arm->nextReady()));
@@ -546,7 +655,7 @@ TEST_F(AsyncResultsMergerTest, StreamResultsFromOneShardIfOtherDoesntRespond) {
 
 TEST_F(AsyncResultsMergerTest, ErrorOnMismatchedCursorIds) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -556,8 +665,8 @@ TEST_F(AsyncResultsMergerTest, ErrorOnMismatchedCursorIds) {
     std::vector<BSONObj> batch1 = {
         fromjson("{_id: 1}"), fromjson("{_id: 2}"), fromjson("{_id: 3}")};
     responses.emplace_back(_nss, CursorId(123), batch1);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
@@ -574,20 +683,21 @@ TEST_F(AsyncResultsMergerTest, ErrorOnMismatchedCursorIds) {
     std::vector<BSONObj> batch2 = {
         fromjson("{_id: 4}"), fromjson("{_id: 5}"), fromjson("{_id: 6}")};
     responses.emplace_back(_nss, CursorId(456), batch2);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT(!arm->nextReady().isOK());
 
     // Required to kill the 'arm' on error before destruction.
     auto killEvent = arm->kill();
-    executor->waitForEvent(killEvent);
+    executor()->waitForEvent(killEvent);
 }
 
 TEST_F(AsyncResultsMergerTest, BadResponseReceivedFromShard) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -601,7 +711,7 @@ TEST_F(AsyncResultsMergerTest, BadResponseReceivedFromShard) {
     BSONObj response3 = CursorResponse(_nss, CursorId(456), batch3)
                             .toBSON(CursorResponse::ResponseType::InitialResponse);
     scheduleNetworkResponseObjs({response1, response2, response3});
-    executor->waitForEvent(readyEvent);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     auto statusWithNext = arm->nextReady();
@@ -609,12 +719,12 @@ TEST_F(AsyncResultsMergerTest, BadResponseReceivedFromShard) {
 
     // Required to kill the 'arm' on error before destruction.
     auto killEvent = arm->kill();
-    executor->waitForEvent(killEvent);
+    executor()->waitForEvent(killEvent);
 }
 
 TEST_F(AsyncResultsMergerTest, ErrorReceivedFromShard) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -625,10 +735,10 @@ TEST_F(AsyncResultsMergerTest, ErrorReceivedFromShard) {
     responses.emplace_back(_nss, CursorId(1), batch1);
     std::vector<BSONObj> batch2 = {fromjson("{_id: 3}"), fromjson("{_id: 4}")};
     responses.emplace_back(_nss, CursorId(2), batch2);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
 
     scheduleErrorResponse({ErrorCodes::BadValue, "bad thing happened"});
-    executor->waitForEvent(readyEvent);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     auto statusWithNext = arm->nextReady();
@@ -638,12 +748,12 @@ TEST_F(AsyncResultsMergerTest, ErrorReceivedFromShard) {
 
     // Required to kill the 'arm' on error before destruction.
     auto killEvent = arm->kill();
-    executor->waitForEvent(killEvent);
+    executor()->waitForEvent(killEvent);
 }
 
 TEST_F(AsyncResultsMergerTest, ErrorCantScheduleEventBeforeLastSignaled) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -654,8 +764,8 @@ TEST_F(AsyncResultsMergerTest, ErrorCantScheduleEventBeforeLastSignaled) {
     std::vector<CursorResponse> responses;
     std::vector<BSONObj> batch = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
     responses.emplace_back(_nss, CursorId(0), batch);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
@@ -666,13 +776,13 @@ TEST_F(AsyncResultsMergerTest, ErrorCantScheduleEventBeforeLastSignaled) {
 
     // Required to kill the 'arm' on error before destruction.
     auto killEvent = arm->kill();
-    executor->waitForEvent(killEvent);
+    executor()->waitForEvent(killEvent);
 }
 
 TEST_F(AsyncResultsMergerTest, NextEventAfterTaskExecutorShutdown) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, _remotes);
-    executor->shutdown();
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
+    executor()->shutdown();
     ASSERT_NOT_OK(arm->nextEvent().getStatus());
     auto killEvent = arm->kill();
     ASSERT_FALSE(killEvent.isValid());
@@ -680,7 +790,7 @@ TEST_F(AsyncResultsMergerTest, NextEventAfterTaskExecutorShutdown) {
 
 TEST_F(AsyncResultsMergerTest, KillAfterTaskExecutorShutdownWithOutstandingBatches) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
 
     // Make a request to the shard that will never get answered.
     ASSERT_FALSE(arm->ready());
@@ -689,14 +799,14 @@ TEST_F(AsyncResultsMergerTest, KillAfterTaskExecutorShutdownWithOutstandingBatch
     blackHoleNextRequest();
 
     // Executor shuts down before a response is received.
-    executor->shutdown();
+    executor()->shutdown();
     auto killEvent = arm->kill();
     ASSERT_FALSE(killEvent.isValid());
 }
 
 TEST_F(AsyncResultsMergerTest, KillNoBatchesRequested) {
     BSONObj findCmd = fromjson("{find: 'testcoll'}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto killedEvent = arm->kill();
@@ -706,12 +816,12 @@ TEST_F(AsyncResultsMergerTest, KillNoBatchesRequested) {
     ASSERT_TRUE(arm->ready());
     ASSERT_NOT_OK(arm->nextReady().getStatus());
 
-    executor->waitForEvent(killedEvent);
+    executor()->waitForEvent(killedEvent);
 }
 
 TEST_F(AsyncResultsMergerTest, KillAllBatchesReceived) {
     BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -724,18 +834,18 @@ TEST_F(AsyncResultsMergerTest, KillAllBatchesReceived) {
     responses.emplace_back(_nss, CursorId(0), batch2);
     std::vector<BSONObj> batch3 = {fromjson("{_id: 3}"), fromjson("{_id: 4}")};
     responses.emplace_back(_nss, CursorId(123), batch3);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
 
     // Kill should be able to return right away if there are no pending batches.
     auto killedEvent = arm->kill();
     ASSERT_TRUE(arm->ready());
     ASSERT_NOT_OK(arm->nextReady().getStatus());
-    executor->waitForEvent(killedEvent);
+    executor()->waitForEvent(killedEvent);
 }
 
 TEST_F(AsyncResultsMergerTest, KillTwoOutstandingBatches) {
     BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, _remotes);
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -744,55 +854,37 @@ TEST_F(AsyncResultsMergerTest, KillTwoOutstandingBatches) {
     std::vector<CursorResponse> responses;
     std::vector<BSONObj> batch1 = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
     responses.emplace_back(_nss, CursorId(0), batch1);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
 
     // Kill event will only be signalled once the pending batches are received.
     auto killedEvent = arm->kill();
 
-    // Ensures that callbacks run with a cancelled status.
-    runReadyNetworkOperations();
+    // After the kill, the ARM waits for outstanding batches to come back. This ensures that we
+    // receive cursor ids for any established remote cursors, and can clean them up by issuing
+    // killCursors commands.
+    responses.clear();
+    std::vector<BSONObj> batch2 = {fromjson("{_id: 3}"), fromjson("{_id: 4}")};
+    responses.emplace_back(_nss, CursorId(123), batch2);
+    std::vector<BSONObj> batch3 = {fromjson("{_id: 4}"), fromjson("{_id: 5}")};
+    responses.emplace_back(_nss, CursorId(0), batch2);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+
+    // Only one of the responses has a non-zero cursor id. The ARM should have issued a killCursors
+    // command against this id.
+    BSONObj expectedCmdObj = BSON("killCursors"
+                                  << "testcoll"
+                                  << "cursors" << BSON_ARRAY(CursorId(123)));
+    ASSERT_EQ(getFirstPendingRequest().cmdObj, expectedCmdObj);
 
     // Ensure that we properly signal both those waiting for the kill, and those waiting for more
     // results to be ready.
-    executor->waitForEvent(readyEvent);
-    executor->waitForEvent(killedEvent);
+    executor()->waitForEvent(readyEvent);
+    executor()->waitForEvent(killedEvent);
 }
 
-TEST_F(AsyncResultsMergerTest, NextEventErrorsAfterKill) {
+TEST_F(AsyncResultsMergerTest, KillOutstandingGetMore) {
     BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
-
-    ASSERT_FALSE(arm->ready());
-    auto readyEvent = unittest::assertGet(arm->nextEvent());
-    ASSERT_FALSE(arm->ready());
-
-    std::vector<CursorResponse> responses;
-    std::vector<BSONObj> batch1 = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
-    responses.emplace_back(_nss, CursorId(1), batch1);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-
-    auto killedEvent = arm->kill();
-
-    // Attempting to schedule more network operations on a killed arm is an error.
-    ASSERT_NOT_OK(arm->nextEvent().getStatus());
-
-    executor->waitForEvent(killedEvent);
-}
-
-TEST_F(AsyncResultsMergerTest, KillCalledTwice) {
-    BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
-    auto killedEvent1 = arm->kill();
-    ASSERT(killedEvent1.isValid());
-    auto killedEvent2 = arm->kill();
-    ASSERT(killedEvent2.isValid());
-    executor->waitForEvent(killedEvent1);
-    executor->waitForEvent(killedEvent2);
-}
-
-TEST_F(AsyncResultsMergerTest, TailableBasic) {
-    BSONObj findCmd = fromjson("{find: 'testcoll', tailable: true}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -801,8 +893,86 @@ TEST_F(AsyncResultsMergerTest, TailableBasic) {
     std::vector<CursorResponse> responses;
     std::vector<BSONObj> batch1 = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
     responses.emplace_back(_nss, CursorId(123), batch1);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+
+    // First batch received.
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 2}"), *unittest::assertGet(arm->nextReady()));
+
+    // This will schedule a getMore on cursor id 123.
+    ASSERT_FALSE(arm->ready());
+    readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    auto killedEvent = arm->kill();
+
+    // The kill can't complete until the getMore response is received.
+    responses.clear();
+    std::vector<BSONObj> batch2 = {fromjson("{_id: 3}"), fromjson("{_id: 4}")};
+    responses.emplace_back(_nss, CursorId(123), batch2);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+
+    // While processing the getMore response, a killCursors against id 123 should have been
+    // scheduled.
+    BSONObj expectedCmdObj = BSON("killCursors"
+                                  << "testcoll"
+                                  << "cursors" << BSON_ARRAY(CursorId(123)));
+    ASSERT_EQ(getFirstPendingRequest().cmdObj, expectedCmdObj);
+
+    // Ensure that we properly signal both those waiting for the kill, and those waiting for more
+    // results to be ready.
+    executor()->waitForEvent(readyEvent);
+    executor()->waitForEvent(killedEvent);
+}
+
+TEST_F(AsyncResultsMergerTest, NextEventErrorsAfterKill) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch1 = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
+    responses.emplace_back(_nss, CursorId(1), batch1);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+
+    auto killedEvent = arm->kill();
+
+    // Attempting to schedule more network operations on a killed arm is an error.
+    ASSERT_NOT_OK(arm->nextEvent().getStatus());
+
+    executor()->waitForEvent(killedEvent);
+}
+
+TEST_F(AsyncResultsMergerTest, KillCalledTwice) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+    auto killedEvent1 = arm->kill();
+    ASSERT(killedEvent1.isValid());
+    auto killedEvent2 = arm->kill();
+    ASSERT(killedEvent2.isValid());
+    executor()->waitForEvent(killedEvent1);
+    executor()->waitForEvent(killedEvent2);
+}
+
+TEST_F(AsyncResultsMergerTest, TailableBasic) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', tailable: true}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch1 = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
+    responses.emplace_back(_nss, CursorId(123), batch1);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
@@ -812,6 +982,7 @@ TEST_F(AsyncResultsMergerTest, TailableBasic) {
     // In the tailable case, we expect boost::none after every batch.
     ASSERT_TRUE(arm->ready());
     ASSERT(!unittest::assertGet(arm->nextReady()));
+    ASSERT_FALSE(arm->remotesExhausted());
 
     ASSERT_FALSE(arm->ready());
     readyEvent = unittest::assertGet(arm->nextEvent());
@@ -820,21 +991,24 @@ TEST_F(AsyncResultsMergerTest, TailableBasic) {
     responses.clear();
     std::vector<BSONObj> batch2 = {fromjson("{_id: 3}")};
     responses.emplace_back(_nss, CursorId(123), batch2);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
+    ASSERT_FALSE(arm->remotesExhausted());
     ASSERT_EQ(fromjson("{_id: 3}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
     ASSERT(!unittest::assertGet(arm->nextReady()));
+    ASSERT_FALSE(arm->remotesExhausted());
 
     auto killedEvent = arm->kill();
-    executor->waitForEvent(killedEvent);
+    executor()->waitForEvent(killedEvent);
 }
 
 TEST_F(AsyncResultsMergerTest, TailableEmptyBatch) {
     BSONObj findCmd = fromjson("{find: 'testcoll', tailable: true}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -844,20 +1018,44 @@ TEST_F(AsyncResultsMergerTest, TailableEmptyBatch) {
     std::vector<CursorResponse> responses;
     std::vector<BSONObj> batch;
     responses.emplace_back(_nss, CursorId(123), batch);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
-    // After receiving an empty batch, the ARM should return boost::none.
+    // After receiving an empty batch, the ARM should return boost::none, but remotes should not be
+    // marked as exhausted.
     ASSERT_TRUE(arm->ready());
     ASSERT(!unittest::assertGet(arm->nextReady()));
+    ASSERT_FALSE(arm->remotesExhausted());
 
     auto killedEvent = arm->kill();
-    executor->waitForEvent(killedEvent);
+    executor()->waitForEvent(killedEvent);
+}
+
+TEST_F(AsyncResultsMergerTest, TailableExhaustedCursor) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', tailable: true}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // Remote responds with an empty batch and a zero cursor id.
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch;
+    responses.emplace_back(_nss, CursorId(0), batch);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    // Afterwards, the ARM should return boost::none and remote cursors should be marked as
+    // exhausted.
+    ASSERT_TRUE(arm->ready());
+    ASSERT(!unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->remotesExhausted());
 }
 
 TEST_F(AsyncResultsMergerTest, GetMoreBatchSizes) {
     BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 3}");
-    makeCursorFromFindCmd(findCmd, {_remotes[0]});
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
 
     ASSERT_FALSE(arm->ready());
     auto readyEvent = unittest::assertGet(arm->nextEvent());
@@ -867,8 +1065,8 @@ TEST_F(AsyncResultsMergerTest, GetMoreBatchSizes) {
     std::vector<BSONObj> batch1 = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
     responses.emplace_back(_nss, CursorId(1), batch1);
 
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::InitialResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
@@ -882,18 +1080,287 @@ TEST_F(AsyncResultsMergerTest, GetMoreBatchSizes) {
     responses.emplace_back(_nss, CursorId(0), batch2);
     readyEvent = unittest::assertGet(arm->nextEvent());
 
-    BSONObj scheduledCmd = getCommandFromNextReadyRequest();
+    BSONObj scheduledCmd = getFirstPendingRequest().cmdObj;
     auto request = GetMoreRequest::parseFromBSON("anydbname", scheduledCmd);
     ASSERT_OK(request.getStatus());
     ASSERT_EQ(*request.getValue().batchSize, 1LL);
     ASSERT_EQ(request.getValue().cursorid, 1LL);
-    scheduleNetworkResponses(responses, CursorResponse::ResponseType::SubsequentResponse);
-    executor->waitForEvent(readyEvent);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
 
     ASSERT_TRUE(arm->ready());
     ASSERT_EQ(fromjson("{_id: 3}"), *unittest::assertGet(arm->nextReady()));
     ASSERT_TRUE(arm->ready());
     ASSERT(!unittest::assertGet(arm->nextReady()));
+}
+
+TEST_F(AsyncResultsMergerTest, SendsSecondaryOkAsMetadata) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', batchSize: 2}");
+    makeCursorFromFindCmd(
+        findCmd, {kTestShardIds[0]}, boost::none, ReadPreferenceSetting(ReadPreference::Nearest));
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    BSONObj cmdRequestMetadata = getFirstPendingRequest().metadata;
+    ASSERT_EQ(cmdRequestMetadata, rpc::ServerSelectionMetadata(true, boost::none).toBSON());
+
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch1 = {fromjson("{_id: 1}")};
+    responses.emplace_back(_nss, CursorId(0), batch1);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT(!unittest::assertGet(arm->nextReady()));
+}
+
+TEST_F(AsyncResultsMergerTest, AllowPartialResults) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', allowPartialResults: true}");
+    makeCursorFromFindCmd(findCmd, kTestShardIds);
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // An unretriable error occurs with the first host.
+    scheduleErrorResponse({ErrorCodes::AuthenticationFailed, "authentication failed"});
+    ASSERT_FALSE(arm->ready());
+
+    // Instead of propagating the error, we should be willing to return results from the two
+    // remaining shards.
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch1 = {fromjson("{_id: 1}")};
+    responses.emplace_back(_nss, CursorId(98), batch1);
+    std::vector<BSONObj> batch2 = {fromjson("{_id: 2}")};
+    responses.emplace_back(_nss, CursorId(99), batch2);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 2}"), *unittest::assertGet(arm->nextReady()));
+
+    ASSERT_FALSE(arm->ready());
+    readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // Now the second host becomes unreachable. We should still be willing to return results from
+    // the third shard.
+    scheduleErrorResponse({ErrorCodes::AuthenticationFailed, "authentication failed"});
+    ASSERT_FALSE(arm->ready());
+
+    responses.clear();
+    std::vector<BSONObj> batch3 = {fromjson("{_id: 3}")};
+    responses.emplace_back(_nss, CursorId(99), batch3);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 3}"), *unittest::assertGet(arm->nextReady()));
+
+    ASSERT_FALSE(arm->ready());
+    readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // Once the last reachable shard indicates that its cursor is closed, we're done.
+    responses.clear();
+    std::vector<BSONObj> batch4 = {};
+    responses.emplace_back(_nss, CursorId(0), batch4);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT(!unittest::assertGet(arm->nextReady()));
+}
+
+TEST_F(AsyncResultsMergerTest, AllowPartialResultsSingleNode) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', allowPartialResults: true}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch = {fromjson("{_id: 1}"), fromjson("{_id: 2}")};
+    responses.emplace_back(_nss, CursorId(98), batch);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 2}"), *unittest::assertGet(arm->nextReady()));
+
+    ASSERT_FALSE(arm->ready());
+    readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // The lone host involved in this query returns an error. This should simply cause us to return
+    // EOF.
+    scheduleErrorResponse({ErrorCodes::AuthenticationFailed, "authentication failed"});
+    ASSERT_TRUE(arm->ready());
+    ASSERT(!unittest::assertGet(arm->nextReady()));
+}
+
+TEST_F(AsyncResultsMergerTest, RetryOnNotMasterNoSlaveOkSingleNode) {
+    BSONObj findCmd = fromjson("{find: 'testcoll'}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // First and second attempts return an error.
+    scheduleErrorResponse({ErrorCodes::NotMasterNoSlaveOk, "not master and not slave"});
+    ASSERT_FALSE(arm->ready());
+
+    scheduleErrorResponse({ErrorCodes::NotMasterNoSlaveOk, "not master and not slave"});
+    ASSERT_FALSE(arm->ready());
+
+    // Third attempt succeeds.
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch = {fromjson("{_id: 1}")};
+    responses.emplace_back(_nss, CursorId(0), batch);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
+
+    ASSERT_TRUE(arm->remotesExhausted());
+    ASSERT_TRUE(arm->ready());
+}
+
+TEST_F(AsyncResultsMergerTest, RetryOnNotMasterNoSlaveOkAllFailSingleNode) {
+    BSONObj findCmd = fromjson("{find: 'testcoll'}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // All attempts return an error (one attempt plus three retries)
+    scheduleErrorResponse({ErrorCodes::NotMasterNoSlaveOk, "not master and not slave"});
+    ASSERT_FALSE(arm->ready());
+
+    scheduleErrorResponse({ErrorCodes::NotMasterNoSlaveOk, "not master and not slave"});
+    ASSERT_FALSE(arm->ready());
+
+    scheduleErrorResponse({ErrorCodes::NotMasterNoSlaveOk, "not master and not slave"});
+    ASSERT_FALSE(arm->ready());
+
+    scheduleErrorResponse({ErrorCodes::NotMasterNoSlaveOk, "not master and not slave"});
+    ASSERT_TRUE(arm->ready());
+
+    auto status = arm->nextReady();
+    ASSERT_EQ(status.getStatus().code(), ErrorCodes::NotMasterNoSlaveOk);
+
+    // Protocol is to kill the 'arm' on error before destruction.
+    auto killEvent = arm->kill();
+    executor()->waitForEvent(killEvent);
+}
+
+TEST_F(AsyncResultsMergerTest, RetryOnHostUnreachableAllowPartialResults) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', allowPartialResults: true}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0], kTestShardIds[1]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // First host returns single result
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch = {fromjson("{_id: 1}")};
+    responses.emplace_back(_nss, CursorId(0), batch);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+
+    // From the second host all attempts return an error (one attempt plus three retries)
+    scheduleErrorResponse({ErrorCodes::HostUnreachable, "host unreachable"});
+    ASSERT_FALSE(arm->ready());
+
+    scheduleErrorResponse({ErrorCodes::HostUnreachable, "host unreachable"});
+    ASSERT_FALSE(arm->ready());
+
+    scheduleErrorResponse({ErrorCodes::HostUnreachable, "host unreachable"});
+    ASSERT_FALSE(arm->ready());
+
+    scheduleErrorResponse({ErrorCodes::HostUnreachable, "host unreachable"});
+    ASSERT_TRUE(arm->ready());
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
+
+    ASSERT_TRUE(arm->remotesExhausted());
+    ASSERT_TRUE(arm->ready());
+}
+
+TEST_F(AsyncResultsMergerTest, GetMoreRequestIncludesMaxTimeMS) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', tailable: true, awaitData: true}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+
+    ASSERT_FALSE(arm->ready());
+    auto readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    std::vector<CursorResponse> responses;
+    std::vector<BSONObj> batch1 = {fromjson("{_id: 1}")};
+    responses.emplace_back(_nss, CursorId(123), batch1);
+    scheduleNetworkResponses(std::move(responses), CursorResponse::ResponseType::InitialResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 1}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT(!unittest::assertGet(arm->nextReady()));
+
+    ASSERT_OK(arm->setAwaitDataTimeout(Milliseconds(789)));
+
+    ASSERT_FALSE(arm->ready());
+    readyEvent = unittest::assertGet(arm->nextEvent());
+    ASSERT_FALSE(arm->ready());
+
+    // Pending getMore request should include maxTimeMS.
+    BSONObj expectedCmdObj = BSON("getMore" << CursorId(123) << "collection"
+                                            << "testcoll"
+                                            << "maxTimeMS" << 789);
+    ASSERT_EQ(getFirstPendingRequest().cmdObj, expectedCmdObj);
+
+    responses.clear();
+    std::vector<BSONObj> batch2 = {fromjson("{_id: 2}")};
+    responses.emplace_back(_nss, CursorId(0), batch2);
+    scheduleNetworkResponses(std::move(responses),
+                             CursorResponse::ResponseType::SubsequentResponse);
+    executor()->waitForEvent(readyEvent);
+
+    ASSERT_TRUE(arm->ready());
+    ASSERT_EQ(fromjson("{_id: 2}"), *unittest::assertGet(arm->nextReady()));
+    ASSERT_TRUE(arm->ready());
+    ASSERT(!unittest::assertGet(arm->nextReady()));
+}
+
+TEST_F(AsyncResultsMergerTest, GetMoreRequestWithoutTailableCantHaveMaxTime) {
+    BSONObj findCmd = fromjson("{find: 'testcoll'}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+    ASSERT_NOT_OK(arm->setAwaitDataTimeout(Milliseconds(789)));
+    auto killEvent = arm->kill();
+    executor()->waitForEvent(killEvent);
+}
+
+TEST_F(AsyncResultsMergerTest, GetMoreRequestWithoutAwaitDataCantHaveMaxTime) {
+    BSONObj findCmd = fromjson("{find: 'testcoll', tailable: true}");
+    makeCursorFromFindCmd(findCmd, {kTestShardIds[0]});
+    ASSERT_NOT_OK(arm->setAwaitDataTimeout(Milliseconds(789)));
+    auto killEvent = arm->kill();
+    executor()->waitForEvent(killEvent);
 }
 
 }  // namespace

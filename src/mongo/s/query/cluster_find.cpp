@@ -36,24 +36,40 @@
 #include <vector>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/connpool.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/query/store_possible_cursor.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
 namespace {
+
+static const BSONObj kSortKeyMetaProjection = BSON("$meta"
+                                                   << "sortKey");
+
+// We must allow some amount of overhead per result document, since when we make a cursor response
+// the documents are elements of a BSONArray. The overhead is 1 byte/doc for the type + 1 byte/doc
+// for the field name's null terminator + 1 byte per digit in the array index. The index can be no
+// more than 8 decimal digits since the response is at most 16MB, and 16 * 1024 * 1024 < 1 * 10^8.
+static const int kPerDocumentOverheadBytesUpperBound = 10;
 
 /**
  * Given the LiteParsedQuery 'lpq' being executed by mongos, returns a copy of the query which is
@@ -69,14 +85,30 @@ std::unique_ptr<LiteParsedQuery> transformQueryForShards(const LiteParsedQuery& 
     // Similarly, if nToReturn is set, we forward the sum of nToReturn and the skip.
     boost::optional<long long> newNToReturn;
     if (lpq.getNToReturn()) {
-        newNToReturn = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+        // !wantMore and ntoreturn mean the same as !wantMore and limit, so perform the conversion.
+        if (!lpq.wantMore()) {
+            newLimit = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+        } else {
+            newNToReturn = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+        }
+    }
+
+    // If there is a sort other than $natural, we send a sortKey meta-projection to the remote node.
+    BSONObj newProjection = lpq.getProj();
+    if (!lpq.getSort().isEmpty() && !lpq.getSort()["$natural"]) {
+        BSONObjBuilder projectionBuilder;
+        projectionBuilder.appendElements(lpq.getProj());
+        projectionBuilder.append(ClusterClientCursorParams::kSortKeyField, kSortKeyMetaProjection);
+        newProjection = projectionBuilder.obj();
     }
 
     return LiteParsedQuery::makeAsFindCmd(lpq.nss(),
                                           lpq.getFilter(),
-                                          lpq.getProj(),
+                                          newProjection,
                                           lpq.getSort(),
                                           lpq.getHint(),
+                                          lpq.getReadConcern(),
+                                          lpq.getCollation(),
                                           boost::none,  // Don't forward skip.
                                           newLimit,
                                           lpq.getBatchSize(),
@@ -97,7 +129,7 @@ std::unique_ptr<LiteParsedQuery> transformQueryForShards(const LiteParsedQuery& 
                                           lpq.isOplogReplay(),
                                           lpq.isNoCursorTimeout(),
                                           lpq.isAwaitData(),
-                                          lpq.isPartial());
+                                          lpq.isAllowPartialResults());
 }
 
 StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
@@ -116,24 +148,38 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         invariant(chunkManager);
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForQuery(shardIds, query.getParsed().getFilter());
+        chunkManager->getShardIdsForQuery(txn, query.getParsed().getFilter(), &shardIds);
 
         for (auto id : shardIds) {
-            shards.emplace_back(shardRegistry->getShard(txn, id));
+            auto shard = shardRegistry->getShard(txn, id);
+            if (!shard) {
+                return {ErrorCodes::ShardNotFound,
+                        str::stream() << "Shard with id:  " << id << " is not found."};
+            }
+            shards.emplace_back(shard);
         }
     }
 
-    ClusterClientCursorParams params(query.nss());
+    ClusterClientCursorParams params(query.nss(), readPref);
     params.limit = query.getParsed().getLimit();
     params.batchSize = query.getParsed().getEffectiveBatchSize();
     params.skip = query.getParsed().getSkip();
     params.isTailable = query.getParsed().isTailable();
+    params.isAwaitData = query.getParsed().isAwaitData();
+    params.isAllowPartialResults = query.getParsed().isAllowPartialResults();
+
+    // This is the batchSize passed to each subsequent getMore command issued by the cursor. We
+    // usually use the batchSize associated with the initial find, but as it is illegal to send a
+    // getMore with a batchSize of 0, we set it to use the default batchSize logic.
+    if (params.batchSize && *params.batchSize == 0) {
+        params.batchSize = boost::none;
+    }
 
     // $natural sort is actually a hint to use a collection scan, and shouldn't be treated like a
     // sort on mongos. Including a $natural anywhere in the sort spec results in the whole sort
     // being considered a hint to use a collection scan.
     if (!query.getParsed().getSort().hasField("$natural")) {
-        params.sort = query.getParsed().getSort();
+        params.sort = FindCommon::transformSortSpec(query.getParsed().getSort());
     }
 
     // Tailable cursors can't have a sort, which should have already been validated.
@@ -144,33 +190,67 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     // Use read pref to target a particular host from each shard. Also construct the find command
     // that we will forward to each shard.
     for (const auto& shard : shards) {
-        // The find command cannot be used to query config server content with legacy 3-host config
-        // servers, because the new targeting logic only works for config server replica sets.
-        if (shard->isConfig() && shard->getConnString().type() == ConnectionString::SYNC) {
-            return Status(ErrorCodes::CommandNotSupported,
-                          "find command not supported without config server as a replica set");
-        }
-
-        auto targeter = shard->getTargeter();
-        auto hostAndPort = targeter->findHost(readPref);
-        if (!hostAndPort.isOK()) {
-            return hostAndPort.getStatus();
-        }
+        invariant(!shard->isConfig() || shard->getConnString().type() != ConnectionString::INVALID);
 
         // Build the find command, and attach shard version if necessary.
         BSONObjBuilder cmdBuilder;
         lpqToForward->asFindCommand(&cmdBuilder);
 
         if (chunkManager) {
-            auto shardVersion = chunkManager->getVersion(shard->getId());
-            cmdBuilder.appendArray(LiteParsedQuery::kShardVersionField, shardVersion.toBSON());
+            ChunkVersion version(chunkManager->getVersion(shard->getId()));
+            version.appendForCommands(&cmdBuilder);
+        } else if (!query.nss().isOnInternalDb()) {
+            ChunkVersion version(ChunkVersion::UNSHARDED());
+            version.appendForCommands(&cmdBuilder);
         }
 
-        params.remotes.emplace_back(std::move(hostAndPort.getValue()), cmdBuilder.obj());
+        params.remotes.emplace_back(shard->getId(), cmdBuilder.obj());
     }
 
-    auto ccc =
-        stdx::make_unique<ClusterClientCursorImpl>(shardRegistry->getExecutor(), std::move(params));
+    auto ccc = ClusterClientCursorImpl::make(
+        Grid::get(txn)->getExecutorPool()->getArbitraryExecutor(), std::move(params));
+
+    auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
+    int bytesBuffered = 0;
+    while (!FindCommon::enoughForFirstBatch(query.getParsed(), results->size())) {
+        auto next = ccc->next();
+        if (!next.isOK()) {
+            return next.getStatus();
+        }
+
+        if (!next.getValue()) {
+            // We reached end-of-stream. If the cursor is not tailable, then we mark it as
+            // exhausted. If it is tailable, usually we keep it open (i.e. "NotExhausted") even
+            // when we reach end-of-stream. However, if all the remote cursors are exhausted, there
+            // is no hope of returning data and thus we need to close the mongos cursor as well.
+            if (!ccc->isTailable() || ccc->remotesExhausted()) {
+                cursorState = ClusterCursorManager::CursorState::Exhausted;
+            }
+            break;
+        }
+
+        // If adding this object will cause us to exceed the message size limit, then we stash it
+        // for later.
+        if (!FindCommon::haveSpaceForNext(*next.getValue(), results->size(), bytesBuffered)) {
+            ccc->queueResult(*next.getValue());
+            break;
+        }
+
+        // Add doc to the batch. Account for the space overhead associated with returning this doc
+        // inside a BSON array.
+        bytesBuffered += (next.getValue()->objsize() + kPerDocumentOverheadBytesUpperBound);
+        results->push_back(std::move(*next.getValue()));
+    }
+
+    if (!query.getParsed().wantMore() && !ccc->isTailable()) {
+        cursorState = ClusterCursorManager::CursorState::Exhausted;
+    }
+
+    // If the cursor is exhausted, then there are no more results to return and we don't need to
+    // allocate a cursor id.
+    if (cursorState == ClusterCursorManager::CursorState::Exhausted) {
+        return CursorId(0);
+    }
 
     // Register the cursor with the cursor manager.
     auto cursorManager = grid.getCursorManager();
@@ -179,38 +259,8 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     const auto cursorLifetime = query.getParsed().isNoCursorTimeout()
         ? ClusterCursorManager::CursorLifetime::Immortal
         : ClusterCursorManager::CursorLifetime::Mortal;
-    auto pinnedCursor =
-        cursorManager->registerCursor(std::move(ccc), query.nss(), cursorType, cursorLifetime);
-
-    auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
-    int bytesBuffered = 0;
-    while (!FindCommon::enoughForFirstBatch(query.getParsed(), results->size(), bytesBuffered)) {
-        auto next = pinnedCursor.next();
-        if (!next.isOK()) {
-            return next.getStatus();
-        }
-
-        if (!next.getValue()) {
-            // We reached end-of-stream.
-            if (!pinnedCursor.isTailable()) {
-                cursorState = ClusterCursorManager::CursorState::Exhausted;
-            }
-            break;
-        }
-
-        // Add doc to the batch.
-        bytesBuffered += next.getValue()->objsize();
-        results->push_back(std::move(*next.getValue()));
-    }
-
-    CursorId idToReturn = (cursorState == ClusterCursorManager::CursorState::Exhausted)
-        ? CursorId(0)
-        : pinnedCursor.getCursorId();
-
-    // Transfer ownership of the cursor back to the cursor manager.
-    pinnedCursor.returnCursor(cursorState);
-
-    return idToReturn;
+    return cursorManager->registerCursor(
+        ccc.releaseCursor(), query.nss(), cursorType, cursorLifetime);
 }
 
 }  // namespace
@@ -223,8 +273,16 @@ StatusWith<CursorId> ClusterFind::runQuery(OperationContext* txn,
                                            std::vector<BSONObj>* results) {
     invariant(results);
 
+    // Projection on the reserved sort key field is illegal in mongos.
+    if (query.getParsed().getProj().hasField(ClusterClientCursorParams::kSortKeyField)) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Projection contains illegal field '"
+                              << ClusterClientCursorParams::kSortKeyField
+                              << "': " << query.getParsed().getProj()};
+    }
+
     auto dbConfig = grid.catalogCache()->getDatabase(txn, query.nss().db().toString());
-    if (dbConfig.getStatus() == ErrorCodes::DatabaseNotFound) {
+    if (dbConfig.getStatus() == ErrorCodes::NamespaceNotFound) {
         // If the database doesn't exist, we successfully return an empty result set without
         // creating a cursor.
         return CursorId(0);
@@ -246,22 +304,36 @@ StatusWith<CursorId> ClusterFind::runQuery(OperationContext* txn,
         }
         auto status = std::move(cursorId.getStatus());
 
-        if (status != ErrorCodes::SendStaleConfig && status != ErrorCodes::RecvStaleConfig) {
-            // Errors other than receiving a stale config message from mongoD are fatal to the
-            // operation.
+        if (!ErrorCodes::isStaleShardingError(status.code()) &&
+            status != ErrorCodes::ShardNotFound) {
+            // Errors other than trying to reach a non existent shard or receiving a stale
+            // metadata message from MongoD are fatal to the operation. Network errors and
+            // replication retries happen at the level of the AsyncResultsMerger.
             return status;
         }
 
-        LOG(1) << "Received stale config for query " << query.toStringShort() << " on attempt "
-               << retries << " of " << kMaxStaleConfigRetries << ": " << status.reason();
+        LOG(1) << "Received error status for query " << query.toStringShort() << " on attempt "
+               << retries << " of " << kMaxStaleConfigRetries << ": " << status;
 
-        invariant(chunkManager);
-        chunkManager = chunkManager->reload(txn);
+        const bool staleEpoch = (status == ErrorCodes::StaleEpoch);
+        if (staleEpoch) {
+            if (!dbConfig.getValue()->reload(txn)) {
+                // If the reload failed that means the database wasn't found, so successfully return
+                // an empty result set without creating a cursor.
+                return CursorId(0);
+            }
+        }
+        chunkManager =
+            dbConfig.getValue()->getChunkManagerIfExists(txn, query.nss().ns(), true, staleEpoch);
+        if (!chunkManager) {
+            dbConfig.getValue()->getChunkManagerOrPrimary(
+                txn, query.nss().ns(), chunkManager, primary);
+        }
     }
 
     return {ErrorCodes::StaleShardVersion,
             str::stream() << "Retried " << kMaxStaleConfigRetries
-                          << " times without establishing shard version."};
+                          << " times without successfully establishing shard version."};
 }
 
 StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,
@@ -274,12 +346,23 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,
     }
     invariant(request.cursorid == pinnedCursor.getValue().getCursorId());
 
+    // If the fail point is enabled, busy wait until it is disabled.
+    while (MONGO_FAIL_POINT(keepCursorPinnedDuringGetMore)) {
+    }
+
+    if (request.awaitDataTimeout) {
+        auto status = pinnedCursor.getValue().setAwaitDataTimeout(*request.awaitDataTimeout);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
     std::vector<BSONObj> batch;
     int bytesBuffered = 0;
     long long batchSize = request.batchSize.value_or(0);
     long long startingFrom = pinnedCursor.getValue().getNumReturnedSoFar();
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
-    while (!FindCommon::enoughForGetMore(batchSize, batch.size(), bytesBuffered)) {
+    while (!FindCommon::enoughForGetMore(batchSize, batch.size())) {
         auto next = pinnedCursor.getValue().next();
         if (!next.isOK()) {
             return next.getStatus();
@@ -293,8 +376,14 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,
             break;
         }
 
-        // Add doc to the batch.
-        bytesBuffered += next.getValue()->objsize();
+        if (!FindCommon::haveSpaceForNext(*next.getValue(), batch.size(), bytesBuffered)) {
+            pinnedCursor.getValue().queueResult(*next.getValue());
+            break;
+        }
+
+        // Add doc to the batch. Account for the space overhead associated with returning this doc
+        // inside a BSON array.
+        bytesBuffered += (next.getValue()->objsize() + kPerDocumentOverheadBytesUpperBound);
         batch.push_back(std::move(*next.getValue()));
     }
 
@@ -305,6 +394,35 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* txn,
         ? CursorId(0)
         : request.cursorid;
     return CursorResponse(request.nss, idToReturn, std::move(batch), startingFrom);
+}
+
+StatusWith<ReadPreferenceSetting> ClusterFind::extractUnwrappedReadPref(const BSONObj& cmdObj,
+                                                                        const bool isSlaveOk) {
+    BSONElement queryOptionsElt;
+    auto status = bsonExtractTypedField(
+        cmdObj, LiteParsedQuery::kUnwrappedReadPrefField, BSONType::Object, &queryOptionsElt);
+    if (status.isOK()) {
+        // There must be a nested object containing the read preference if there is a queryOptions
+        // field.
+        BSONObj queryOptionsObj = queryOptionsElt.Obj();
+        invariant(queryOptionsObj[LiteParsedQuery::kWrappedReadPrefField].type() ==
+                  BSONType::Object);
+        BSONObj readPrefObj = queryOptionsObj[LiteParsedQuery::kWrappedReadPrefField].Obj();
+
+        auto readPref = ReadPreferenceSetting::fromBSON(readPrefObj);
+        if (!readPref.isOK()) {
+            return readPref.getStatus();
+        }
+        return readPref.getValue();
+    } else if (status != ErrorCodes::NoSuchKey) {
+        return status;
+    }
+
+    // If there is no explicit read preference, the value we use depends on the setting of the slave
+    // ok bit.
+    ReadPreference pref =
+        isSlaveOk ? mongo::ReadPreference::SecondaryPreferred : mongo::ReadPreference::PrimaryOnly;
+    return ReadPreferenceSetting(pref, TagSet());
 }
 
 }  // namespace mongo

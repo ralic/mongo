@@ -40,38 +40,7 @@ namespace mongo {
 
 class Collection;
 class OperationContext;
-
-/**
- * A container for the summary statistics that the profiler, slow query log, and
- * other non-explain debug mechanisms may want to collect.
- */
-struct PlanSummaryStats {
-    PlanSummaryStats()
-        : nReturned(0),
-          totalKeysExamined(0),
-          totalDocsExamined(0),
-          executionTimeMillis(0),
-          isIdhack(false),
-          hasSortStage(false) {}
-
-    // The number of results returned by the plan.
-    size_t nReturned;
-
-    // The total number of index keys examined by the plan.
-    size_t totalKeysExamined;
-
-    // The total number of documents examined by the plan.
-    size_t totalDocsExamined;
-
-    // The number of milliseconds spent inside the root stage's work() method.
-    long long executionTimeMillis;
-
-    // Did this plan use the fast path for key-value retrievals on the _id index?
-    bool isIdhack;
-
-    // Did this plan use an in-memory sort stage?
-    bool hasSortStage;
-};
+struct PlanSummaryStats;
 
 /**
  * Namespace for the collection of static methods used to generate explain information.
@@ -96,6 +65,17 @@ public:
     static void explainStages(PlanExecutor* exec,
                               ExplainCommon::Verbosity verbosity,
                               BSONObjBuilder* out);
+
+    /**
+     * Converts the PlanExecutor's winning plan stats tree to BSON and returns to the caller.
+     */
+    static BSONObj getWinningPlanStats(const PlanExecutor* exec);
+
+    /**
+     * Converts the PlanExecutor's winning plan stats tree to BSON and returns the result through
+     * the out-parameter 'bob'.
+     */
+    static void getWinningPlanStats(const PlanExecutor* exec, BSONObjBuilder* bob);
 
     /**
      * Converts the stats tree 'stats' into a corresponding BSON object containing
@@ -161,10 +141,11 @@ private:
      * @param winnerStats -- the stats tree for the winning plan.
      * @param rejectedStats -- an array of stats trees, one per rejected plan
      */
-    static void generatePlannerInfo(PlanExecutor* exec,
-                                    PlanStageStats* winnerStats,
-                                    const std::vector<PlanStageStats*>& rejectedStats,
-                                    BSONObjBuilder* out);
+    static void generatePlannerInfo(
+        PlanExecutor* exec,
+        PlanStageStats* winnerStats,
+        const std::vector<std::unique_ptr<PlanStageStats>>& rejectedStats,
+        BSONObjBuilder* out);
 
     /**
      * Generates the execution stats section for the stats tree 'stats',

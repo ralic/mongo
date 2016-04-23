@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -65,7 +65,7 @@ struct __wt_table {
 	TAILQ_ENTRY(__wt_table) q;
 	TAILQ_ENTRY(__wt_table) hashq;
 
-	int cg_complete, idx_complete, is_simple;
+	bool cg_complete, idx_complete, is_simple;
 	u_int ncolgroups, nindices, nkey_columns;
 
 	uint32_t refcnt;	/* Number of open cursors */
@@ -79,13 +79,13 @@ struct __wt_table {
 #define	WT_COLGROUPS(t)	WT_MAX((t)->ncolgroups, 1)
 
 /*
- * WT_WITH_LOCK --
- *	Acquire a lock, perform an operation, drop the lock.
+ * WT_WITH_LOCK_WAIT --
+ *	Wait for a lock, perform an operation, drop the lock.
  */
-#define	WT_WITH_LOCK(session, lock, flag, op) do {			\
+#define	WT_WITH_LOCK_WAIT(session, lock, flag, op) do {			\
 	if (F_ISSET(session, (flag))) {					\
 		op;							\
-	} else {							\
+	}  else {							\
 		__wt_spin_lock(session, (lock));			\
 		F_SET(session, (flag));					\
 		op;							\
@@ -95,32 +95,63 @@ struct __wt_table {
 } while (0)
 
 /*
+ * WT_WITH_LOCK --
+ *	Acquire a lock, perform an operation, drop the lock.
+ */
+#define	WT_WITH_LOCK(session, ret, lock, flag, op) do {			\
+	ret = 0;							\
+	if (!F_ISSET(session, (flag)) &&				\
+	    F_ISSET(session, WT_SESSION_LOCK_NO_WAIT)) {		\
+		if ((ret = __wt_spin_trylock(session, (lock))) == 0) {	\
+			F_SET(session, (flag));				\
+			op;						\
+			F_CLR(session, (flag));				\
+			__wt_spin_unlock(session, (lock));		\
+		}							\
+	} else								\
+		WT_WITH_LOCK_WAIT(session, lock, flag, op);		\
+} while (0)
+
+/*
  * WT_WITH_CHECKPOINT_LOCK --
  *	Acquire the checkpoint lock, perform an operation, drop the lock.
  */
-#define	WT_WITH_CHECKPOINT_LOCK(session, op)				\
-	WT_WITH_LOCK(session,						\
+#define	WT_WITH_CHECKPOINT_LOCK(session, ret, op)			\
+	WT_WITH_LOCK(session, ret,					\
 	    &S2C(session)->checkpoint_lock, WT_SESSION_LOCKED_CHECKPOINT, op)
 
 /*
  * WT_WITH_HANDLE_LIST_LOCK --
  *	Acquire the data handle list lock, perform an operation, drop the lock.
+ *
+ *	Note: always waits because some operations need the handle list lock to
+ *	discard handles, and we only expect it to be held across short
+ *	operations.
  */
 #define	WT_WITH_HANDLE_LIST_LOCK(session, op)				\
-	WT_WITH_LOCK(session,						\
+	WT_WITH_LOCK_WAIT(session, 					\
 	    &S2C(session)->dhandle_lock, WT_SESSION_LOCKED_HANDLE_LIST, op)
+
+/*
+ * WT_WITH_METADATA_LOCK --
+ *	Acquire the metadata lock, perform an operation, drop the lock.
+ */
+#define	WT_WITH_METADATA_LOCK(session, ret, op)				\
+	WT_WITH_LOCK(session, ret,					\
+	    &S2C(session)->metadata_lock, WT_SESSION_LOCKED_METADATA, op)
+
 /*
  * WT_WITH_SCHEMA_LOCK --
  *	Acquire the schema lock, perform an operation, drop the lock.
  *	Check that we are not already holding some other lock: the schema lock
  *	must be taken first.
  */
-#define	WT_WITH_SCHEMA_LOCK(session, op) do {				\
+#define	WT_WITH_SCHEMA_LOCK(session, ret, op) do {			\
 	WT_ASSERT(session,						\
 	    F_ISSET(session, WT_SESSION_LOCKED_SCHEMA) ||		\
 	    !F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST |		\
 	    WT_SESSION_NO_SCHEMA_LOCK | WT_SESSION_LOCKED_TABLE));	\
-	WT_WITH_LOCK(session,						\
+	WT_WITH_LOCK(session, ret,					\
 	    &S2C(session)->schema_lock, WT_SESSION_LOCKED_SCHEMA, op);	\
 } while (0)
 
@@ -128,11 +159,11 @@ struct __wt_table {
  * WT_WITH_TABLE_LOCK --
  *	Acquire the table lock, perform an operation, drop the lock.
  */
-#define	WT_WITH_TABLE_LOCK(session, op) do {				\
+#define	WT_WITH_TABLE_LOCK(session, ret, op) do {			\
 	WT_ASSERT(session,						\
 	    F_ISSET(session, WT_SESSION_LOCKED_TABLE) ||		\
 	    !F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST));		\
-	WT_WITH_LOCK(session,						\
+	WT_WITH_LOCK(session, ret,					\
 	    &S2C(session)->table_lock, WT_SESSION_LOCKED_TABLE, op);	\
 } while (0)
 
@@ -141,37 +172,47 @@ struct __wt_table {
  *	Drop the handle, table and/or schema locks, perform an operation,
  *	re-acquire the lock(s).
  */
-#define	WT_WITHOUT_LOCKS(session, op) do {			\
-	WT_CONNECTION_IMPL *__conn = S2C(session);		\
-	int __handle_locked =					\
-		F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST);\
-	int __table_locked =					\
-		F_ISSET(session, WT_SESSION_LOCKED_TABLE);	\
-	int __schema_locked =					\
-		F_ISSET(session, WT_SESSION_LOCKED_SCHEMA);	\
-	if (__handle_locked) {					\
-		F_CLR(session, WT_SESSION_LOCKED_HANDLE_LIST);	\
-		__wt_spin_unlock(session, &__conn->dhandle_lock);\
-	}							\
-	if (__table_locked) {					\
-		F_CLR(session, WT_SESSION_LOCKED_TABLE);	\
-		__wt_spin_unlock(session, &__conn->table_lock);\
-	}							\
-	if (__schema_locked) {					\
-		F_CLR(session, WT_SESSION_LOCKED_SCHEMA);	\
-		__wt_spin_unlock(session, &__conn->schema_lock);\
-	}							\
-	op;							\
-	if (__schema_locked) {					\
-		__wt_spin_lock(session, &__conn->schema_lock);	\
-		F_SET(session, WT_SESSION_LOCKED_SCHEMA);	\
-	}							\
-	if (__table_locked) {					\
-		__wt_spin_lock(session, &__conn->table_lock);	\
-		F_SET(session, WT_SESSION_LOCKED_TABLE);	\
-	}							\
-	if (__handle_locked) {					\
-		__wt_spin_lock(session, &__conn->dhandle_lock);	\
-		F_SET(session, WT_SESSION_LOCKED_HANDLE_LIST);	\
-	}							\
+#define	WT_WITHOUT_LOCKS(session, op) do {				\
+	WT_CONNECTION_IMPL *__conn = S2C(session);			\
+	bool __checkpoint_locked =					\
+	    F_ISSET(session, WT_SESSION_LOCKED_CHECKPOINT);		\
+	bool __handle_locked =						\
+	    F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST);		\
+	bool __table_locked =						\
+	    F_ISSET(session, WT_SESSION_LOCKED_TABLE);			\
+	bool __schema_locked =						\
+	    F_ISSET(session, WT_SESSION_LOCKED_SCHEMA);			\
+	if (__handle_locked) {						\
+		F_CLR(session, WT_SESSION_LOCKED_HANDLE_LIST);		\
+		__wt_spin_unlock(session, &__conn->dhandle_lock);	\
+	}								\
+	if (__table_locked) {						\
+		F_CLR(session, WT_SESSION_LOCKED_TABLE);		\
+		__wt_spin_unlock(session, &__conn->table_lock);		\
+	}								\
+	if (__schema_locked) {						\
+		F_CLR(session, WT_SESSION_LOCKED_SCHEMA);		\
+		__wt_spin_unlock(session, &__conn->schema_lock);	\
+	}								\
+	if (__checkpoint_locked) {					\
+		F_CLR(session, WT_SESSION_LOCKED_CHECKPOINT);		\
+		__wt_spin_unlock(session, &__conn->checkpoint_lock);	\
+	}								\
+	op;								\
+	if (__checkpoint_locked) {					\
+		__wt_spin_lock(session, &__conn->checkpoint_lock);	\
+		F_SET(session, WT_SESSION_LOCKED_CHECKPOINT);		\
+	}								\
+	if (__schema_locked) {						\
+		__wt_spin_lock(session, &__conn->schema_lock);		\
+		F_SET(session, WT_SESSION_LOCKED_SCHEMA);		\
+	}								\
+	if (__table_locked) {						\
+		__wt_spin_lock(session, &__conn->table_lock);		\
+		F_SET(session, WT_SESSION_LOCKED_TABLE);		\
+	}								\
+	if (__handle_locked) {						\
+		__wt_spin_lock(session, &__conn->dhandle_lock);		\
+		F_SET(session, WT_SESSION_LOCKED_HANDLE_LIST);		\
+	}								\
 } while (0)

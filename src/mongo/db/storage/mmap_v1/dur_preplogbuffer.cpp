@@ -44,7 +44,7 @@
 #include "mongo/db/storage/mmap_v1/dur_journalimpl.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -175,7 +175,7 @@ static void _PREPLOGBUFFER(JSectHeader& h, AlignedBuilder& bb) {
 
     // Invalidate the total length, we will fill it in later.
     h.setSectionLen(0xffffffff);
-    h.seqNumber = getLastDataFileFlushTime();
+    h.seqNumber = generateNextSeqNumber();
     h.fileId = j.curFileId();
 
     // Ops other than basic writes (DurOp's) go first

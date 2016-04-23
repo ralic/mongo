@@ -38,10 +38,23 @@ struct CollectionOptions;
 class NamespaceString;
 class OperationContext;
 
-struct oplogUpdateEntryArgs {
+/**
+ * Holds document update information used in logging.
+ */
+struct OplogUpdateEntryArgs {
+    // Name of the collection in which document is being updated.
     std::string ns;
+
+    // Fully updated document with damages (update modifiers) applied.
+    BSONObj updatedDoc;
+
+    // Document containing update modifiers -- e.g. $set and $unset
     BSONObj update;
+
+    // Document containing the _id field of the doc being updated.
     BSONObj criteria;
+
+    // True if this update comes from a chunk migration.
     bool fromMigrate;
 };
 
@@ -51,19 +64,43 @@ class OpObserver {
 public:
     OpObserver() {}
     ~OpObserver() {}
+
+    /**
+     * Holds document deletion information used in logging.
+     */
+    struct DeleteState {
+        // Contains the _id field of the document being deleted.
+        BSONObj idDoc;
+
+        // True if doc being deleted is located in a currently migrating
+        // chunk, where this is the chunk source.
+        bool isMigrating = false;
+    };
+
     void onCreateIndex(OperationContext* txn,
                        const std::string& ns,
                        BSONObj indexDoc,
                        bool fromMigrate = false);
-    void onInsert(OperationContext* txn,
-                  const NamespaceString& ns,
-                  BSONObj doc,
-                  bool fromMigrate = false);
-    void onUpdate(OperationContext* txn, oplogUpdateEntryArgs args);
+    void onInserts(OperationContext* txn,
+                   const NamespaceString& ns,
+                   std::vector<BSONObj>::const_iterator begin,
+                   std::vector<BSONObj>::const_iterator end,
+                   bool fromMigrate = false);
+    void onUpdate(OperationContext* txn, const OplogUpdateEntryArgs& args);
+    DeleteState aboutToDelete(OperationContext* txn, const NamespaceString& ns, const BSONObj& doc);
+    /**
+     * Handles logging before document is deleted.
+     *
+     * "ns" name of the collection from which deleteState.idDoc will be deleted.
+     * "deleteState" holds information about the deleted document.
+     * "fromMigrate" indicates whether the delete was induced by a chunk migration, and
+     * so should be ignored by the user as an internal maintenance operation and not a
+     * real delete.
+     */
     void onDelete(OperationContext* txn,
-                  const std::string& ns,
-                  const BSONObj& idDoc,
-                  bool fromMigrate = false);
+                  const NamespaceString& ns,
+                  DeleteState deleteState,
+                  bool fromMigrate);
     void onOpMessage(OperationContext* txn, const BSONObj& msgObj);
     void onCreateCollection(OperationContext* txn,
                             const NamespaceString& collectionName,

@@ -29,20 +29,35 @@
 
 #pragma once
 
+#include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
-
-class OperationContext;
-
 namespace repl {
 
 class StorageInterfaceMock : public StorageInterface {
-public:
-    explicit StorageInterfaceMock();
-    virtual ~StorageInterfaceMock();
+    MONGO_DISALLOW_COPYING(StorageInterfaceMock);
 
-    OperationContext* createOperationContext() override;
+public:
+    StorageInterfaceMock() = default;
+
+    bool getInitialSyncFlag(OperationContext* txn) const override;
+    void setInitialSyncFlag(OperationContext* txn) override;
+    void clearInitialSyncFlag(OperationContext* txn) override;
+
+    BatchBoundaries getMinValid(OperationContext* txn) const override;
+    void setMinValid(OperationContext* txn,
+                     const OpTime& endOpTime,
+                     const DurableRequirement durReq) override;
+    void setMinValid(OperationContext* txn, const BatchBoundaries& boundaries) override;
+
+private:
+    mutable stdx::mutex _initialSyncFlagMutex;
+    bool _initialSyncFlag = false;
+
+    mutable stdx::mutex _minValidBoundariesMutex;
+    BatchBoundaries _minValidBoundaries = {OpTime(), OpTime()};
 };
 
 }  // namespace repl

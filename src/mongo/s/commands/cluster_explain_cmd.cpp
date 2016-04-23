@@ -28,8 +28,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
+#include "mongo/s/query/cluster_find.h"
 
 namespace mongo {
 namespace {
@@ -52,7 +56,7 @@ class ClusterExplainCmd : public Command {
 public:
     ClusterExplainCmd() : Command("explain") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -62,6 +66,7 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
+
     virtual bool slaveOverrideOk() const {
         return true;
     }
@@ -119,15 +124,24 @@ public:
 
         const std::string cmdName = explainObj.firstElementFieldName();
         Command* commToExplain = Command::findCommand(cmdName);
-        if (NULL == commToExplain) {
-            mongoutils::str::stream ss;
-            ss << "Explain failed due to unknown command: " << cmdName;
-            Status explainStatus(ErrorCodes::CommandNotFound, ss);
-            return appendCommandStatus(result, explainStatus);
+        if (!commToExplain) {
+            return appendCommandStatus(
+                result,
+                Status{ErrorCodes::CommandNotFound,
+                       str::stream() << "Explain failed due to unknown command: " << cmdName});
         }
 
+        auto readPref =
+            ClusterFind::extractUnwrappedReadPref(cmdObj, options & QueryOption_SlaveOk);
+        if (!readPref.isOK()) {
+            return appendCommandStatus(result, readPref.getStatus());
+        }
+        const bool secondaryOk = (readPref.getValue().pref != ReadPreference::PrimaryOnly);
+        rpc::ServerSelectionMetadata metadata(secondaryOk, readPref.getValue());
+
         // Actually call the nested command's explain(...) method.
-        Status explainStatus = commToExplain->explain(txn, dbName, explainObj, verbosity, &result);
+        Status explainStatus =
+            commToExplain->explain(txn, dbName, explainObj, verbosity, metadata, &result);
         if (!explainStatus.isOK()) {
             return appendCommandStatus(result, explainStatus);
         }

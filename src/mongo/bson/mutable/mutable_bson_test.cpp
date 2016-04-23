@@ -703,12 +703,12 @@ TEST(SafeNumType, getSafeNum) {
     mmb::Element t0 = doc.makeElementInt("t0", 1234567890);
     ASSERT_EQUALS(1234567890, t0.getValueInt());
     mongo::SafeNum num = t0.getValueSafeNum();
-    ASSERT_EQUALS(num, 1234567890);
+    ASSERT_EQUALS(num, static_cast<int64_t>(1234567890));
 
     t0.setValueLong(1234567890LL);
     ASSERT_EQUALS(1234567890LL, t0.getValueLong());
     num = t0.getValueSafeNum();
-    ASSERT_EQUALS(num, 1234567890LL);
+    ASSERT_EQUALS(num, static_cast<int64_t>(1234567890LL));
 
     t0.setValueDouble(123.456789);
     ASSERT_EQUALS(123.456789, t0.getValueDouble());
@@ -751,11 +751,11 @@ TEST(SafeNumType, appendElement) {
     mmb::Document doc;
 
     mmb::Element t0 = doc.makeElementObject("e0");
-    t0.appendSafeNum("a timestamp field", mongo::SafeNum(1352151971LL));
+    t0.appendSafeNum("a timestamp field", mongo::SafeNum(static_cast<int64_t>(1352151971LL)));
 
     mmb::Element it = findFirstChildNamed(t0, "a timestamp field");
     ASSERT_TRUE(it.ok());
-    ASSERT_EQUALS(mongo::SafeNum(1352151971LL), it.getValueSafeNum());
+    ASSERT_EQUALS(mongo::SafeNum(static_cast<int64_t>(1352151971LL)), it.getValueSafeNum());
 }
 
 TEST(OIDType, getOidValue) {
@@ -1459,6 +1459,168 @@ TEST(Document, SetValueBSONElementFieldNameHandling) {
 
     static const char outJson[] = "{ a : 5 }";
     ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+}
+
+TEST(Document, SetValueElementFromSeparateDocument) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc1(inObj);
+
+    mongo::BSONObj inObj2 = mongo::fromjson("{ b : 5 }");
+    const mmb::Document doc2(inObj2);
+
+    auto setTo = doc1.root().leftChild();
+    auto setFrom = doc2.root().leftChild();
+    ASSERT_OK(setTo.setValueElement(setFrom));
+
+    ASSERT_EQ(mongo::fromjson("{ a : 5 }"), doc1.getObject());
+
+    // Doc containing the 'setFrom' element should be unchanged.
+    ASSERT_EQ(inObj2, doc2.getObject());
+}
+
+TEST(Document, SetValueElementIsNoopWhenSetToSelf) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc(inObj);
+
+    auto element = doc.root().leftChild();
+    ASSERT_OK(element.setValueElement(element));
+
+    ASSERT_EQ(inObj, doc.getObject());
+}
+
+TEST(Document, SetValueElementIsNoopWhenSetToSelfFromCopy) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc(inObj);
+
+    auto element = doc.root().leftChild();
+    auto elementCopy = element;
+    ASSERT_OK(element.setValueElement(elementCopy));
+
+    ASSERT_EQ(inObj, doc.getObject());
+}
+
+TEST(Document, SetValueElementIsNoopWhenSetToSelfNonRootElement) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : { b : { c: 4 } } }");
+    mmb::Document doc(inObj);
+
+    auto element = doc.root().leftChild().leftChild().leftChild();
+    ASSERT_EQ("c", element.getFieldName());
+    ASSERT_OK(element.setValueElement(element));
+
+    ASSERT_EQ(inObj, doc.getObject());
+}
+
+TEST(Document, SetValueElementSetToNestedObject) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc1(inObj);
+
+    mongo::BSONObj inObj2 = mongo::fromjson("{ b : { c : 5, d : 6 } }");
+    const mmb::Document doc2(inObj2);
+
+    auto setTo = doc1.root().leftChild();
+    auto setFrom = doc2.root().leftChild();
+    ASSERT_OK(setTo.setValueElement(setFrom));
+
+    ASSERT_EQ(mongo::fromjson("{ a : { c : 5, d : 6 } }"), doc1.getObject());
+
+    // Doc containing the 'setFrom' element should be unchanged.
+    ASSERT_EQ(inObj2, doc2.getObject());
+}
+
+TEST(Document, SetValueElementNonRootElements) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : { b : 5, c : 6 } }");
+    mmb::Document doc1(inObj);
+
+    mongo::BSONObj inObj2 = mongo::fromjson("{ d : { e : 8, f : 9 } }");
+    const mmb::Document doc2(inObj2);
+
+    auto setTo = doc1.root().leftChild().rightChild();
+    ASSERT_EQ("c", setTo.getFieldName());
+    auto setFrom = doc2.root().leftChild().leftChild();
+    ASSERT_EQ("e", setFrom.getFieldName());
+    ASSERT_OK(setTo.setValueElement(setFrom));
+
+    ASSERT_EQ(mongo::fromjson("{ a : { b : 5, c : 8 } }"), doc1.getObject());
+
+    // Doc containing the 'setFrom' element should be unchanged.
+    ASSERT_EQ(inObj2, doc2.getObject());
+}
+
+TEST(Document, SetValueElementSetRootToSelfErrors) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc(inObj);
+
+    auto element = doc.root();
+    ASSERT_NOT_OK(element.setValueElement(element));
+    ASSERT_EQ(inObj, doc.getObject());
+}
+
+TEST(Document, SetValueElementSetRootToAnotherDocRootErrors) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc1(inObj);
+
+    mongo::BSONObj inObj2 = mongo::fromjson("{ b : 5 }");
+    const mmb::Document doc2(inObj2);
+
+    auto setTo = doc1.root();
+    auto setFrom = doc2.root();
+    ASSERT_NOT_OK(setTo.setValueElement(setFrom));
+
+    ASSERT_EQ(inObj, doc1.getObject());
+    ASSERT_EQ(inObj2, doc2.getObject());
+}
+
+TEST(Document, SetValueElementSetRootToNotRootInSelfErrors) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc(inObj);
+
+    auto setTo = doc.root();
+    auto setFrom = doc.root().leftChild();
+    ASSERT_NOT_OK(setTo.setValueElement(setFrom));
+    ASSERT_EQ(inObj, doc.getObject());
+}
+
+TEST(Document, SetValueElementSetRootToNotRootInAnotherDocErrors) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : 4 }");
+    mmb::Document doc1(inObj);
+
+    mongo::BSONObj inObj2 = mongo::fromjson("{ b : 5 }");
+    const mmb::Document doc2(inObj2);
+
+    auto setTo = doc1.root();
+    auto setFrom = doc2.root().leftChild();
+    ASSERT_NOT_OK(setTo.setValueElement(setFrom));
+
+    ASSERT_EQ(inObj, doc1.getObject());
+    ASSERT_EQ(inObj2, doc2.getObject());
+}
+
+TEST(Document, SetValueElementSetToOwnRootErrors) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : { b : 4 } }");
+    mmb::Document doc(inObj);
+
+    auto setTo = doc.root().leftChild().leftChild();
+    ASSERT_EQ("b", setTo.getFieldName());
+    auto setFrom = doc.root();
+
+    ASSERT_NOT_OK(setTo.setValueElement(setFrom));
+    ASSERT_EQ(inObj, doc.getObject());
+}
+
+TEST(Document, SetValueElementSetToOtherDocRoot) {
+    mongo::BSONObj inObj = mongo::fromjson("{ a : { b : 4 } }");
+    mmb::Document doc1(inObj);
+
+    mongo::BSONObj inObj2 = mongo::fromjson("{ c : 5 } }");
+    mmb::Document doc2(inObj2);
+
+    auto setTo = doc1.root().leftChild().leftChild();
+    ASSERT_EQ("b", setTo.getFieldName());
+    auto setFrom = doc2.root();
+
+    ASSERT_OK(setTo.setValueElement(setFrom));
+    ASSERT_EQ(mongo::fromjson("{ a : { b : { c : 5 } } }"), doc1.getObject());
+    ASSERT_EQ(inObj2, doc2.getObject());
 }
 
 TEST(Document, CreateElementWithEmptyFieldName) {

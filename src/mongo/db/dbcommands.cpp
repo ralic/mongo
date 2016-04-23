@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <array>
 #include <boost/optional.hpp>
 #include <time.h>
 
@@ -61,6 +62,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/index_access_method.h"
@@ -70,6 +72,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
@@ -83,15 +86,20 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/request_interface.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
+#include "mongo/rpc/protocol.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point_service.h"
@@ -111,12 +119,10 @@ using std::unique_ptr;
 // This is a special flag that allows for testing of snapshot behavior by skipping the replication
 // related checks and isolating the storage/query side of snapshotting.
 bool testingSnapshotBehaviorInIsolation = false;
-ExportedServerParameter<bool> TestingSnapshotBehaviorInIsolation(
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly> TestingSnapshotBehaviorInIsolation(
     ServerParameterSet::getGlobal(),
     "testingSnapshotBehaviorInIsolation",
-    &testingSnapshotBehaviorInIsolation,
-    true,
-    false);
+    &testingSnapshotBehaviorInIsolation);
 
 
 class CmdShutdownMongoD : public CmdShutdown {
@@ -173,7 +179,8 @@ public:
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
@@ -186,7 +193,7 @@ public:
              string& errmsg,
              BSONObjBuilder& result) {
         // disallow dropping the config database
-        if (serverGlobalParams.configsvr && (dbname == "config")) {
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer && (dbname == "config")) {
             return appendCommandStatus(result,
                                        Status(ErrorCodes::IllegalOperation,
                                               "Cannot drop 'config' database if mongod started "
@@ -209,7 +216,7 @@ public:
         }
 
         Status status = dropDatabase(txn, dbname);
-        if (status == ErrorCodes::DatabaseNotFound) {
+        if (status == ErrorCodes::NamespaceNotFound) {
             return appendCommandStatus(result, Status::OK());
         }
         if (status.isOK()) {
@@ -232,8 +239,9 @@ public:
         help << "repair database.  also compacts. note: slow.";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -261,7 +269,13 @@ public:
         // TODO: SERVER-4328 Don't lock globally
         ScopedTransaction transaction(txn, MODE_X);
         Lock::GlobalWrite lk(txn->lockState());
-        OldClientContext context(txn, dbname);
+
+        // TODO (Kal): OldClientContext legacy, needs to be removed
+        {
+            CurOp::get(txn)->ensureStarted();
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            CurOp::get(txn)->setNS_inlock(dbname);
+        }
 
         log() << "repairDatabase " << dbname;
         BackgroundOperation::assertNoBgOpInProgForDb(dbname);
@@ -302,8 +316,9 @@ public:
         help << "http://docs.mongodb.org/manual/reference/command/profile/#dbcmd.profile";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
@@ -337,23 +352,32 @@ public:
              int options,
              string& errmsg,
              BSONObjBuilder& result) {
-        // Needs to be locked exclusively, because creates the system.profile collection
-        // in the local database.
-        ScopedTransaction transaction(txn, MODE_IX);
-        Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
+        BSONElement firstElement = cmdObj.firstElement();
+        int profilingLevel = firstElement.numberInt();
 
-        BSONElement e = cmdObj.firstElement();
-        result.append("was", ctx.db()->getProfilingLevel());
-        result.append("slowms", serverGlobalParams.slowMS);
+        // If profilingLevel is 0, 1, or 2, needs to be locked exclusively,
+        // because creates the system.profile collection in the local database.
 
-        int p = (int)e.number();
+        const bool readOnly = (profilingLevel < 0 || profilingLevel > 2);
+        const LockMode dbMode = readOnly ? MODE_S : MODE_X;
+        const LockMode transactionMode = readOnly ? MODE_IS : MODE_IX;
+
         Status status = Status::OK();
 
-        if (p == -1)
-            status = Status::OK();
-        else if (p >= 0 && p <= 2) {
-            status = ctx.db()->setProfilingLevel(txn, p);
+        ScopedTransaction transaction(txn, transactionMode);
+        AutoGetDb ctx(txn, dbname, dbMode);
+        Database* db = ctx.getDb();
+
+        result.append("was", db ? db->getProfilingLevel() : serverGlobalParams.defaultProfile);
+        result.append("slowms", serverGlobalParams.slowMS);
+
+        if (!readOnly) {
+            if (!db) {
+                // When setting the profiling level, create the database if it didn't already exist.
+                // When just reading the profiling level, we do not create the database.
+                db = dbHolder().openDb(txn, dbname);
+            }
+            status = db->setProfilingLevel(txn, profilingLevel);
         }
 
         const BSONElement slow = cmdObj["slowms"];
@@ -385,8 +409,9 @@ public:
              "monitoring#MonitoringandDiagnostics-DatabaseRecord%2FReplay%28diagLoggingcommand%29";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return true;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -412,7 +437,13 @@ public:
         //
         ScopedTransaction transaction(txn, MODE_IX);
         Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
+
+        // TODO (Kal): OldClientContext legacy, needs to be removed
+        {
+            CurOp::get(txn)->ensureStarted();
+            stdx::lock_guard<Client> lk(*txn->getClient());
+            CurOp::get(txn)->setNS_inlock(dbname);
+        }
 
         int was = _diaglog.setLevel(cmdObj.firstElement().numberInt());
         _diaglog.flush();
@@ -446,7 +477,8 @@ public:
         help << "drop a collection\n{drop : <collectionName>}";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
@@ -456,21 +488,21 @@ public:
                      int,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        const std::string nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
 
-        if (nsToDrop.find('$') != string::npos) {
-            errmsg = "can't drop collection with reserved $ character in name";
+        if (NamespaceString::virtualized(nsToDrop.ns())) {
+            errmsg = "can't drop a virtual collection";
             return false;
         }
 
         if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone) &&
-            NamespaceString(nsToDrop).isOplog()) {
+            nsToDrop.isOplog()) {
             errmsg = "can't drop live oplog while replicating";
             return false;
         }
 
-        return appendCommandStatus(result, dropCollection(txn, NamespaceString(nsToDrop), result));
+        return appendCommandStatus(result, dropCollection(txn, nsToDrop, result));
     }
 
 } cmdDrop;
@@ -486,7 +518,8 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
@@ -544,7 +577,8 @@ public:
         help << " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -597,7 +631,11 @@ public:
 
         MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
             auto statusWithCQ =
-                CanonicalQuery::canonicalize(NamespaceString(ns), query, sort, BSONObj());
+                CanonicalQuery::canonicalize(NamespaceString(ns),
+                                             query,
+                                             sort,
+                                             BSONObj(),
+                                             ExtensionsCallbackDisallowExtensions());
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
                 return 0;
@@ -667,6 +705,14 @@ public:
                 }
             }
 
+            if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+                return appendCommandStatus(result,
+                                           Status(ErrorCodes::OperationFailed,
+                                                  str::stream()
+                                                      << "Executor error during filemd5 command: "
+                                                      << WorkingSetCommon::toStatusString(obj)));
+            }
+
             if (partialOk)
                 result.appendBinData("md5state", sizeof(st), BinDataGeneral, &st);
 
@@ -706,7 +752,7 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void help(stringstream& help) const {
@@ -808,8 +854,9 @@ public:
         long long numObjects = 0;
 
         RecordId loc;
+        BSONObj obj;
         PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &loc))) {
             if (estimate)
                 size += avgObjSize;
             else
@@ -823,8 +870,13 @@ public:
             }
         }
 
-        if (PlanExecutor::IS_EOF != state) {
+        if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             warning() << "Internal error while reading " << ns << endl;
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::OperationFailed,
+                       str::stream() << "Executor error while reading during dataSize command: "
+                                     << WorkingSetCommon::toStatusString(obj)));
         }
 
         ostringstream os;
@@ -832,7 +884,6 @@ public:
         if (!min.isEmpty()) {
             os << " between " << min << " and " << max;
         }
-        logIfSlow(timer, os.str());
 
         result.appendNumber("size", size);
         result.appendNumber("numObjects", numObjects);
@@ -849,7 +900,7 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void help(stringstream& help) const {
@@ -959,7 +1010,7 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
     virtual void help(stringstream& help) const {
@@ -982,8 +1033,8 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const std::string ns = parseNsCollectionRequired(dbname, jsobj);
-        return appendCommandStatus(result, collMod(txn, NamespaceString(ns), jsobj, &result));
+        const NamespaceString nss = parseNsCollectionRequired(dbname, jsobj);
+        return appendCommandStatus(result, collMod(txn, nss, jsobj, &result));
     }
 
 } collectionModCommand;
@@ -995,7 +1046,7 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void help(stringstream& help) const {
@@ -1032,9 +1083,9 @@ public:
 
         const string ns = parseNs(dbname, jsobj);
 
-        // TODO: OldClientContext legacy, needs to be removed
-        CurOp::get(txn)->ensureStarted();
+        // TODO (Kal): OldClientContext legacy, needs to be removed
         {
+            CurOp::get(txn)->ensureStarted();
             stdx::lock_guard<Client> lk(*txn->getClient());
             CurOp::get(txn)->setNS_inlock(dbname);
         }
@@ -1085,7 +1136,7 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void help(stringstream& help) const {
@@ -1112,7 +1163,7 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual Status checkAuthForCommand(ClientBasic* client,
@@ -1157,6 +1208,52 @@ private:
     bool maintenanceModeSet;
 };
 
+namespace {
+
+// Symbolic names for indexes to make code more readable.
+const std::size_t kCmdOptionMaxTimeMSField = 0;
+const std::size_t kHelpField = 1;
+const std::size_t kShardVersionFieldIdx = 2;
+const std::size_t kQueryOptionMaxTimeMSField = 3;
+
+// We make an array of the fields we need so we can call getFields once. This saves repeated
+// scans over the command object.
+const std::array<StringData, 4> neededFieldNames{LiteParsedQuery::cmdOptionMaxTimeMS,
+                                                 Command::kHelpFieldName,
+                                                 ChunkVersion::kShardVersionField,
+                                                 LiteParsedQuery::queryOptionMaxTimeMS};
+}  // namespace
+
+void appendOpTimeMetadata(OperationContext* txn,
+                          const rpc::RequestInterface& request,
+                          BSONObjBuilder* metadataBob) {
+    const bool isShardingAware = ShardingState::get(txn)->enabled();
+    const bool isConfig = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
+    repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+    const bool isReplSet =
+        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+
+    if (isReplSet) {
+        // Attach our own last opTime.
+        repl::OpTime lastOpTimeFromClient =
+            repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
+        replCoord->prepareReplResponseMetadata(request, lastOpTimeFromClient, metadataBob);
+
+        // For commands from mongos, append some info to help getLastError(w) work.
+        // TODO: refactor out of here as part of SERVER-18236
+        if (isShardingAware || isConfig) {
+            rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
+                .writeToMetadata(metadataBob, request.getProtocol());
+        }
+    }
+
+    // If we're a shard other than the config shard, attach the last configOpTime we know about.
+    if (isShardingAware && !isConfig) {
+        auto opTime = grid.configOpTime();
+        rpc::ConfigServerMetadata(opTime).writeToMetadata(metadataBob);
+    }
+}
+
 /**
  * this handles
  - auth
@@ -1175,39 +1272,45 @@ void Command::execCommand(OperationContext* txn,
             stdx::lock_guard<Client> lk(*txn->getClient());
             CurOp::get(txn)->setCommand_inlock(command);
         }
+
+        rpc::setOperationProtocol(txn, request.getProtocol());  // SERVER-21485.  Remove after 3.2
+
         // TODO: move this back to runCommands when mongos supports OperationContext
         // see SERVER-18515 for details.
         uassertStatusOK(rpc::readRequestMetadata(txn, request.getMetadata()));
 
-        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kMetadata);
+        dassert(replyBuilder->getState() == rpc::ReplyBuilderInterface::State::kCommandReply);
 
         std::string dbname = request.getDatabase().toString();
         unique_ptr<MaintenanceModeSetter> mmSetter;
 
-        if (isHelpRequest(request)) {
+        std::array<BSONElement, std::tuple_size<decltype(neededFieldNames)>::value>
+            extractedFields{};
+        request.getCommandArgs().getFields(neededFieldNames, &extractedFields);
+
+        if (isHelpRequest(extractedFields[kHelpField])) {
             CurOp::get(txn)->ensureStarted();
+            // We disable last-error for help requests due to SERVER-11492, because config servers
+            // use help requests to determine which commands are database writes, and so must be
+            // forwarded to all config servers.
+            LastError::get(txn->getClient()).disable();
             generateHelpResponse(txn, request, replyBuilder, *command);
             return;
         }
 
-        repl::ReplicationCoordinator* replCoord =
-            repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
         ImpersonationSessionGuard guard(txn);
-
         uassertStatusOK(
             _checkAuthorization(command, txn->getClient(), dbname, request.getCommandArgs()));
 
+        repl::ReplicationCoordinator* replCoord =
+            repl::ReplicationCoordinator::get(txn->getClient()->getServiceContext());
+        const bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
+
         {
-            bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
             bool commandCanRunOnSecondary = command->slaveOk();
 
             bool commandIsOverriddenToRunOnSecondary = command->slaveOverrideOk() &&
-
-                // The $secondaryOk option is set.
-                (rpc::ServerSelectionMetadata::get(txn).isSecondaryOk() ||
-
-                 // Or the command has a read preference (may be incorrect, see SERVER-18194).
-                 (rpc::ServerSelectionMetadata::get(txn).getReadPreference() != boost::none));
+                rpc::ServerSelectionMetadata::get(txn).canRunOnSecondary();
 
             bool iAmStandalone = !txn->writesAreReplicated();
             bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||
@@ -1215,7 +1318,7 @@ void Command::execCommand(OperationContext* txn,
 
             // This logic is clearer if we don't have to invert it.
             if (!canRunHere && command->slaveOverrideOk()) {
-                uasserted(ErrorCodes::NotMasterNoSlaveOkCode, "not master and slaveOk=false");
+                uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
             }
 
             uassert(ErrorCodes::NotMaster, "not master", canRunHere);
@@ -1224,7 +1327,7 @@ void Command::execCommand(OperationContext* txn,
                 replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
                 !replCoord->canAcceptWritesForDatabase(dbname) &&
                 !replCoord->getMemberState().secondary()) {
-                uasserted(ErrorCodes::NotMasterOrSecondaryCode, "node is recovering");
+                uasserted(ErrorCodes::NotMasterOrSecondary, "node is recovering");
             }
         }
 
@@ -1242,17 +1345,40 @@ void Command::execCommand(OperationContext* txn,
         }
 
         // Handle command option maxTimeMS.
-        int maxTimeMS =
-            uassertStatusOK(LiteParsedQuery::parseMaxTimeMSCommand(request.getCommandArgs()));
+        int maxTimeMS = uassertStatusOK(
+            LiteParsedQuery::parseMaxTimeMS(extractedFields[kCmdOptionMaxTimeMSField]));
 
         uassert(ErrorCodes::InvalidOptions,
                 "no such command option $maxTimeMs; use maxTimeMS instead",
-                !request.getCommandArgs().hasField("$maxTimeMS"));
+                extractedFields[kQueryOptionMaxTimeMSField].eoo());
 
         CurOp::get(txn)->setMaxTimeMicros(static_cast<unsigned long long>(maxTimeMS) * 1000);
 
-        // Handle shard version that may have been sent along with the command.
-        OperationShardVersion::get(txn).initializeFromCommand(request.getCommandArgs());
+        // Operations are only versioned against the primary. We also make sure not to redo shard
+        // version handling if this command was issued via the direct client.
+        if (iAmPrimary && !txn->getClient()->isInDirectClient()) {
+            // Handle shard version and config optime information that may have been sent along with
+            // the command.
+            auto& oss = OperationShardingState::get(txn);
+
+            auto commandNS = NamespaceString(command->parseNs(dbname, request.getCommandArgs()));
+            oss.initializeShardVersion(commandNS, extractedFields[kShardVersionFieldIdx]);
+
+            auto shardingState = ShardingState::get(txn);
+            if (shardingState->enabled()) {
+                // TODO(spencer): Do this unconditionally once all nodes are sharding aware
+                // by default.
+                shardingState->updateConfigServerOpTimeFromMetadata(txn);
+            } else {
+                massert(
+                    34422,
+                    str::stream()
+                        << "Received a command with sharding chunk version information but this "
+                           "node is not sharding aware: " << request.getCommandArgs().jsonString(),
+                    !oss.hasShardVersion() ||
+                        ChunkVersion::isIgnoredVersion(oss.getShardVersion(commandNS)));
+            }
+        }
 
         // Can throw
         txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
@@ -1270,8 +1396,18 @@ void Command::execCommand(OperationContext* txn,
         if (!retval) {
             command->_commandsFailed.increment();
         }
-    } catch (const DBException& exception) {
-        Command::generateErrorResponse(txn, replyBuilder, exception, request, command);
+    } catch (const DBException& e) {
+        // If we got a stale config, wait in case the operation is stuck in a critical section
+        if (e.getCode() == ErrorCodes::SendStaleConfig) {
+            auto& sce = static_cast<const StaleConfigException&>(e);
+            ShardingState::get(txn)
+                ->onStaleShardVersion(txn, NamespaceString(sce.getns()), sce.getVersionReceived());
+        }
+
+        BSONObjBuilder metadataBob;
+        appendOpTimeMetadata(txn, request, &metadataBob);
+
+        Command::generateErrorResponse(txn, replyBuilder, e, request, command, metadataBob.done());
     }
 }
 
@@ -1282,60 +1418,105 @@ void Command::execCommand(OperationContext* txn,
 bool Command::run(OperationContext* txn,
                   const rpc::RequestInterface& request,
                   rpc::ReplyBuilderInterface* replyBuilder) {
-    BSONObjBuilder replyBuilderBob;
+    auto bytesToReserve = reserveBytesForReply();
+
+// SERVER-22100: In Windows DEBUG builds, the CRT heap debugging overhead, in conjunction with the
+// additional memory pressure introduced by reply buffer pre-allocation, causes the concurrency
+// suite to run extremely slowly. As a workaround we do not pre-allocate in Windows DEBUG builds.
+#ifdef _WIN32
+    if (kDebugBuild)
+        bytesToReserve = 0;
+#endif
+
+    BSONObjBuilder inPlaceReplyBob(replyBuilder->getInPlaceReplyBuilder(bytesToReserve));
 
     repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
 
-    repl::ReadConcernArgs readConcern;
+    repl::ReadConcernArgs readConcernArgs;
     {
         // parse and validate ReadConcernArgs
-        auto readConcernParseStatus = readConcern.initialize(request.getCommandArgs());
+        auto readConcernParseStatus = readConcernArgs.initialize(request.getCommandArgs());
         if (!readConcernParseStatus.isOK()) {
-            replyBuilder->setMetadata(rpc::makeEmptyMetadata())
-                .setCommandReply(readConcernParseStatus);
-            return false;
+            auto result = appendCommandStatus(inPlaceReplyBob, readConcernParseStatus);
+            inPlaceReplyBob.doneFast();
+            replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+            return result;
         }
 
         if (!supportsReadConcern()) {
             // Only return an error if a non-nullish readConcern was parsed, but do not process
             // readConcern regardless.
-            if (!readConcern.getOpTime().isNull() ||
-                readConcern.getLevel() != repl::ReadConcernLevel::kLocalReadConcern) {
-                replyBuilder->setMetadata(rpc::makeEmptyMetadata())
-                    .setCommandReply({ErrorCodes::InvalidOptions,
-                                      str::stream()
-                                          << "Command " << name << " does not support "
-                                          << repl::ReadConcernArgs::kReadConcernFieldName});
-                return false;
+            if (!readConcernArgs.getOpTime().isNull() ||
+                readConcernArgs.getLevel() != repl::ReadConcernLevel::kLocalReadConcern) {
+                auto result = appendCommandStatus(
+                    inPlaceReplyBob,
+                    {ErrorCodes::InvalidOptions,
+                     str::stream() << "Command " << getName() << " does not support "
+                                   << repl::ReadConcernArgs::kReadConcernFieldName});
+                inPlaceReplyBob.doneFast();
+                replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+                return result;
             }
         } else {
             // Skip waiting for the OpTime when testing snapshot behavior.
             if (!testingSnapshotBehaviorInIsolation) {
                 // Wait for readConcern to be satisfied.
-                auto readConcernResult = replCoord->waitUntilOpTime(txn, readConcern);
-                readConcernResult.appendInfo(&replyBuilderBob);
+                auto readConcernResult = replCoord->waitUntilOpTime(txn, readConcernArgs);
+                readConcernResult.appendInfo(&inPlaceReplyBob);
                 if (!readConcernResult.getStatus().isOK()) {
-                    replyBuilder->setMetadata(rpc::makeEmptyMetadata())
-                        .setCommandReply(readConcernResult.getStatus(), replyBuilderBob.done());
-                    return false;
+                    if (ErrorCodes::ExceededTimeLimit == readConcernResult.getStatus()) {
+                        const int debugLevel =
+                            serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
+                        LOG(debugLevel)
+                            << "Command on database " << request.getDatabase()
+                            << " timed out waiting for read concern to be satisfied. Command: "
+                            << getRedactedCopyForLogging(request.getCommandArgs());
+                    }
+                    auto result =
+                        appendCommandStatus(inPlaceReplyBob, readConcernResult.getStatus());
+                    inPlaceReplyBob.doneFast();
+                    replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+                    return result;
                 }
             }
 
             if ((replCoord->getReplicationMode() ==
                      repl::ReplicationCoordinator::Mode::modeReplSet ||
                  testingSnapshotBehaviorInIsolation) &&
-                readConcern.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
+                readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
+                // ReadConcern Majority is not supported in ProtocolVersion 0.
+                if (!testingSnapshotBehaviorInIsolation && !replCoord->isV1ElectionProtocol()) {
+                    auto result = appendCommandStatus(
+                        inPlaceReplyBob,
+                        {ErrorCodes::ReadConcernMajorityNotEnabled,
+                         str::stream() << "Replica sets running protocol version 0 do not support "
+                                          "readConcern: majority"});
+                    inPlaceReplyBob.doneFast();
+                    replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+                    return result;
+                }
+
+                const int debugLevel =
+                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
+                LOG(debugLevel) << "Waiting for 'committed' snapshot to be available for reading: "
+                                << readConcernArgs;
                 Status status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
 
                 // Wait until a snapshot is available.
                 while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
-                    replCoord->waitForNewSnapshot(txn);
+                    LOG(debugLevel)
+                        << "Snapshot not available for readConcern: " << readConcernArgs;
+                    replCoord->waitUntilSnapshotCommitted(txn, SnapshotName::min());
                     status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
                 }
 
+                LOG(debugLevel) << "Using 'committed' snapshot. " << CurOp::get(txn)->query();
+
                 if (!status.isOK()) {
-                    replyBuilder->setMetadata(rpc::makeEmptyMetadata()).setCommandReply(status);
-                    return false;
+                    auto result = appendCommandStatus(inPlaceReplyBob, status);
+                    inPlaceReplyBob.doneFast();
+                    replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+                    return result;
                 }
             }
         }
@@ -1349,37 +1530,56 @@ bool Command::run(OperationContext* txn,
     // run expects const db std::string (can't bind to temporary)
     const std::string db = request.getDatabase().toString();
 
+    StatusWith<WriteConcernOptions> wcResult =
+        extractWriteConcern(txn, cmd, db, this->supportsWriteConcern(cmd));
+    if (!wcResult.isOK()) {
+        auto result = appendCommandStatus(inPlaceReplyBob, wcResult.getStatus());
+        inPlaceReplyBob.doneFast();
+        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
+        return result;
+    }
+
+    if (this->supportsWriteConcern(cmd)) {
+        txn->setWriteConcern(wcResult.getValue());
+    }
+
     // TODO: remove queryOptions parameter from command's run method.
-    bool result = this->run(txn, db, cmd, 0, errmsg, replyBuilderBob);
+    bool result = this->run(txn, db, cmd, 0, errmsg, inPlaceReplyBob);
 
-    BSONObjBuilder metadataBob;
+    if (this->supportsWriteConcern(cmd)) {
+        if (shouldLog(logger::LogSeverity::Debug(1))) {
+            BSONObj oldWC = wcResult.getValue().toBSON();
+            BSONObj newWC = txn->getWriteConcern().toBSON();
+            if (oldWC != newWC) {
+                LOG(1) << "Provided writeConcern was overridden from " << oldWC << " to " << newWC
+                       << " for command " << cmd;
+            }
+        }
 
-    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    if (isReplSet) {
-        repl::OpTime lastOpTimeFromClient =
-            repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
-        replCoord->prepareReplResponseMetadata(
-            request, lastOpTimeFromClient, readConcern, &metadataBob);
+        WriteConcernResult res;
+        auto waitForWCStatus =
+            waitForWriteConcern(txn,
+                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                                txn->getWriteConcern(),
+                                &res);
+        appendCommandWCStatus(inPlaceReplyBob, waitForWCStatus, res);
 
-        // For commands from mongos, append some info to help getLastError(w) work.
-        // TODO: refactor out of here as part of SERVER-18326
-        if (ShardingState::get(txn)->enabled()) {
-            rpc::ShardingMetadata(lastOpTimeFromClient.getTimestamp(), replCoord->getElectionId())
-                .writeToMetadata(&metadataBob);
+        // SERVER-22421: This code is to ensure error response backwards compatibility with the
+        // user management commands. This can be removed in 3.6.
+        if (!waitForWCStatus.isOK() && isUserManagementCommand(this->getName())) {
+            BSONObj temp = inPlaceReplyBob.asTempObj().copy();
+            inPlaceReplyBob.resetToEmpty();
+            appendCommandStatus(inPlaceReplyBob, waitForWCStatus);
+            inPlaceReplyBob.appendElementsUnique(temp);
         }
     }
 
-    auto cmdResponse = replyBuilderBob.done();
-    replyBuilder->setMetadata(metadataBob.done());
+    appendCommandStatus(inPlaceReplyBob, result, errmsg);
+    inPlaceReplyBob.doneFast();
 
-    if (result) {
-        replyBuilder->setCommandReply(std::move(cmdResponse));
-    } else {
-        // maintain existing behavior of returning all data appended to builder
-        // even if command returned false
-        replyBuilder->setCommandReply(Status(ErrorCodes::CommandFailed, errmsg),
-                                      std::move(cmdResponse));
-    }
+    BSONObjBuilder metadataBob;
+    appendOpTimeMetadata(txn, request, &metadataBob);
+    replyBuilder->setMetadata(metadataBob.done());
 
     return result;
 }

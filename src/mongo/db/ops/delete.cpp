@@ -45,7 +45,7 @@ namespace mongo {
    god:     allow access to system namespaces, and don't yield
 */
 long long deleteObjects(OperationContext* txn,
-                        Database* db,
+                        Collection* collection,
                         StringData ns,
                         BSONObj pattern,
                         PlanExecutor::YieldPolicy policy,
@@ -60,19 +60,14 @@ long long deleteObjects(OperationContext* txn,
     request.setFromMigrate(fromMigrate);
     request.setYieldPolicy(policy);
 
-    Collection* collection = NULL;
-    if (db) {
-        collection = db->getCollection(nsString.ns());
-    }
-
     ParsedDelete parsedDelete(txn, &request);
     uassertStatusOK(parsedDelete.parseRequest());
 
     auto client = txn->getClient();
     auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
 
-    std::unique_ptr<PlanExecutor> exec =
-        uassertStatusOK(getExecutorDelete(txn, collection, &parsedDelete));
+    std::unique_ptr<PlanExecutor> exec = uassertStatusOK(
+        getExecutorDelete(txn, &CurOp::get(txn)->debug(), collection, &parsedDelete));
 
     uassertStatusOK(exec->executePlan());
 

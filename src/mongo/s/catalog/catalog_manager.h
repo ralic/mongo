@@ -34,9 +34,9 @@
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/repl/optime_with.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/optime_pair.h"
-#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -44,16 +44,16 @@ class ActionLogType;
 class BatchedCommandRequest;
 class BatchedCommandResponse;
 struct BSONArray;
+class BSONArrayBuilder;
 class BSONObj;
 class BSONObjBuilder;
 class ChunkType;
+struct ChunkVersion;
 class CollectionType;
 class ConnectionString;
 class DatabaseType;
-class DistLockManager;
 class NamespaceString;
 class OperationContext;
-class SettingsType;
 class ShardKeyPattern;
 class ShardRegistry;
 class ShardType;
@@ -61,6 +61,10 @@ class Status;
 template <typename T>
 class StatusWith;
 class TagsType;
+
+namespace executor {
+struct ConnectionPoolStats;
+}
 
 /**
  * Used to indicate to the caller of the removeShard method whether draining of chunks for
@@ -81,15 +85,8 @@ enum ShardDrainingStatus {
  */
 class CatalogManager {
     MONGO_DISALLOW_COPYING(CatalogManager);
-    friend class ForwardingCatalogManager;
 
 public:
-    enum class ConfigServerMode {
-        NONE,
-        SCCC,
-        CSRS,
-    };
-
     virtual ~CatalogManager() = default;
 
     /**
@@ -97,18 +94,12 @@ public:
      * has been installed into the global 'grid' object. Implementation do not need to guarantee
      * thread safety so callers should employ proper synchronization when calling this method.
      */
-    virtual Status startup(OperationContext* txn, bool allowNetworking) = 0;
+    virtual Status startup() = 0;
 
     /**
      * Performs necessary cleanup when shutting down cleanly.
      */
-    virtual void shutDown(OperationContext* txn, bool allowNetworking = true) = 0;
-
-    /**
-     * Returns what type of catalog manager this is - CSRS for the CatalogManagerReplicaSet and
-     * SCCC for the CatalogManagerLegacy.
-     */
-    virtual ConfigServerMode getMode() = 0;
+    virtual void shutDown(OperationContext* txn) = 0;
 
     /**
      * Creates a new database or updates the sharding status for an existing one. Cannot be
@@ -188,10 +179,10 @@ public:
      * Returns Status::OK along with the database information and the OpTime of the config server
      * which the database information was based upon. Otherwise, returns an error code indicating
      * the failure. These are some of the known failures:
-     *  - DatabaseNotFound - database does not exist
+     *  - NamespaceNotFound - database does not exist
      */
-    virtual StatusWith<OpTimePair<DatabaseType>> getDatabase(OperationContext* txn,
-                                                             const std::string& dbName) = 0;
+    virtual StatusWith<repl::OpTimeWith<DatabaseType>> getDatabase(OperationContext* txn,
+                                                                   const std::string& dbName) = 0;
 
     /**
      * Updates or creates the metadata for a given collection.
@@ -210,8 +201,8 @@ public:
      * the failure. These are some of the known failures:
      *  - NamespaceNotFound - collection does not exist
      */
-    virtual StatusWith<OpTimePair<CollectionType>> getCollection(OperationContext* txn,
-                                                                 const std::string& collNs) = 0;
+    virtual StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
+        OperationContext* txn, const std::string& collNs) = 0;
 
     /**
      * Retrieves all collections undera specified database (or in the system).
@@ -287,7 +278,8 @@ public:
      * Retrieves all shards in this sharded cluster.
      * Returns a !OK status if an error occurs.
      */
-    virtual Status getAllShards(OperationContext* txn, std::vector<ShardType>* shards) = 0;
+    virtual StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
+        OperationContext* txn) = 0;
 
     /**
      * Runs a user management command on the config servers, potentially synchronizing through
@@ -306,14 +298,6 @@ public:
                                                BSONObjBuilder* result) = 0;
 
     /**
-     * Runs a read-only command on a config server.
-     */
-    virtual bool runReadCommand(OperationContext* txn,
-                                const std::string& dbname,
-                                const BSONObj& cmdObj,
-                                BSONObjBuilder* result) = 0;
-
-    /**
      * Runs a user management related read-only command on a config server.
      */
     virtual bool runUserManagementReadCommand(OperationContext* txn,
@@ -325,48 +309,51 @@ public:
      * Applies oplog entries to the config servers.
      * Used by mergeChunk, splitChunk, and moveChunk commands.
      *
-     * @param updateOps: oplog entries to apply
-     * @param preCondition: preconditions for applying oplog entries
+     * @param updateOps: documents to write to the chunks collection.
+     * @param preCondition: preconditions for applying documents.
+     * @param nss: namespace string for the chunks collection.
+     * @param lastChunkVersion: version of the last document being written to the chunks
+     * collection.
+     *
+     * 'nss' and 'lastChunkVersion' uniquely identify the last document being written, which is
+     * expected to appear in the chunks collection on success. This is important for the
+     * case where network problems cause a retry of a successful write, which then returns
+     * failure because the precondition no longer matches. If a query of the chunks collection
+     * returns a document matching both 'nss' and 'lastChunkVersion,' the write succeeded.
      */
     virtual Status applyChunkOpsDeprecated(OperationContext* txn,
                                            const BSONArray& updateOps,
-                                           const BSONArray& preCondition) = 0;
+                                           const BSONArray& preCondition,
+                                           const std::string& nss,
+                                           const ChunkVersion& lastChunkVersion) = 0;
 
     /**
-     * Logs to the actionlog.
-     * Used by the balancer to report the result of a balancing round.
-     *
-     * NOTE: This method is best effort so it should never throw.
+     * Writes a diagnostic event to the action log.
      */
-    virtual void logAction(OperationContext* txn, const ActionLogType& actionLog) = 0;
+    virtual Status logAction(OperationContext* txn,
+                             const std::string& what,
+                             const std::string& ns,
+                             const BSONObj& detail) = 0;
 
     /**
-     * Logs a diagnostic event locally and on the config server.
-     *
-     * NOTE: This method is best effort so it should never throw.
-     *
-     * @param clientAddress Address of the client that initiated the op that caused this change
-     * @param what E.g. "split", "migrate"
-     * @param ns To which collection the metadata change is being applied
-     * @param detail Additional info about the metadata change (not interpreted)
+     * Writes a diagnostic event to the change log.
      */
-    virtual void logChange(OperationContext* txn,
-                           const std::string& clientAddress,
-                           const std::string& what,
-                           const std::string& ns,
-                           const BSONObj& detail) = 0;
+    virtual Status logChange(OperationContext* txn,
+                             const std::string& what,
+                             const std::string& ns,
+                             const BSONObj& detail) = 0;
 
     /**
-     * Returns global settings for a certain key.
-     * @param key: key for SettingsType::ConfigNS document.
+     * Reads global sharding settings from the confing.settings collection. The key parameter is
+     * used as the _id of the respective setting document.
      *
-     * Returns ErrorCodes::NoMatchingDocument if no SettingsType::ConfigNS document
-     * with such key exists.
-     * Returns ErrorCodes::FailedToParse if we encountered an error while parsing
-     * the settings document.
+     * NOTE: This method should generally not be used directly and instead the respective
+     * configuration class should be used (e.g. BalancerConfiguration).
+     *
+     * Returns ErrorCodes::NoMatchingDocument if no such key exists or the BSON content of the
+     * setting otherwise.
      */
-    virtual StatusWith<SettingsType> getGlobalSettings(OperationContext* txn,
-                                                       const std::string& key) = 0;
+    virtual StatusWith<BSONObj> getGlobalSettings(OperationContext* txn, StringData key) = 0;
 
     /**
      * Directly sends the specified command to the config server and returns the response.
@@ -397,57 +384,69 @@ public:
     virtual Status createDatabase(OperationContext* txn, const std::string& dbName) = 0;
 
     /**
-     * Directly inserts a document in the specified namespace on the config server (only the
-     * config or admin databases). If the document does not have _id field, the field will be
-     * added.
+     * Directly inserts a document in the specified namespace on the config server. The document
+     * must have an _id index. Must only be used for insertions in the 'config' database.
      *
-     * This is a thin wrapper around writeConfigServerDirect.
-     *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the
-     *       interface.
+     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
      */
-    Status insert(OperationContext* txn,
-                  const std::string& ns,
-                  const BSONObj& doc,
-                  BatchedCommandResponse* response);
+    virtual Status insertConfigDocument(OperationContext* txn,
+                                        const std::string& ns,
+                                        const BSONObj& doc) = 0;
 
     /**
-     * Updates a document in the specified namespace on the config server (only the config or
-     * admin databases).
+     * Updates a single document in the specified namespace on the config server. The document must
+     * have an _id index. Must only be used for updates to the 'config' database.
      *
-     * This is a thin wrapper around writeConfigServerDirect.
+     * This method retries the operation on NotMaster or network errors, so it should only be used
+     * with modifications which are idempotent.
      *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the
-     *       interface.
+     * Returns non-OK status if the command failed to run for some reason. If the command was
+     * successful, returns true if a document was actually modified (that is, it did not exist and
+     * was upserted or it existed and any of the fields changed) and false otherwise (basically
+     * returns whether the update command's response update.n value is > 0).
+     *
+     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
      */
-    Status update(OperationContext* txn,
-                  const std::string& ns,
-                  const BSONObj& query,
-                  const BSONObj& update,
-                  bool upsert,
-                  bool multi,
-                  BatchedCommandResponse* response);
+    virtual StatusWith<bool> updateConfigDocument(OperationContext* txn,
+                                                  const std::string& ns,
+                                                  const BSONObj& query,
+                                                  const BSONObj& update,
+                                                  bool upsert) = 0;
 
     /**
-     * Removes a document from the specified namespace on the config server (only the config
-     * or admin databases).
+     * Removes documents matching a particular query predicate from the specified namespace on the
+     * config server. Must only be used for deletions from the 'config' database.
      *
-     * This is a thin wrapper around writeConfigServerDirect.
-     *
-     * NOTE: Should not be used in new code. Instead add a new metadata operation to the
-     *       interface.
+     * NOTE: Should not be used in new code. Instead add a new metadata operation to the interface.
      */
-    Status remove(OperationContext* txn,
-                  const std::string& ns,
-                  const BSONObj& query,
-                  int limit,
-                  BatchedCommandResponse* response);
+    virtual Status removeConfigDocuments(OperationContext* txn,
+                                         const std::string& ns,
+                                         const BSONObj& query) = 0;
 
     /**
      * Performs the necessary checks for version compatibility and creates a new version document
      * if the current cluster config is empty.
      */
     virtual Status initConfigVersion(OperationContext* txn) = 0;
+
+    /**
+     * Appends the information about the config and admin databases in the config server
+     * with the format for listDatabase.
+     */
+    virtual Status appendInfoForConfigServerDatabases(OperationContext* txn,
+                                                      BSONArrayBuilder* builder) = 0;
+
+    /**
+     * Append information about the connection pools owned by the CatalogManager.
+     */
+    virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) = 0;
+
+
+    virtual StatusWith<DistLockManager::ScopedDistLock> distLock(
+        OperationContext* txn,
+        StringData name,
+        StringData whyMessage,
+        stdx::chrono::milliseconds waitFor = DistLockManager::kSingleLockAttemptTimeout) = 0;
 
 protected:
     CatalogManager() = default;

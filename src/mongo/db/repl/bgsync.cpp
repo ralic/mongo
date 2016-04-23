@@ -42,18 +42,17 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
-#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/rollback_source_impl.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/executor/network_interface_factory.h"
-#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -74,7 +73,16 @@ namespace {
 const char hashFieldName[] = "h";
 int SleepToAllowBatchingMillis = 2;
 const int BatchIsSmallish = 40000;  // bytes
-const Milliseconds fetcherMaxTimeMS(2000);
+const Milliseconds oplogSocketTimeout(30000);
+
+/**
+ * Returns new thread pool for thead pool task executor.
+ */
+std::unique_ptr<ThreadPool> makeThreadPool() {
+    ThreadPool::Options threadPoolOptions;
+    threadPoolOptions.poolName = "rsBackgroundSync";
+    return stdx::make_unique<ThreadPool>(threadPoolOptions);
+}
 
 /**
  * Checks the criteria for rolling back.
@@ -94,20 +102,24 @@ Status checkRemoteOplogStart(stdx::function<StatusWith<BSONObj>()> getNextOperat
                       "we are ahead of the sync source, will try to roll back");
     }
     BSONObj o = result.getValue();
-    OpTime opTime = fassertStatusOK(28778, OpTime::parseFromBSON(o));
+    OpTime opTime = fassertStatusOK(28778, OpTime::parseFromOplogEntry(o));
     long long hash = o["h"].numberLong();
     if (opTime != lastOpTimeFetched || hash != lastHashFetched) {
         return Status(ErrorCodes::OplogStartMissing,
                       str::stream() << "our last op time fetched: " << lastOpTimeFetched.toString()
-                                    << ". source's GTE: " << opTime.toString());
+                                    << ". source's GTE: " << opTime.toString() << " hashes: ("
+                                    << lastHashFetched << "/" << hash << ")");
     }
     return Status::OK();
 }
 
+size_t getSize(const BSONObj& o) {
+    // SERVER-9808 Avoid Fortify complaint about implicit signed->unsigned conversion
+    return static_cast<size_t>(o.objsize());
+}
 }  // namespace
 
 MONGO_FP_DECLARE(rsBgSyncProduce);
-MONGO_FP_DECLARE(stepDownWhileDrainingFailPoint);
 
 BackgroundSync* BackgroundSync::s_instance = 0;
 stdx::mutex BackgroundSync::s_mutex;
@@ -139,21 +151,16 @@ static ServerStatusMetricField<int> displayBufferMaxSize("repl.buffer.maxSizeByt
 
 BackgroundSyncInterface::~BackgroundSyncInterface() {}
 
-namespace {
-size_t getSize(const BSONObj& o) {
-    // SERVER-9808 Avoid Fortify complaint about implicit signed->unsigned conversion
-    return static_cast<size_t>(o.objsize());
-}
-}  // namespace
-
 BackgroundSync::BackgroundSync()
     : _buffer(bufferMaxSizeGauge, &getSize),
+      _threadPoolTaskExecutor(makeThreadPool(),
+                              executor::makeNetworkInterface("NetworkInterfaceASIO-BGSync")),
       _lastOpTimeFetched(Timestamp(std::numeric_limits<int>::max(), 0),
                          std::numeric_limits<long long>::max()),
       _lastFetchedHash(0),
-      _pause(true),
-      _appliedBuffer(true),
+      _stopped(true),
       _replCoord(getGlobalReplicationCoordinator()),
+      _syncSourceResolver(_replCoord),
       _initialSyncRequestedFlag(false),
       _indexPrefetchConfig(PREFETCH_ALL) {}
 
@@ -170,50 +177,28 @@ void BackgroundSync::shutdown() {
 
     // Clear the buffer in case the producerThread is waiting in push() due to a full queue.
     invariant(inShutdown());
-    _buffer.clear();
-    _pause = true;
-
-    // Wake up producerThread so it notices that we're in shutdown
-    _appliedBufferCondition.notify_all();
-    _pausedCondition.notify_all();
+    clearBuffer();
+    _stopped = true;
 }
 
-void BackgroundSync::notify(OperationContext* txn) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-
-    // If all ops in the buffer have been applied, unblock waitForRepl (if it's waiting)
-    if (_buffer.empty()) {
-        _appliedBuffer = true;
-        _appliedBufferCondition.notify_all();
-    }
-}
-
-void BackgroundSync::producerThread(executor::TaskExecutor* taskExecutor) {
+void BackgroundSync::producerThread() {
     Client::initThread("rsBackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization();
 
-    // Disregard task executor passed into this function and use a local thread pool task executor
-    // instead. This ensures that potential blocking operations inside the fetcher callback will
-    // not affect other coordinators (such as the replication coordinator) that might be dependent
-    // on the shared task executor.
-    ThreadPool::Options threadPoolOptions;
-    threadPoolOptions.poolName = "rsBackgroundSync";
-    executor::ThreadPoolTaskExecutor threadPoolTaskExecutor(
-        stdx::make_unique<ThreadPool>(threadPoolOptions), executor::makeNetworkInterface());
-    taskExecutor = &threadPoolTaskExecutor;
-    taskExecutor->startup();
-    ON_BLOCK_EXIT([taskExecutor]() {
-        taskExecutor->shutdown();
-        taskExecutor->join();
+    _threadPoolTaskExecutor.startup();
+    ON_BLOCK_EXIT([this]() {
+        _threadPoolTaskExecutor.shutdown();
+        _threadPoolTaskExecutor.join();
     });
 
     while (!inShutdown()) {
         try {
-            _producerThread(taskExecutor);
+            _producerThread();
         } catch (const DBException& e) {
             std::string msg(str::stream() << "sync producer problem: " << e.toString());
             error() << msg;
             _replCoord->setMyHeartbeatMessage(msg);
+            sleepmillis(100);  // sleep a bit to keep from hammering this thread with temp. errors.
         } catch (const std::exception& e2) {
             severe() << "sync producer exception: " << e2.what();
             fassertFailed(28546);
@@ -222,12 +207,27 @@ void BackgroundSync::producerThread(executor::TaskExecutor* taskExecutor) {
     stop();
 }
 
-void BackgroundSync::_producerThread(executor::TaskExecutor* taskExecutor) {
+void BackgroundSync::_signalNoNewDataForApplier() {
+    // Signal to consumers that we have entered the stopped state
+    // if the signal isn't already in the queue.
+    const boost::optional<BSONObj> lastObjectPushed = _buffer.lastObjectPushed();
+    if (!lastObjectPushed || !lastObjectPushed->isEmpty()) {
+        const BSONObj sentinelDoc;
+        _buffer.pushEvenIfFull(sentinelDoc);
+        bufferCountGauge.increment();
+        bufferSizeGauge.increment(sentinelDoc.objsize());
+    }
+}
+
+void BackgroundSync::_producerThread() {
     const MemberState state = _replCoord->getMemberState();
-    // we want to pause when the state changes to primary
+    // Stop when the state changes to primary.
     if (_replCoord->isWaitingForApplierToDrain() || state.primary()) {
-        if (!isPaused()) {
+        if (!isStopped()) {
             stop();
+        }
+        if (_replCoord->isWaitingForApplierToDrain()) {
+            _signalNoNewDataForApplier();
         }
         sleepsecs(1);
         return;
@@ -241,21 +241,22 @@ void BackgroundSync::_producerThread(executor::TaskExecutor* taskExecutor) {
     }
 
     // We need to wait until initial sync has started.
-    if (_replCoord->getMyLastOptime().isNull()) {
+    if (_replCoord->getMyLastAppliedOpTime().isNull()) {
         sleepsecs(1);
         return;
     }
-    // we want to unpause when we're no longer primary
+    // we want to start when we're no longer primary
     // start() also loads _lastOpTimeFetched, which we know is set from the "if"
-    OperationContextImpl txn;
-    if (isPaused()) {
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;
+    if (isStopped()) {
         start(&txn);
     }
 
-    _produce(&txn, taskExecutor);
+    _produce(&txn);
 }
 
-void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* taskExecutor) {
+void BackgroundSync::_produce(OperationContext* txn) {
     // this oplog reader does not do a handshake because we don't want the server it's syncing
     // from to track how far it has synced
     {
@@ -281,45 +282,66 @@ void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* tas
 
     // find a target to sync from the last optime fetched
     OpTime lastOpTimeFetched;
+    HostAndPort source;
     {
         stdx::unique_lock<stdx::mutex> lock(_mutex);
         lastOpTimeFetched = _lastOpTimeFetched;
         _syncSourceHost = HostAndPort();
     }
-    OplogReader syncSourceReader;
-    syncSourceReader.connectToSyncSource(txn, lastOpTimeFetched, _replCoord);
+    SyncSourceResolverResponse syncSourceResp =
+        _syncSourceResolver.findSyncSource(txn, lastOpTimeFetched);
 
-    // no server found
-    if (syncSourceReader.getHost().empty()) {
+    if (syncSourceResp.syncSourceStatus == ErrorCodes::OplogStartMissing) {
+        // All (accessible) sync sources were too stale.
+        error() << "too stale to catch up -- entering maintenance mode";
+        log() << "Our newest OpTime : " << lastOpTimeFetched;
+        log() << "Earliest OpTime available is " << syncSourceResp.earliestOpTimeSeen;
+        log() << "See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember";
+        StorageInterface::get(txn)
+            ->setMinValid(txn, {lastOpTimeFetched, syncSourceResp.earliestOpTimeSeen});
+        auto status = _replCoord->setMaintenanceMode(true);
+        if (!status.isOK()) {
+            warning() << "Failed to transition into maintenance mode.";
+        }
+        bool worked = _replCoord->setFollowerMode(MemberState::RS_RECOVERING);
+        if (!worked) {
+            warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
+                      << ". Current state: " << _replCoord->getMemberState();
+        }
+        return;
+    } else if (syncSourceResp.isOK() && !syncSourceResp.getSyncSource().empty()) {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _syncSourceHost = syncSourceResp.getSyncSource();
+        source = _syncSourceHost;
+    } else {
+        if (!syncSourceResp.isOK()) {
+            log() << "failed to find sync source, received error "
+                  << syncSourceResp.syncSourceStatus.getStatus();
+        }
+        // No sync source found.
         sleepsecs(1);
-        // if there is no one to sync from
         return;
     }
 
     long long lastHashFetched;
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
-        if (_pause) {
+        if (_stopped) {
             return;
         }
         lastOpTimeFetched = _lastOpTimeFetched;
         lastHashFetched = _lastFetchedHash;
-        _syncSourceHost = syncSourceReader.getHost();
         _replCoord->signalUpstreamUpdater();
     }
 
-    const Milliseconds oplogSocketTimeout(OplogReader::kSocketTimeout);
+    const auto isV1ElectionProtocol = _replCoord->isV1ElectionProtocol();
+    // Under protocol version 1, make the awaitData timeout (maxTimeMS) dependent on the election
+    // timeout. This enables the sync source to communicate liveness of the primary to secondaries.
+    // Under protocol version 0, use a default timeout of 2 seconds for awaitData.
+    const Milliseconds fetcherMaxTimeMS(
+        isV1ElectionProtocol ? _replCoord->getConfig().getElectionTimeoutPeriod() / 2 : Seconds(2));
 
-    // Prefer host in oplog reader to _syncSourceHost because _syncSourceHost may be cleared
-    // if sync source feedback fails.
-    const HostAndPort source = syncSourceReader.getHost();
-    syncSourceReader.resetConnection();
-    // no more references to oplog reader from here on.
-
-    // If this status is not OK after the fetcher returns from wait(),
-    // proceed to execute rollback
-    Status remoteOplogStartStatus = Status::OK();
-
+    Status fetcherReturnStatus = Status::OK();
     auto fetcherCallback = stdx::bind(&BackgroundSync::_fetcherCallback,
                                       this,
                                       stdx::placeholders::_1,
@@ -327,7 +349,9 @@ void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* tas
                                       stdx::cref(source),
                                       lastOpTimeFetched,
                                       lastHashFetched,
-                                      &remoteOplogStartStatus);
+                                      fetcherMaxTimeMS,
+                                      &fetcherReturnStatus);
+
 
     BSONObjBuilder cmdBob;
     cmdBob.append("find", nsToCollectionSubstring(rsOplogName));
@@ -335,18 +359,27 @@ void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* tas
     cmdBob.append("tailable", true);
     cmdBob.append("oplogReplay", true);
     cmdBob.append("awaitData", true);
-    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
+    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(Minutes(1)));  // 1 min initial find.
 
     BSONObjBuilder metadataBob;
-    if (_replCoord->isV1ElectionProtocol()) {
+    if (isV1ElectionProtocol) {
         cmdBob.append("term", _replCoord->getTerm());
         metadataBob.append(rpc::kReplSetMetadataFieldName, 1);
     }
 
+    auto dbName = nsToDatabase(rsOplogName);
     auto cmdObj = cmdBob.obj();
     auto metadataObj = metadataBob.obj();
-    Fetcher fetcher(
-        taskExecutor, source, nsToDatabase(rsOplogName), cmdObj, fetcherCallback, metadataObj);
+    Fetcher fetcher(&_threadPoolTaskExecutor,
+                    source,
+                    dbName,
+                    cmdObj,
+                    fetcherCallback,
+                    metadataObj,
+                    _replCoord->getConfig().getElectionTimeoutPeriod());
+
+    LOG(1) << "scheduling fetcher to read remote oplog on " << source << " starting at "
+           << cmdObj["filter"];
     auto scheduleStatus = fetcher.schedule();
     if (!scheduleStatus.isOK()) {
         warning() << "unable to schedule fetcher to read remote oplog on " << source << ": "
@@ -354,32 +387,77 @@ void BackgroundSync::_produce(OperationContext* txn, executor::TaskExecutor* tas
         return;
     }
     fetcher.wait();
+    LOG(1) << "fetcher stopped reading remote oplog on " << source;
 
-    // If the background sync is paused after the fetcher is started, we need to
+    // If the background sync is stopped after the fetcher is started, we need to
     // re-evaluate our sync source and oplog common point.
-    if (isPaused()) {
+    if (isStopped()) {
         return;
     }
 
-    // Execute rollback if necessary.
-    // Rollback is a synchronous operation that uses the task executor and may not be
-    // executed inside the fetcher callback.
-    if (!remoteOplogStartStatus.isOK()) {
+    if (fetcherReturnStatus.code() == ErrorCodes::OplogOutOfOrder) {
+        // This is bad because it means that our source
+        // has not returned oplog entries in ascending ts order, and they need to be.
+
+        warning() << fetcherReturnStatus.toString();
+        // Do not blacklist the server here, it will be blacklisted when we try to reuse it,
+        // if it can't return a matching oplog start from the last fetch oplog ts field.
+        return;
+    } else if (fetcherReturnStatus.code() == ErrorCodes::OplogStartMissing ||
+               fetcherReturnStatus.code() == ErrorCodes::RemoteOplogStale) {
+        // Rollback is a synchronous operation that uses the task executor and may not be
+        // executed inside the fetcher callback.
         const int messagingPortTags = 0;
         ConnectionPool connectionPool(messagingPortTags);
         std::unique_ptr<ConnectionPool::ConnectionPtr> connection;
-        auto getConnection =
-            [&connection, &connectionPool, oplogSocketTimeout, source]() -> DBClientBase* {
-                if (!connection.get()) {
-                    connection.reset(new ConnectionPool::ConnectionPtr(
-                        &connectionPool, source, Date_t::now(), oplogSocketTimeout));
-                };
-                return connection->get();
+        auto getConnection = [&connection, &connectionPool, source]() -> DBClientBase* {
+            if (!connection.get()) {
+                connection.reset(new ConnectionPool::ConnectionPtr(
+                    &connectionPool, source, Date_t::now(), oplogSocketTimeout));
             };
+            return connection->get();
+        };
 
-        log() << "starting rollback: " << remoteOplogStartStatus;
+        {
+            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            lastOpTimeFetched = _lastOpTimeFetched;
+        }
+
+        log() << "Starting rollback due to " << fetcherReturnStatus;
+
+        // Wait till all buffered oplog entries have drained and been applied.
+        auto lastApplied = _replCoord->getMyLastAppliedOpTime();
+        if (lastApplied != lastOpTimeFetched) {
+            log() << "Waiting for all operations from " << lastApplied << " until "
+                  << lastOpTimeFetched << " to be applied before starting rollback.";
+            while (lastOpTimeFetched > (lastApplied = _replCoord->getMyLastAppliedOpTime())) {
+                sleepmillis(10);
+                if (isStopped() || inShutdown()) {
+                    return;
+                }
+            }
+        }
+        // check that we are at minvalid, otherwise we cannot roll back as we may be in an
+        // inconsistent state
+        BatchBoundaries boundaries = StorageInterface::get(txn)->getMinValid(txn);
+        if (!boundaries.start.isNull() || boundaries.end > lastApplied) {
+            fassertNoTrace(18750,
+                           Status(ErrorCodes::UnrecoverableRollbackError,
+                                  str::stream()
+                                      << "need to rollback, but in inconsistent state. "
+                                      << "minvalid: " << boundaries.end.toString()
+                                      << " > our last optime: " << lastApplied.toString()));
+        }
+
         _rollback(txn, source, getConnection);
         stop();
+    } else if (fetcherReturnStatus == ErrorCodes::InvalidBSON) {
+        Seconds blacklistDuration(60);
+        warning() << "Fetcher got invalid BSON while querying oplog. Blacklisting sync source "
+                  << source << " for " << blacklistDuration << ".";
+        _replCoord->blacklistSyncSource(source, Date_t::now() + blacklistDuration);
+    } else if (!fetcherReturnStatus.isOK()) {
+        warning() << "Fetcher error querying oplog: " << fetcherReturnStatus.toString();
     }
 }
 
@@ -388,23 +466,30 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
                                       const HostAndPort& source,
                                       OpTime lastOpTimeFetched,
                                       long long lastFetchedHash,
-                                      Status* remoteOplogStartStatus) {
+                                      Milliseconds fetcherMaxTimeMS,
+                                      Status* returnStatus) {
     // if target cut connections between connecting and querying (for
     // example, because it stepped down) we might not have a cursor
     if (!result.isOK()) {
+        LOG(2) << "Error returned from oplog query: " << result.getStatus();
+        *returnStatus = result.getStatus();
         return;
     }
 
     if (inShutdown()) {
+        LOG(2) << "Interrupted by shutdown while querying oplog. 1";  // 1st instance.
         return;
     }
 
-    // Check if we have been paused.
-    if (isPaused()) {
+    // Check if we have been stopped.
+    if (isStopped()) {
+        LOG(2) << "Interrupted by stop request while querying the oplog. 1";  // 1st instance.
         return;
     }
 
     const auto& queryResponse = result.getValue();
+    bool syncSourceHasSyncSource = false;
+    OpTime sourcesLastOpTime;
 
     // Forward metadata (containing liveness information) to replication coordinator.
     bool receivedMetadata =
@@ -417,88 +502,139 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
                     << metadataResult.getStatus() << ": " << queryResponse.otherFields.metadata;
             return;
         }
-        _replCoord->processReplSetMetadata(metadataResult.getValue());
+        const auto& metadata = metadataResult.getValue();
+        _replCoord->processReplSetMetadata(metadata);
+        if (metadata.getPrimaryIndex() != rpc::ReplSetMetadata::kNoPrimary) {
+            _replCoord->cancelAndRescheduleElectionTimeout();
+        }
+        syncSourceHasSyncSource = metadata.getSyncSourceIndex() != -1;
+        sourcesLastOpTime = metadata.getLastOpVisible();
     }
 
     const auto& documents = queryResponse.documents;
-    auto documentBegin = documents.cbegin();
-    auto documentEnd = documents.cend();
+    auto firstDocToApply = documents.cbegin();
+    auto lastDocToApply = documents.cend();
+
+    if (!documents.empty()) {
+        LOG(2) << "fetcher read " << documents.size()
+               << " operations from remote oplog starting at " << documents.front()["ts"]
+               << " and ending at " << documents.back()["ts"];
+    } else {
+        LOG(2) << "fetcher read 0 operations from remote oplog";
+    }
 
     // Check start of remote oplog and, if necessary, stop fetcher to execute rollback.
     if (queryResponse.first) {
-        auto getNextOperation = [&documentBegin, documentEnd]() -> StatusWith<BSONObj> {
-            if (documentBegin == documentEnd) {
+        auto getNextOperation = [&firstDocToApply, lastDocToApply]() -> StatusWith<BSONObj> {
+            if (firstDocToApply == lastDocToApply) {
                 return Status(ErrorCodes::OplogStartMissing, "remote oplog start missing");
             }
-            return *(documentBegin++);
+            return *(firstDocToApply++);
         };
 
-        *remoteOplogStartStatus =
-            checkRemoteOplogStart(getNextOperation, lastOpTimeFetched, lastFetchedHash);
-        if (!remoteOplogStartStatus->isOK()) {
+        *returnStatus = checkRemoteOplogStart(getNextOperation, lastOpTimeFetched, lastFetchedHash);
+        if (!returnStatus->isOK()) {
             // Stop fetcher and execute rollback.
             return;
         }
 
         // If this is the first batch and no rollback is needed, we should have advanced
         // the document iterator.
-        invariant(documentBegin != documents.cbegin());
+        invariant(firstDocToApply != documents.cbegin());
     }
 
-    // process documents
-    int currentBatchMessageSize = 0;
-    for (auto documentIter = documentBegin; documentIter != documentEnd; ++documentIter) {
-        if (inShutdown()) {
+    // No work to do if we are draining/primary.
+    if (_replCoord->isWaitingForApplierToDrain() || _replCoord->getMemberState().primary()) {
+        LOG(2) << "Interrupted by waiting for applier to drain "
+               << "or becoming primary while querying the oplog. 1";  // 1st instance.
+        return;
+    }
+
+    // The count of the bytes of the documents read off the network.
+    int networkDocumentBytes = 0;
+    Timestamp lastTS;
+    {
+        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        // If we are stopped then return without queueing this batch to apply.
+        if (_stopped) {
+            LOG(2) << "Interrupted by stop request while querying the oplog. 2";  // 2nd instance.
             return;
         }
+        lastTS = _lastOpTimeFetched.getTimestamp();
+    }
+    int count = 0;
+    for (auto&& doc : documents) {
+        networkDocumentBytes += doc.objsize();
+        ++count;
 
-        // If we are transitioning to primary state, we need to leave
-        // this loop in order to go into bgsync-pause mode.
-        if (_replCoord->isWaitingForApplierToDrain() || _replCoord->getMemberState().primary()) {
-            LOG(1) << "waiting for draining or we are primary, not adding more ops to buffer";
+        // If this is the first response (to the $gte query) then we already applied the first doc.
+        if (queryResponse.first && count == 1) {
+            continue;
+        }
+
+        // Check to see if the oplog entry goes back in time for this document.
+        const auto docOpTime = OpTime::parseFromOplogEntry(doc);
+        fassertStatusOK(34362, docOpTime.getStatus());  // entries must have a "ts" field.
+        const auto docTS = docOpTime.getValue().getTimestamp();
+
+        if (lastTS >= docTS) {
+            *returnStatus = Status(
+                ErrorCodes::OplogOutOfOrder,
+                str::stream() << "Reading the oplog from" << source.toString()
+                              << " returned out of order entries. lastTS: " << lastTS.toString()
+                              << " outOfOrderTS:" << docTS.toString() << " at count:" << count);
             return;
         }
+        lastTS = docTS;
+    }
 
-        // At this point, we are guaranteed to have at least one thing to read out
-        // of the fetcher.
-        const BSONObj& o = *documentIter;
-        currentBatchMessageSize += o.objsize();
-        opsReadStats.increment();
+    // These numbers are for the documents we will apply.
+    auto toApplyDocumentCount = documents.size();
+    auto toApplyDocumentBytes = networkDocumentBytes;
+    if (queryResponse.first) {
+        // The count is one less since the first document found was already applied ($gte $ts query)
+        // and we will not apply it again. We just needed to check it so we didn't rollback, or
+        // error above.
+        --toApplyDocumentCount;
+        const auto alreadyAppliedDocument = documents.cbegin();
+        toApplyDocumentBytes -= alreadyAppliedDocument->objsize();
+    }
 
-        if (MONGO_FAIL_POINT(stepDownWhileDrainingFailPoint)) {
-            sleepsecs(20);
-        }
-
-        {
-            stdx::unique_lock<stdx::mutex> lock(_mutex);
-            _appliedBuffer = false;
-        }
+    if (toApplyDocumentBytes > 0) {
+        // Wait for enough space.
+        _buffer.waitForSpace(toApplyDocumentBytes);
 
         OCCASIONALLY {
             LOG(2) << "bgsync buffer has " << _buffer.size() << " bytes";
         }
 
-        bufferCountGauge.increment();
-        bufferSizeGauge.increment(getSize(o));
-        _buffer.push(o);
+        // Buffer docs for later application.
+        std::vector<BSONObj> objs{firstDocToApply, lastDocToApply};
+        _buffer.pushAllNonBlocking(objs);
 
+        // Inc stats.
+        opsReadStats.increment(documents.size());  // we read all of the docs in the query.
+        networkByteStats.increment(networkDocumentBytes);
+        bufferCountGauge.increment(toApplyDocumentCount);
+        bufferSizeGauge.increment(toApplyDocumentBytes);
+
+        // Update last fetched info.
+        auto lastDoc = objs.back();
         {
             stdx::unique_lock<stdx::mutex> lock(_mutex);
-            _lastFetchedHash = o["h"].numberLong();
-            _lastOpTimeFetched = fassertStatusOK(28770, OpTime::parseFromBSON(o));
-            LOG(3) << "lastOpTimeFetched: " << _lastOpTimeFetched;
+            _lastFetchedHash = lastDoc["h"].numberLong();
+            _lastOpTimeFetched = fassertStatusOK(28770, OpTime::parseFromOplogEntry(lastDoc));
+            LOG(3) << "batch resetting _lastOpTimeFetched: " << _lastOpTimeFetched;
         }
     }
 
     // record time for each batch
     getmoreReplStats.recordMillis(durationCount<Milliseconds>(queryResponse.elapsedMillis));
 
-    networkByteStats.increment(currentBatchMessageSize);
-
     // Check some things periodically
     // (whenever we run out of items in the
     // current cursor batch)
-    if (currentBatchMessageSize > 0 && currentBatchMessageSize < BatchIsSmallish) {
+    if (networkDocumentBytes > 0 && networkDocumentBytes < BatchIsSmallish) {
         // on a very low latency network, if we don't wait a little, we'll be
         // getting ops to write almost one at a time.  this will both be expensive
         // for the upstream server as well as potentially defeating our parallel
@@ -510,43 +646,45 @@ void BackgroundSync::_fetcherCallback(const StatusWith<Fetcher::QueryResponse>& 
         sleepmillis(SleepToAllowBatchingMillis);
     }
 
+    if (inShutdown()) {
+        LOG(2) << "Interrupted by shutdown while querying oplog. 2";  // 2nd instance.
+        return;
+    }
+
     // If we are transitioning to primary state, we need to leave
-    // this loop in order to go into bgsync-pause mode.
+    // this loop in order to go into bgsync-stop mode.
     if (_replCoord->isWaitingForApplierToDrain() || _replCoord->getMemberState().primary()) {
+        LOG(2) << "Interrupted by waiting for applier to drain "
+               << "or becoming primary while querying the oplog. 2";  // 2nd instance.
         return;
     }
 
     // re-evaluate quality of sync target
-    if (_shouldChangeSyncSource(source)) {
+    if (getSyncTarget().empty() ||
+        _replCoord->shouldChangeSyncSource(source, sourcesLastOpTime, syncSourceHasSyncSource)) {
+        LOG(1) << "Cancelling oplog query because we have to choose a sync source. Current source: "
+               << source << ", OpTime" << sourcesLastOpTime
+               << ", hasSyncSource:" << syncSourceHasSyncSource;
         return;
     }
 
-    // Check if we have been paused.
-    if (isPaused()) {
+    // Check if we have been stopped.
+    if (isStopped()) {
+        LOG(2) << "Interrupted by a stop request while fetching the oplog so starting a new query.";
         return;
     }
 
-    // We fill in 'bob' to signal the fetcher to process with another getMore.
-    invariant(bob);
-    bob->append("getMore", queryResponse.cursorId);
-    bob->append("collection", queryResponse.nss.coll());
-    bob->append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
-    if (receivedMetadata) {
-        bob->append("term", _replCoord->getTerm());
+    // We fill in 'bob' to signal the fetcher to process with another getMore, if needed.
+    if (bob) {
+        bob->append("getMore", queryResponse.cursorId);
+        bob->append("collection", queryResponse.nss.coll());
+        bob->append("maxTimeMS", durationCount<Milliseconds>(fetcherMaxTimeMS));
+        if (receivedMetadata) {
+            bob->append("term", _replCoord->getTerm());
+            _replCoord->getLastCommittedOpTime().append(bob, "lastKnownCommittedOpTime");
+        }
     }
 }
-
-bool BackgroundSync::_shouldChangeSyncSource(const HostAndPort& syncSource) {
-    // is it even still around?
-    if (getSyncTarget().empty() || syncSource.empty()) {
-        return true;
-    }
-
-    // check other members: is any member's optime more than MaxSyncSourceLag seconds
-    // ahead of the current sync source?
-    return _replCoord->shouldChangeSyncSource(syncSource);
-}
-
 
 bool BackgroundSync::peek(BSONObj* op) {
     return _buffer.peek(*op);
@@ -573,11 +711,30 @@ void BackgroundSync::_rollback(OperationContext* txn,
     // Abort only when syncRollback detects we are in a unrecoverable state.
     // In other cases, we log the message contained in the error status and retry later.
     auto status = syncRollback(txn,
-                               _replCoord->getMyLastOptime(),
                                OplogInterfaceLocal(txn, rsOplogName),
                                RollbackSourceImpl(getConnection, source, rsOplogName),
                                _replCoord);
     if (status.isOK()) {
+        // When the syncTail thread sees there is no new data by adding something to the buffer.
+        _signalNoNewDataForApplier();
+        // Wait until the buffer is empty.
+        // This is an indication that syncTail has removed the sentinal marker from the buffer
+        // and reset its local lastAppliedOpTime via the replCoord.
+        while (!_buffer.empty()) {
+            sleepmillis(10);
+            if (inShutdown()) {
+                return;
+            }
+        }
+
+        // It is now safe to clear the ROLLBACK state, which may result in the applier thread
+        // transitioning to SECONDARY.  This is safe because the applier thread has now reloaded
+        // the new rollback minValid from the database.
+        if (!_replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
+            warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
+                      << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
+                      << " but found self in " << _replCoord->getMemberState();
+        }
         return;
     }
     if (ErrorCodes::UnrecoverableRollbackError == status.code()) {
@@ -596,15 +753,17 @@ void BackgroundSync::clearSyncTarget() {
     _syncSourceHost = HostAndPort();
 }
 
+void BackgroundSync::cancelFetcher() {
+    _threadPoolTaskExecutor.cancelAllCommands();
+}
+
 void BackgroundSync::stop() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-    _pause = true;
+    _stopped = true;
     _syncSourceHost = HostAndPort();
     _lastOpTimeFetched = OpTime();
     _lastFetchedHash = 0;
-    _appliedBufferCondition.notify_all();
-    _pausedCondition.notify_all();
 }
 
 void BackgroundSync::start(OperationContext* txn) {
@@ -612,29 +771,26 @@ void BackgroundSync::start(OperationContext* txn) {
 
     long long lastFetchedHash = _readLastAppliedHash(txn);
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _pause = false;
+    _stopped = false;
 
     // reset _last fields with current oplog data
-    _lastOpTimeFetched = _replCoord->getMyLastOptime();
+    _lastOpTimeFetched = _replCoord->getMyLastAppliedOpTime();
     _lastFetchedHash = lastFetchedHash;
 
     LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched << " " << _lastFetchedHash;
 }
 
-bool BackgroundSync::isPaused() const {
+bool BackgroundSync::isStopped() const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
-    return _pause;
-}
-
-void BackgroundSync::waitUntilPaused() {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
-    while (!_pause) {
-        _pausedCondition.wait(lock);
-    }
+    return _stopped;
 }
 
 void BackgroundSync::clearBuffer() {
     _buffer.clear();
+    const auto count = bufferCountGauge.get();
+    bufferCountGauge.decrement(count);
+    const auto size = bufferSizeGauge.get();
+    bufferSizeGauge.decrement(size);
 }
 
 long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
@@ -658,7 +814,8 @@ long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
     BSONElement hashElement = oplogEntry[hashFieldName];
     if (hashElement.eoo()) {
         severe() << "Most recent entry in " << rsOplogName << " missing \"" << hashFieldName
-                 << "\" field";
+                 << "\" field. Oplog entry: " << oplogEntry;
+
         fassertFailed(18902);
     }
     if (hashElement.type() != NumberLong) {
@@ -680,8 +837,9 @@ void BackgroundSync::setInitialSyncRequestedFlag(bool value) {
 }
 
 void BackgroundSync::pushTestOpToBuffer(const BSONObj& op) {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _buffer.push(op);
+    bufferCountGauge.increment();
+    bufferSizeGauge.increment(op.objsize());
 }
 
 

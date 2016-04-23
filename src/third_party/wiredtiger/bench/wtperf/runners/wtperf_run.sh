@@ -12,30 +12,41 @@
 # This script should be invoked with the pathname of the wtperf test
 # config to run and the number of runs.
 #
-if test "$#" -ne "2"; then
+if test "$#" -lt "2"; then
 	echo "Must specify wtperf test to run and number of runs"
 	exit 1
 fi
 wttest=$1
 runmax=$2
+# Jenkins removes the quotes from the passed in arg so we may
+# have 3 or 4 args.
+wtarg=""
+wtarg2=""
+if test "$#" -gt "2"; then
+	wtarg=$3
+	if test "$#" -eq "4"; then
+		wtarg2=$4
+	fi
+fi
 
 home=./WT_TEST
 outfile=./wtperf.out
 rm -f $outfile
+echo "Parsed $# args: test: $wttest runmax: $runmax args: $wtarg $wtarg2" >> $outfile
 
 # Each of these has an entry for each op in ops below.
-avg=(0 0 0)
-max=(0 0 0)
-min=(0 0 0)
-sum=(0 0 0)
+avg=(0 0 0 0)
+max=(0 0 0 0)
+min=(0 0 0 0)
+sum=(0 0 0 0)
 # Load needs floating point and bc, handle separately.
-loadindex=4
+loadindex=5
 avg[$loadindex]=0
 max[$loadindex]=0
 min[$loadindex]=0
 sum[$loadindex]=0
-ops=(read insert update)
-outp=("Read count:" "Insert count:" "Update count:")
+ops=(read insert update truncate)
+outp=("Read count:" "Insert count:" "Update count:" "Truncate count:")
 outp[$loadindex]="Load time:"
 
 # getval min/max val cur
@@ -77,7 +88,7 @@ run=1
 while test "$run" -le "$runmax"; do
 	rm -rf $home
 	mkdir $home
-	LD_PRELOAD=/usr/lib64/libjemalloc.so.1 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ./wtperf -O $wttest
+	LD_PRELOAD=/usr/lib64/libjemalloc.so.1 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ./wtperf -O $wttest $wtarg $wtarg2
 	if test "$?" -ne "0"; then
 		exit 1
 	fi

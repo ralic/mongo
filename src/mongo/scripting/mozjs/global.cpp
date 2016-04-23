@@ -38,6 +38,7 @@
 #include "mongo/scripting/mozjs/jsstringwrapper.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
 namespace mozjs {
@@ -57,7 +58,7 @@ logger::MessageLogDomain* jsPrintLogDomain;
 
 }  // namespace
 
-void GlobalInfo::Functions::print(JSContext* cx, JS::CallArgs args) {
+void GlobalInfo::Functions::print::call(JSContext* cx, JS::CallArgs args) {
     logger::LogstreamBuilder builder(jsPrintLogDomain, getThreadName(), logger::LogSeverity::Log());
     std::ostream& ss = builder.stream();
 
@@ -82,11 +83,11 @@ void GlobalInfo::Functions::print(JSContext* cx, JS::CallArgs args) {
     args.rval().setUndefined();
 }
 
-void GlobalInfo::Functions::version(JSContext* cx, JS::CallArgs args) {
-    ValueReader(cx, args.rval()).fromStringData(JS_VersionToString(JS_GetVersion(cx)));
+void GlobalInfo::Functions::version::call(JSContext* cx, JS::CallArgs args) {
+    ValueReader(cx, args.rval()).fromStringData(versionString);
 }
 
-void GlobalInfo::Functions::gc(JSContext* cx, JS::CallArgs args) {
+void GlobalInfo::Functions::gc::call(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
     scope->gc();

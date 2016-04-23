@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,28 +9,47 @@
 #include "wt_internal.h"
 
 /*
- * __wt_block_header --
- *	Return the size of the block-specific header.
- */
-u_int
-__wt_block_header(WT_BLOCK *block)
-{
-	WT_UNUSED(block);
-
-	return ((u_int)WT_BLOCK_HEADER_SIZE);
-}
-
-/*
  * __wt_block_truncate --
  *	Truncate the file.
  */
 int
-__wt_block_truncate(WT_SESSION_IMPL *session, WT_FH *fh, wt_off_t len)
+__wt_block_truncate(WT_SESSION_IMPL *session, WT_BLOCK *block, wt_off_t len)
 {
-	WT_RET(__wt_ftruncate(session, fh, len));
+	WT_RET(__wt_ftruncate(session, block->fh, len));
 
-	fh->size = fh->extend_size = len;
+	block->size = block->extend_size = len;
 
+	return (0);
+}
+
+/*
+ * __wt_block_discard --
+ *	Discard blocks from the system buffer cache.
+ */
+int
+__wt_block_discard(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t added_size)
+{
+	WT_DECL_RET;
+
+	if (block->os_cache_max == 0)
+		return (0);
+
+	/*
+	 * We're racing on the addition, but I'm not willing to serialize on it
+	 * in the standard read path with more evidence it's needed.
+	 */
+	if ((block->os_cache += added_size) <= block->os_cache_max)
+		return (0);
+
+	block->os_cache = 0;
+	WT_ERR(block->fh->fh_advise(session,
+	    block->fh, (wt_off_t)0, (wt_off_t)0, POSIX_FADV_DONTNEED));
+	return (0);
+
+err:	/* Ignore ENOTSUP, but don't try again. */
+	if (ret != ENOTSUP)
+		return (ret);
+	block->os_cache_max = 0;
 	return (0);
 }
 
@@ -40,10 +59,10 @@ __wt_block_truncate(WT_SESSION_IMPL *session, WT_FH *fh, wt_off_t len)
  */
 static inline int
 __wt_block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block,
-    WT_FH *fh, wt_off_t offset, size_t align_size, int *release_lockp)
+    WT_FH *fh, wt_off_t offset, size_t align_size, bool *release_lockp)
 {
 	WT_DECL_RET;
-	int locked;
+	bool locked;
 
 	/*
 	 * The locking in this function is messy: by definition, the live system
@@ -58,10 +77,10 @@ __wt_block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 * need a lock after all, we re-acquire the lock and set release_lock so
 	 * our caller knows to release it.
 	 */
-	locked = 1;
+	locked = true;
 
 	/* If not configured to extend the file, we're done. */
-	if (fh->extend_len == 0)
+	if (block->extend_len == 0)
 		return (0);
 
 	/*
@@ -73,9 +92,9 @@ __wt_block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 * why there's a check in case the extended file size becomes too small:
 	 * if the file size catches up, every thread tries to extend it.
 	 */
-	if (fh->extend_size > fh->size &&
-	    (offset > fh->extend_size ||
-	    offset + fh->extend_len + (wt_off_t)align_size < fh->extend_size))
+	if (block->extend_size > block->size &&
+	    (offset > block->extend_size || offset +
+	    block->extend_len + (wt_off_t)align_size < block->extend_size))
 		return (0);
 
 	/*
@@ -97,7 +116,7 @@ __wt_block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block,
 		 * over the extend call.)
 		 */
 		if (!fh->fallocate_requires_locking && *release_lockp) {
-			*release_lockp = locked = 0;
+			*release_lockp = locked = false;
 			__wt_spin_unlock(session, &block->live_lock);
 		}
 
@@ -108,9 +127,9 @@ __wt_block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block,
 		 * and that's OK, we simply may do another extension sooner than
 		 * otherwise.
 		 */
-		fh->extend_size = fh->size + fh->extend_len * 2;
+		block->extend_size = block->size + block->extend_len * 2;
 		if ((ret = __wt_fallocate(
-		    session, fh, fh->size, fh->extend_len * 2)) == 0)
+		    session, fh, block->size, block->extend_len * 2)) == 0)
 			return (0);
 		if (ret != ENOTSUP)
 			return (ret);
@@ -122,7 +141,7 @@ __wt_block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 */
 	if (!locked) {
 		__wt_spin_lock(session, &block->live_lock);
-		*release_lockp = 1;
+		*release_lockp = true;
 	}
 
 	/*
@@ -130,13 +149,13 @@ __wt_block_extend(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 * extend length after locking so we don't overwrite already-written
 	 * blocks.
 	 */
-	fh->extend_size = fh->size + fh->extend_len * 2;
+	block->extend_size = block->size + block->extend_len * 2;
 
 	/*
 	 * The truncate might fail if there's a mapped file (in other words, if
 	 * there's an open checkpoint on the file), that's OK.
 	 */
-	if ((ret = __wt_ftruncate(session, fh, fh->extend_size)) == EBUSY)
+	if ((ret = __wt_ftruncate(session, fh, block->extend_size)) == EBUSY)
 		ret = 0;
 	return (ret);
 }
@@ -172,14 +191,14 @@ __wt_block_write_size(WT_SESSION_IMPL *session, WT_BLOCK *block, size_t *sizep)
  */
 int
 __wt_block_write(WT_SESSION_IMPL *session, WT_BLOCK *block,
-    WT_ITEM *buf, uint8_t *addr, size_t *addr_sizep, int data_cksum)
+    WT_ITEM *buf, uint8_t *addr, size_t *addr_sizep, bool data_cksum)
 {
 	wt_off_t offset;
 	uint32_t size, cksum;
 	uint8_t *endp;
 
 	WT_RET(__wt_block_write_off(
-	    session, block, buf, &offset, &size, &cksum, data_cksum, 0));
+	    session, block, buf, &offset, &size, &cksum, data_cksum, false));
 
 	endp = addr;
 	WT_RET(__wt_block_addr_to_buffer(block, &endp, offset, size, cksum));
@@ -196,17 +215,30 @@ __wt_block_write(WT_SESSION_IMPL *session, WT_BLOCK *block,
 int
 __wt_block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
     WT_ITEM *buf, wt_off_t *offsetp, uint32_t *sizep, uint32_t *cksump,
-    int data_cksum, int caller_locked)
+    bool data_cksum, bool caller_locked)
 {
 	WT_BLOCK_HEADER *blk;
 	WT_DECL_RET;
 	WT_FH *fh;
 	size_t align_size;
 	wt_off_t offset;
-	int local_locked;
+	uint32_t cksum;
+	bool local_locked;
 
-	blk = WT_BLOCK_HEADER_REF(buf->mem);
 	fh = block->fh;
+
+	/*
+	 * Clear the block header to ensure all of it is initialized, even the
+	 * unused fields.
+	 */
+	blk = WT_BLOCK_HEADER_REF(buf->mem);
+	memset(blk, 0, sizeof(*blk));
+
+	/*
+	 * Swap the page-header as needed; this doesn't belong here, but it's
+	 * the best place to catch all callers.
+	 */
+	__wt_page_header_byteswap(buf->mem);
 
 	/* Buffers should be aligned for writing. */
 	if (!F_ISSET(buf, WT_ITEM_ALIGNED)) {
@@ -255,13 +287,21 @@ __wt_block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 * because they're not compressed, both to give salvage a quick test
 	 * of whether a block is useful and to give us a test so we don't lose
 	 * the first WT_BLOCK_COMPRESS_SKIP bytes without noticing.
+	 *
+	 * Checksum a little-endian version of the header, and write everything
+	 * in little-endian format. The checksum is (potentially) returned in a
+	 * big-endian format, swap it into place in a separate step.
 	 */
 	blk->flags = 0;
 	if (data_cksum)
 		F_SET(blk, WT_BLOCK_DATA_CKSUM);
 	blk->cksum = 0;
-	blk->cksum = __wt_cksum(
+	__wt_block_header_byteswap(blk);
+	blk->cksum = cksum = __wt_cksum(
 	    buf->mem, data_cksum ? align_size : WT_BLOCK_COMPRESS_SKIP);
+#ifdef WORDS_BIGENDIAN
+	blk->cksum = __wt_bswap32(blk->cksum);
+#endif
 
 	/* Pre-allocate some number of extension structures. */
 	WT_RET(__wt_block_ext_prealloc(session, 5));
@@ -272,10 +312,10 @@ __wt_block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 * the block-extend function may release the lock).
 	 * Release any locally acquired lock.
 	 */
-	local_locked = 0;
+	local_locked = false;
 	if (!caller_locked) {
 		__wt_spin_lock(session, &block->live_lock);
-		local_locked = 1;
+		local_locked = true;
 	}
 	ret = __wt_block_alloc(session, block, &offset, (wt_off_t)align_size);
 	if (ret == 0)
@@ -297,7 +337,6 @@ __wt_block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 		WT_RET(ret);
 	}
 
-#ifdef HAVE_SYNC_FILE_RANGE
 	/*
 	 * Optionally schedule writes for dirty pages in the system buffer
 	 * cache, but only if the current session can wait.
@@ -306,30 +345,29 @@ __wt_block_write_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	    (block->os_cache_dirty += align_size) > block->os_cache_dirty_max &&
 	    __wt_session_can_wait(session)) {
 		block->os_cache_dirty = 0;
-		WT_RET(__wt_fsync_async(session, fh));
+		if ((ret = __wt_fsync(session, fh, false)) != 0) {
+			 /*
+			  * Ignore ENOTSUP, but don't try again.
+			  */
+			if (ret != ENOTSUP)
+				return (ret);
+			block->os_cache_dirty_max = 0;
+		}
 	}
-#endif
-#ifdef HAVE_POSIX_FADVISE
-	/* Optionally discard blocks from the system buffer cache. */
-	if (block->os_cache_max != 0 &&
-	    (block->os_cache += align_size) > block->os_cache_max) {
-		block->os_cache = 0;
-		if ((ret = posix_fadvise(fh->fd,
-		    (wt_off_t)0, (wt_off_t)0, POSIX_FADV_DONTNEED)) != 0)
-			WT_RET_MSG(
-			    session, ret, "%s: posix_fadvise", block->name);
-	}
-#endif
+
+	/* Optionally discard blocks from the buffer cache. */
+	WT_RET(__wt_block_discard(session, block, align_size));
+
 	WT_STAT_FAST_CONN_INCR(session, block_write);
 	WT_STAT_FAST_CONN_INCRV(session, block_byte_write, align_size);
 
 	WT_RET(__wt_verbose(session, WT_VERB_WRITE,
 	    "off %" PRIuMAX ", size %" PRIuMAX ", cksum %" PRIu32,
-	    (uintmax_t)offset, (uintmax_t)align_size, blk->cksum));
+	    (uintmax_t)offset, (uintmax_t)align_size, cksum));
 
 	*offsetp = offset;
 	*sizep = WT_STORE_SIZE(align_size);
-	*cksump = blk->cksum;
+	*cksump = cksum;
 
-	return (ret);
+	return (0);
 }

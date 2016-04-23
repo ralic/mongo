@@ -42,6 +42,8 @@ using boost::intrusive_ptr;
 using std::string;
 using std::vector;
 
+const DocumentStorage DocumentStorage::kEmptyDoc;
+
 Position DocumentStorage::findField(StringData requested) const {
     int reqSize = requested.size();  // get size calculation out of the way if needed
 
@@ -223,6 +225,16 @@ Document::Document(const BSONObj& bson) {
     }
 
     *this = md.freeze();
+}
+
+Document::Document(std::initializer_list<std::pair<StringData, ImplicitValue>> initializerList) {
+    MutableDocument mutableDoc(initializerList.size());
+
+    for (auto&& pair : initializerList) {
+        mutableDoc.addField(pair.first, pair.second);
+    }
+
+    *this = mutableDoc.freeze();
 }
 
 BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const Document& doc) {
@@ -444,7 +456,7 @@ void Document::serializeForSorter(BufBuilder& buf) const {
 }
 
 Document Document::deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
-    const int numElems = buf.read<int>();
+    const int numElems = buf.read<LittleEndian<int>>();
     MutableDocument doc(numElems);
     for (int i = 0; i < numElems; i++) {
         StringData name = buf.readCStr();
@@ -453,9 +465,9 @@ Document Document::deserializeForSorter(BufReader& buf, const SorterDeserializeS
 
     while (char marker = buf.read<char>()) {
         if (marker == char(DocumentStorage::MetaType::TEXT_SCORE) + 1) {
-            doc.setTextScore(buf.read<double>());
+            doc.setTextScore(buf.read<LittleEndian<double>>());
         } else if (marker == char(DocumentStorage::MetaType::RAND_VAL) + 1) {
-            doc.setRandMetaField(buf.read<double>());
+            doc.setRandMetaField(buf.read<LittleEndian<double>>());
         } else {
             uasserted(28744, "Unrecognized marker, unable to deserialize buffer");
         }

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # Copyright (c) 2009 Google Inc. All rights reserved.
 #
@@ -1615,6 +1615,7 @@ def make_polyfill_regex():
   polyfill_required_names = [
     '_',
     'adopt_lock',
+    'align',
     'async',
     'bind',
     'chrono',
@@ -1645,8 +1646,8 @@ def make_polyfill_regex():
     'unique_lock',
   ]
 
-  qualified_names = ['boost::' + name + "(?!_)" for name in polyfill_required_names]
-  qualified_names.extend('std::' + name  + "(?!_)" for name in polyfill_required_names)
+  qualified_names = ['boost::' + name + "\\b" for name in polyfill_required_names]
+  qualified_names.extend('std::' + name  + "\\b" for name in polyfill_required_names)
   qualified_names_regex = '|'.join(qualified_names)
   return re.compile(qualified_names_regex)
 _RE_PATTERN_MONGO_POLYFILL=make_polyfill_regex()
@@ -1656,6 +1657,13 @@ def CheckForMongoPolyfill(filename, clean_lines, linenum, error):
   if re.search(_RE_PATTERN_MONGO_POLYFILL, line):
     error(filename, linenum, 'mongodb/polyfill', 5,
           'Illegal use of banned name from std::/boost::, use mongo::stdx:: variant instead')
+
+def CheckForMongoAtomic(filename, clean_lines, linenum, error):
+  line = clean_lines.elided[linenum]
+  if re.search('std::atomic', line):
+    error(filename, linenum, 'mongodb/stdatomic', 5,
+          'Illegal use of prohibited std::atomic<T>, use AtomicWord<T> or other types '
+          'from "mongo/platform/atomic_word.h"')
 
 def CheckForCopyright(filename, lines, error):
   """Logs an error if no Copyright message appears at the top of the file."""
@@ -5799,6 +5807,7 @@ def ProcessLine(filename, file_extension, clean_lines, line,
   CheckForNamespaceIndentation(filename, nesting_state, clean_lines, line,
                                error)
   CheckForMongoPolyfill(filename, clean_lines, line, error)
+  CheckForMongoAtomic(filename, clean_lines, line, error)
   if nesting_state.InAsmBlock(): return
   CheckForFunctionLengths(filename, clean_lines, line, function_state, error)
   CheckForMultilineCommentsAndStrings(filename, clean_lines, line, error)

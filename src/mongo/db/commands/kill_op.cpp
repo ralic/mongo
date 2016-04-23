@@ -49,7 +49,8 @@ class KillOpCommand : public Command {
 public:
     KillOpCommand() : Command("killOp") {}
 
-    bool isWriteCommandForConfigServer() const final {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -80,6 +81,12 @@ public:
 
         log() << "going to kill op: " << op;
         result.append("info", "attempting to kill op");
+
+        // Internally opid is an unsigned 32-bit int, but as BSON only has signed integer types,
+        // we wrap values exceeding 2,147,483,647 to negative numbers. The following undoes this
+        // transformation, so users can use killOp on the (negative) opid they received.
+        if (op >= std::numeric_limits<int>::min() && op < 0)
+            op += 1ull << 32;
 
         uassert(26823,
                 str::stream() << "invalid op : " << op,

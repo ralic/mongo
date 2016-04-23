@@ -59,15 +59,16 @@ bool isNumeric(StringData str, size_t* num) {
 Status maybePadTo(mutablebson::Element* elemArray, size_t sizeRequired) {
     dassert(elemArray->getType() == Array);
 
-    if (sizeRequired > kMaxPaddingAllowed) {
-        return Status(ErrorCodes::CannotBackfillArray,
-                      mongoutils::str::stream() << "can't backfill array to larger than "
-                                                << kMaxPaddingAllowed << " elements");
-    }
-
     size_t currSize = mutablebson::countChildren(*elemArray);
     if (sizeRequired > currSize) {
         size_t toPad = sizeRequired - currSize;
+
+        if (toPad > kMaxPaddingAllowed) {
+            return Status(ErrorCodes::CannotBackfillArray,
+                          mongoutils::str::stream() << "can't backfill more than "
+                                                    << kMaxPaddingAllowed << " elements");
+        }
+
         for (size_t i = 0; i < toPad; i++) {
             Status status = elemArray->appendNull("");
             if (!status.isOK()) {
@@ -287,9 +288,9 @@ Status setElementAtPath(const FieldRef& path,
     }
 }
 
-const BSONElement& findParentEqualityElement(const EqualityMatches& equalities,
-                                             const FieldRef& path,
-                                             int* parentPathParts) {
+BSONElement findParentEqualityElement(const EqualityMatches& equalities,
+                                      const FieldRef& path,
+                                      int* parentPathParts) {
     // We may have an equality match to an object at a higher point in the pattern path, check
     // all path prefixes for equality matches
     // ex: path: 'a.b', query : { 'a' : { b : <value> } }
@@ -309,8 +310,7 @@ const BSONElement& findParentEqualityElement(const EqualityMatches& equalities,
     }
 
     *parentPathParts = -1;
-    static const BSONElement eooElement;
-    return eooElement;
+    return BSONElement();
 }
 
 /**
@@ -318,7 +318,7 @@ const BSONElement& findParentEqualityElement(const EqualityMatches& equalities,
  */
 static Status checkEqualityConflicts(const EqualityMatches& equalities, const FieldRef& path) {
     int parentPathPart = -1;
-    const BSONElement& parentEl = findParentEqualityElement(equalities, path, &parentPathPart);
+    const BSONElement parentEl = findParentEqualityElement(equalities, path, &parentPathPart);
 
     if (parentEl.eoo())
         return Status::OK();

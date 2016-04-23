@@ -46,7 +46,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -56,12 +56,21 @@ class WiredTigerFactory : public StorageEngine::Factory {
 public:
     virtual ~WiredTigerFactory() {}
     virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile& lockFile) const {
-        if (lockFile.createdByUncleanShutdown()) {
+                                  const StorageEngineLockFile* lockFile) const {
+        if (lockFile && lockFile->createdByUncleanShutdown()) {
             warning() << "Recovering data from the last clean checkpoint.";
         }
-        WiredTigerKVEngine* kv = new WiredTigerKVEngine(
-            params.dbpath, wiredTigerGlobalOptions.engineConfig, params.dur, params.repair);
+
+        size_t cacheMB = WiredTigerUtil::getCacheSizeMB(wiredTigerGlobalOptions.cacheSizeGB);
+        const bool ephemeral = false;
+        WiredTigerKVEngine* kv = new WiredTigerKVEngine(getCanonicalName().toString(),
+                                                        params.dbpath,
+                                                        wiredTigerGlobalOptions.engineConfig,
+                                                        cacheMB,
+                                                        params.dur,
+                                                        ephemeral,
+                                                        params.repair,
+                                                        params.readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
         // Intentionally leaked.
@@ -109,6 +118,10 @@ public:
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
         return builder.obj();
+    }
+
+    bool supportsReadOnly() const final {
+        return true;
     }
 };
 }  // namespace

@@ -32,6 +32,8 @@
 
 #include "mongo/s/query/cluster_client_cursor_mock.h"
 
+#include "mongo/util/assert_util.h"
+
 namespace mongo {
 
 ClusterClientCursorMock::ClusterClientCursorMock(stdx::function<void(void)> killCallback)
@@ -75,12 +77,24 @@ bool ClusterClientCursorMock::isTailable() const {
     return false;
 }
 
-void ClusterClientCursorMock::queueResult(BSONObj obj) {
+void ClusterClientCursorMock::queueResult(const BSONObj& obj) {
     _resultsQueue.push({obj});
+}
+
+bool ClusterClientCursorMock::remotesExhausted() {
+    return _remotesExhausted;
+}
+
+void ClusterClientCursorMock::markRemotesNotExhausted() {
+    _remotesExhausted = false;
 }
 
 void ClusterClientCursorMock::queueError(Status status) {
     _resultsQueue.push({status});
+}
+
+Status ClusterClientCursorMock::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace mongo

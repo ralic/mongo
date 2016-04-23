@@ -54,13 +54,6 @@ class AuthzManagerExternalStateLocal : public AuthzManagerExternalState {
 public:
     virtual ~AuthzManagerExternalStateLocal() = default;
 
-    /**
-     * Takes a user document, and processes it with the RoleGraph, in order to recursively
-     * resolve roles and add the 'inheritedRoles', 'inheritedPrivileges',
-     * and 'warnings' fields.
-     */
-    void resolveUserRoles(mutablebson::Document* userDoc, const std::vector<RoleName>& directRoles);
-
     virtual Status initialize(OperationContext* txn);
 
     virtual Status getStoredAuthorizationVersion(OperationContext* txn, int* outVersion);
@@ -102,7 +95,14 @@ public:
                          const stdx::function<void(const BSONObj&)>& resultProcessor) = 0;
 
     virtual void logOp(
-        OperationContext* txn, const char* op, const char* ns, const BSONObj& o, BSONObj* o2);
+        OperationContext* txn, const char* op, const char* ns, const BSONObj& o, const BSONObj* o2);
+
+    /**
+     * Takes a user document, and processes it with the RoleGraph, in order to recursively
+     * resolve roles and add the 'inheritedRoles', 'inheritedPrivileges',
+     * and 'warnings' fields.
+     */
+    void resolveUserRoles(mutablebson::Document* userDoc, const std::vector<RoleName>& directRoles);
 
 protected:
     AuthzManagerExternalStateLocal() = default;

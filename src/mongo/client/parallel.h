@@ -31,7 +31,6 @@
 
 #pragma once
 
-
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_connection.h"
@@ -71,11 +70,11 @@ public:
 
     // Please do not reorder. cursor destructor can use conn.
     // On a related note, never attempt to cleanup these pointers manually.
-    ShardConnectionPtr conn;
+    std::shared_ptr<ShardConnection> conn;
     DBClientCursorPtr cursor;
 
     // Version information
-    ChunkManagerPtr manager;
+    std::shared_ptr<ChunkManager> manager;
     std::shared_ptr<Shard> primary;
 
     // Cursor status information
@@ -148,17 +147,20 @@ public:
 
     ~ParallelSortClusteredCursor();
 
-    std::string getNS();
-
     /** call before using */
     void init(OperationContext* txn);
 
     bool more();
     BSONObj next();
-    std::string type() const {
-        return "ParallelSort";
-    }
 
+    /**
+     * Returns the set of shards with open cursors.
+     */
+    void getQueryShardIds(std::set<ShardId>& shardIds);
+
+    DBClientCursorPtr getShardCursor(const ShardId& shardId);
+
+private:
     void fullInit(OperationContext* txn);
     void startInit(OperationContext* txn);
     void finishInit(OperationContext* txn);
@@ -166,50 +168,8 @@ public:
     bool isCommand() {
         return NamespaceString(_qSpec.ns()).isCommand();
     }
-    bool isExplain() {
-        return _qSpec.isExplain();
-    }
 
-    /**
-     * Sets the batch size on all underlying cursors to 'newBatchSize'.
-     */
-    void setBatchSize(int newBatchSize);
-
-    /**
-     * Returns whether the collection was sharded when the cursors were established.
-     */
-    bool isSharded();
-
-    /**
-     * Returns the number of shards with open cursors.
-     */
-    int getNumQueryShards();
-
-    /**
-     * Returns the set of shards with open cursors.
-     */
-    void getQueryShardIds(std::set<ShardId>& shardIds);
-
-    /**
-     * Returns the single shard with an open cursor.
-     * It is an error to call this if getNumQueryShards() > 1
-     */
-    ShardId getQueryShardId();
-
-    /**
-     * Returns primary shard with an open cursor.
-     * It is an error to call this if the collection is sharded.
-     */
-    std::shared_ptr<Shard> getPrimary();
-
-    DBClientCursorPtr getShardCursor(const ShardId& shardId);
-
-    void explain(BSONObjBuilder& b);
-
-private:
     void _finishCons();
-
-    void _explain(std::map<std::string, std::list<BSONObj>>& out);
 
     void _markStaleNS(const NamespaceString& staleNS,
                       const StaleConfigException& e,
@@ -230,7 +190,6 @@ private:
     std::map<std::string, int> _staleNSMap;
 
     int _totalTries;
-    bool _cmChangeAttempted;
 
     std::map<ShardId, PCMData> _cursorMap;
 
@@ -254,7 +213,7 @@ private:
                                       std::shared_ptr<Shard> primary /* in */,
                                       const NamespaceString& ns,
                                       const std::string& vinfo,
-                                      ChunkManagerPtr manager /* in */);
+                                      std::shared_ptr<ChunkManager> manager /* in */);
 
     // LEGACY init - Needed for map reduce
     void _oldInit();

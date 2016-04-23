@@ -43,10 +43,6 @@ namespace mongo {
 
 class Client;
 
-bool inShutdown() {
-    return false;
-}
-
 class OperationContext;
 
 DBClientBase* createDirectClient(OperationContext* txn) {
@@ -54,21 +50,11 @@ DBClientBase* createDirectClient(OperationContext* txn) {
     return NULL;
 }
 
-bool haveLocalShardingInfo(Client* client, const std::string& ns) {
+bool haveLocalShardingInfo(OperationContext* txn, const std::string& ns) {
     return false;
 }
 
-void dbexit(ExitCode rc, const char* why) {
-    invariant(!"unittests shouldn't call dbexit");
-}
-
-void exitCleanly(ExitCode code) {
-    invariant(!"unittests shouldn't call exitCleanly");
-}
-
 #ifdef _WIN32
-void signalShutdown() {}
-
 namespace ntservice {
 bool shouldStartService() {
     return false;

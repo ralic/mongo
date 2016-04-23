@@ -49,33 +49,34 @@ struct RemoteCommandRequest {
     // Indicates that there is no expiration time by when the request needs to complete
     static const Date_t kNoExpirationDate;
 
-    RemoteCommandRequest() = default;
+    // Type to represent the internal id of this request
+    typedef uint64_t RequestId;
+
+    RemoteCommandRequest();
+
+    RemoteCommandRequest(RequestId requestId,
+                         const HostAndPort& theTarget,
+                         const std::string& theDbName,
+                         const BSONObj& theCmdObj,
+                         const BSONObj& metadataObj,
+                         Milliseconds timeoutMillis);
 
     RemoteCommandRequest(const HostAndPort& theTarget,
                          const std::string& theDbName,
                          const BSONObj& theCmdObj,
                          const BSONObj& metadataObj,
-                         const Milliseconds timeoutMillis = kNoTimeout)
-        : target(theTarget),
-          dbname(theDbName),
-          metadata(metadataObj),
-          cmdObj(theCmdObj),
-          timeout(timeoutMillis) {
-        if (timeoutMillis == kNoTimeout) {
-            expirationDate = kNoExpirationDate;
-        }
-    }
+                         Milliseconds timeoutMillis = kNoTimeout);
 
     RemoteCommandRequest(const HostAndPort& theTarget,
                          const std::string& theDbName,
                          const BSONObj& theCmdObj,
-                         const Milliseconds timeoutMillis = kNoTimeout)
+                         Milliseconds timeoutMillis = kNoTimeout)
         : RemoteCommandRequest(
               theTarget, theDbName, theCmdObj, rpc::makeEmptyMetadata(), timeoutMillis) {}
 
     RemoteCommandRequest(const HostAndPort& theTarget,
                          const rpc::RequestInterface& request,
-                         const Milliseconds timeoutMillis = kNoTimeout)
+                         Milliseconds timeoutMillis = kNoTimeout)
         : RemoteCommandRequest(theTarget,
                                request.getDatabase().toString(),
                                request.getCommandArgs(),
@@ -83,6 +84,9 @@ struct RemoteCommandRequest {
                                timeoutMillis) {}
 
     std::string toString() const;
+
+    // Internal id of this request. Not interpereted and used for tracing purposes only.
+    RequestId id;
 
     HostAndPort target;
     std::string dbname;

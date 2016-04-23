@@ -61,7 +61,7 @@ public:
        also, the Message data will go out of scope on the subsequent recv call.
     */
     bool recv(Message& m);
-    void reply(Message& received, Message& response, MSGID responseTo);
+    void reply(Message& received, Message& response, int32_t responseToMsgId);
     void reply(Message& received, Message& response);
     bool call(Message& toSend, Message& response);
 
@@ -119,8 +119,7 @@ public:
 
 private:
     // this is the parsed version of remote
-    // mutable because its initialized only on call to remote()
-    mutable HostAndPort _remoteParsed;
+    HostAndPort _remoteParsed;
 
 public:
     static void closeAllSockets(unsigned tagMask = 0xffffffff);

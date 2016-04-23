@@ -68,12 +68,7 @@ CollectionScan::CollectionScan(OperationContext* txn,
     _specificStats.direction = params.direction;
 }
 
-PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
-    ++_commonStats.works;
-
-    // Adds the amount of time taken by work() to executionTimeMillis.
-    ScopedTimer timer(&_commonStats.executionTimeMillis);
-
+PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     if (_isDead) {
         Status status(
             ErrorCodes::CappedPositionLost,
@@ -118,7 +113,6 @@ PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
                 }
             }
 
-            _commonStats.needTime++;
             return PlanStage::NEED_TIME;
         }
 
@@ -132,7 +126,6 @@ PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
                 WorkingSetMember* member = _workingSet->get(_wsidForFetch);
                 member->setFetcher(fetcher.release());
                 *out = _wsidForFetch;
-                _commonStats.needYield++;
                 return PlanStage::NEED_YIELD;
             }
 
@@ -163,9 +156,9 @@ PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
 
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
-    member->loc = record->id;
+    member->recordId = record->id;
     member->obj = {getOpCtx()->recoveryUnit()->getSnapshotId(), record->data.releaseToBson()};
-    _workingSet->transitionToLocAndObj(id);
+    _workingSet->transitionToRecordIdAndObj(id);
 
     return returnIfMatches(member, id, out);
 }
@@ -177,11 +170,9 @@ PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
 
     if (Filter::passes(member, _filter)) {
         *out = memberID;
-        ++_commonStats.advanced;
         return PlanStage::ADVANCED;
     } else {
         _workingSet->free(memberID);
-        ++_commonStats.needTime;
         return PlanStage::NEED_TIME;
     }
 }
@@ -203,7 +194,7 @@ void CollectionScan::doInvalidate(OperationContext* txn,
 
     // Deletions can harm the underlying RecordCursor so we must pass them down.
     if (_cursor) {
-        _cursor->invalidate(id);
+        _cursor->invalidate(txn, id);
     }
 
     if (_params.tailable && id == _lastSeenId) {
@@ -243,7 +234,7 @@ unique_ptr<PlanStageStats> CollectionScan::getStats() {
     // Add a BSON representation of the filter to the stats tree, if there is one.
     if (NULL != _filter) {
         BSONObjBuilder bob;
-        _filter->toBSON(&bob);
+        _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
     }
 

@@ -44,6 +44,10 @@
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+namespace {
+using executor::RemoteCommandRequest;
+}
+
 class Fetcher {
     MONGO_DISALLOW_COPYING(Fetcher);
 
@@ -58,8 +62,6 @@ public:
      * If cursor ID is zero, there are no additional batches.
      */
     struct QueryResponse {
-        QueryResponse() = default;
-        QueryResponse(CursorId theCursorId, const NamespaceString& theNss, Documents theDocuments);
         CursorId cursorId = 0;
         NamespaceString nss;
         Documents documents;
@@ -67,7 +69,7 @@ public:
             BSONObj metadata;
         } otherFields;
         Milliseconds elapsedMillis = Milliseconds(0);
-        bool first;
+        bool first = false;
     };
 
     using QueryResponseStatus = StatusWith<Fetcher::QueryResponse>;
@@ -120,9 +122,30 @@ public:
             const std::string& dbname,
             const BSONObj& cmdObj,
             const CallbackFn& work,
-            const BSONObj& metadata = rpc::makeEmptyMetadata());
+            const BSONObj& metadata = rpc::makeEmptyMetadata(),
+            Milliseconds timeout = RemoteCommandRequest::kNoTimeout);
 
     virtual ~Fetcher();
+
+    /**
+     * Returns host where remote commands will be sent to.
+     */
+    HostAndPort getSource() const;
+
+    /**
+     * Returns command object sent in first remote command.
+     */
+    BSONObj getCommandObject() const;
+
+    /**
+     * Returns metadata object sent in remote commands.
+     */
+    BSONObj getMetadataObject() const;
+
+    /**
+     * Returns timeout for remote commands to complete.
+     */
+    Milliseconds getTimeout() const;
 
     /**
      * Returns diagnostic information.
@@ -199,6 +222,9 @@ private:
 
     // Callback handle to the scheduled remote command.
     executor::TaskExecutor::CallbackHandle _remoteCommandCallbackHandle;
+
+    // Socket timeout
+    Milliseconds _timeout;
 };
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -74,7 +74,7 @@ __curlog_compare(WT_CURSOR *a, WT_CURSOR *b, int *cmpp)
 	acl = (WT_CURSOR_LOG *)a;
 	bcl = (WT_CURSOR_LOG *)b;
 	WT_ASSERT(session, cmpp != NULL);
-	*cmpp = WT_LOG_CMP(acl->cur_lsn, bcl->cur_lsn);
+	*cmpp = __wt_log_cmp(acl->cur_lsn, bcl->cur_lsn);
 	/*
 	 * If both are on the same LSN, compare step counter.
 	 */
@@ -187,13 +187,13 @@ __curlog_kv(WT_SESSION_IMPL *session, WT_CURSOR *cursor)
 	if (FLD_ISSET(cursor->flags, WT_CURSTD_RAW)) {
 		memset(&item, 0, sizeof(item));
 		WT_RET(wiredtiger_struct_size((WT_SESSION *)session,
-		    &item.size, WT_LOGC_KEY_FORMAT, cl->cur_lsn->file,
-		    cl->cur_lsn->offset, key_count));
+		    &item.size, WT_LOGC_KEY_FORMAT, cl->cur_lsn->l.file,
+		    cl->cur_lsn->l.offset, key_count));
 		WT_RET(__wt_realloc(session, NULL, item.size, &cl->packed_key));
 		item.data = cl->packed_key;
 		WT_RET(wiredtiger_struct_pack((WT_SESSION *)session,
 		    cl->packed_key, item.size, WT_LOGC_KEY_FORMAT,
-		    cl->cur_lsn->file, cl->cur_lsn->offset, key_count));
+		    cl->cur_lsn->l.file, cl->cur_lsn->l.offset, key_count));
 		__wt_cursor_set_key(cursor, &item);
 
 		WT_RET(wiredtiger_struct_size((WT_SESSION *)session,
@@ -208,8 +208,8 @@ __curlog_kv(WT_SESSION_IMPL *session, WT_CURSOR *cursor)
 		    cl->opvalue));
 		__wt_cursor_set_value(cursor, &item);
 	} else {
-		__wt_cursor_set_key(cursor, cl->cur_lsn->file,
-		    cl->cur_lsn->offset, key_count);
+		__wt_cursor_set_key(cursor, cl->cur_lsn->l.file,
+		    cl->cur_lsn->l.offset, key_count);
 		__wt_cursor_set_value(cursor, cl->txnid, cl->rectype, optype,
 		    fileid, cl->opkey, cl->opvalue);
 	}
@@ -264,7 +264,7 @@ __curlog_search(WT_CURSOR *cursor)
 	WT_DECL_RET;
 	WT_LSN key;
 	WT_SESSION_IMPL *session;
-	uint32_t counter;
+	uint32_t counter, key_file, key_offset;
 
 	cl = (WT_CURSOR_LOG *)cursor;
 
@@ -274,7 +274,8 @@ __curlog_search(WT_CURSOR *cursor)
 	 * !!! We are ignoring the counter and only searching based on the LSN.
 	 */
 	WT_ERR(__wt_cursor_get_key((WT_CURSOR *)cl,
-	    &key.file, &key.offset, &counter));
+	    &key_file, &key_offset, &counter));
+	WT_SET_LSN(&key, key_file, key_offset);
 	ret = __wt_log_scan(session, &key, WT_LOGSCAN_ONE,
 	    __curlog_logrec, cl);
 	if (ret == ENOENT)
@@ -346,22 +347,22 @@ __wt_curlog_open(WT_SESSION_IMPL *session,
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_CURSOR_STATIC_INIT(iface,
-	    __wt_cursor_get_key,	/* get-key */
-	    __wt_cursor_get_value,	/* get-value */
-	    __wt_cursor_set_key,	/* set-key */
-	    __wt_cursor_set_value,	/* set-value */
-	    __curlog_compare,		/* compare */
-	    __wt_cursor_equals,		/* equals */
-	    __curlog_next,		/* next */
-	    __wt_cursor_notsup,		/* prev */
-	    __curlog_reset,		/* reset */
-	    __curlog_search,		/* search */
-	    __wt_cursor_notsup,		/* search-near */
-	    __wt_cursor_notsup,		/* insert */
-	    __wt_cursor_notsup,		/* update */
-	    __wt_cursor_notsup,		/* remove */
-	    __wt_cursor_notsup,		/* reconfigure */
-	    __curlog_close);		/* close */
+	    __wt_cursor_get_key,		/* get-key */
+	    __wt_cursor_get_value,		/* get-value */
+	    __wt_cursor_set_key,		/* set-key */
+	    __wt_cursor_set_value,		/* set-value */
+	    __curlog_compare,			/* compare */
+	    __wt_cursor_equals,			/* equals */
+	    __curlog_next,			/* next */
+	    __wt_cursor_notsup,			/* prev */
+	    __curlog_reset,			/* reset */
+	    __curlog_search,			/* search */
+	    __wt_cursor_search_near_notsup,	/* search-near */
+	    __wt_cursor_notsup,			/* insert */
+	    __wt_cursor_notsup,			/* update */
+	    __wt_cursor_notsup,			/* remove */
+	    __wt_cursor_reconfigure_notsup,	/* reconfigure */
+	    __curlog_close);			/* close */
 	WT_CURSOR *cursor;
 	WT_CURSOR_LOG *cl;
 	WT_DECL_RET;
@@ -391,6 +392,12 @@ __wt_curlog_open(WT_SESSION_IMPL *session,
 	WT_INIT_LSN(cl->next_lsn);
 
 	WT_ERR(__wt_cursor_init(cursor, uri, NULL, cfg, cursorp));
+
+	/*
+	 * The user may be trying to read a log record they just wrote.
+	 * Log records may be buffered, so force out any now.
+	 */
+	WT_ERR(__wt_log_force_write(session, 1, NULL));
 
 	/* Log cursors block archiving. */
 	WT_ERR(__wt_readlock(session, log->log_archive_lock));

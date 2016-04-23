@@ -33,23 +33,30 @@
 #include <map>
 
 #include "mongo/db/storage/mmap_v1/record_access_tracker.h"
+#include "mongo/db/storage/mmap_v1/extent_manager.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
+class JournalListener;
 class MMAPV1DatabaseCatalogEntry;
 
 class MMAPV1Engine : public StorageEngine {
 public:
-    MMAPV1Engine(const StorageEngineLockFile& lockFile);
+    MMAPV1Engine(const StorageEngineLockFile* lockFile);
+    MMAPV1Engine(const StorageEngineLockFile* lockFile,
+                 std::unique_ptr<ExtentManager::Factory> extentManagerFactory);
     virtual ~MMAPV1Engine();
 
     void finishInit();
 
     RecoveryUnit* newRecoveryUnit();
     void listDatabases(std::vector<std::string>* out) const;
+
     int flushAllFiles(bool sync);
+    Status beginBackup(OperationContext* txn);
+    void endBackup(OperationContext* txn);
 
     DatabaseCatalogEntry* getDatabaseCatalogEntry(OperationContext* opCtx, StringData db);
 
@@ -61,6 +68,8 @@ public:
     }
 
     virtual bool isDurable() const;
+
+    virtual bool isEphemeral() const;
 
     virtual Status closeDatabase(OperationContext* txn, StringData db);
 
@@ -90,6 +99,8 @@ public:
      */
     RecordAccessTracker& getRecordAccessTracker();
 
+    void setJournalListener(JournalListener* jl) final;
+
 private:
     static void _listDatabases(const std::string& directory, std::vector<std::string>* out);
 
@@ -101,6 +112,8 @@ private:
     // addresses. It is used when higher layers (e.g. the query system) need to ask
     // the storage engine whether data is likely in physical memory.
     RecordAccessTracker _recordAccessTracker;
+
+    std::unique_ptr<ExtentManager::Factory> _extentManagerFactory;
 };
 
 void _deleteDataFiles(const std::string& database);

@@ -37,41 +37,19 @@
 
 namespace mongo {
 namespace repl {
-namespace {
 
-const char* kTimestampFieldName = "ts";
-const char* kTermFieldName = "t";
+const char OpTime::kTimestampFieldName[] = "ts";
+const char OpTime::kTermFieldName[] = "t";
 
-}  // namespace
+void OpTime::append(BSONObjBuilder* builder, const std::string& subObjName) const {
+    BSONObjBuilder opTimeBuilder(builder->subobjStart(subObjName));
+    opTimeBuilder.append(kTimestampFieldName, _timestamp);
 
-OpTime::OpTime(Timestamp ts, long long term) : _timestamp(std::move(ts)), _term(term) {}
-
-Timestamp OpTime::getTimestamp() const {
-    return _timestamp;
+    opTimeBuilder.append(kTermFieldName, _term);
+    opTimeBuilder.doneFast();
 }
 
-long long OpTime::getSecs() const {
-    return _timestamp.getSecs();
-}
-
-long long OpTime::getTerm() const {
-    return _term;
-}
-
-bool OpTime::isNull() const {
-    return _timestamp.isNull();
-}
-
-void OpTime::append(BSONObjBuilder* builder) const {
-    builder->append(kTimestampFieldName, _timestamp);
-
-    // Don't add term in protocol version 0.
-    if (_term != kUninitializedTerm) {
-        builder->append(kTermFieldName, _term);
-    }
-}
-
-StatusWith<OpTime> OpTime::parseFromBSON(const BSONObj& obj) {
+StatusWith<OpTime> OpTime::parseFromOplogEntry(const BSONObj& obj) {
     Timestamp ts;
     Status status = bsonExtractTimestampField(obj, kTimestampFieldName, &ts);
     if (!status.isOK())
@@ -86,10 +64,15 @@ StatusWith<OpTime> OpTime::parseFromBSON(const BSONObj& obj) {
     return OpTime(ts, term);
 }
 
+BSONObj OpTime::toBSON() const {
+    BSONObjBuilder bldr;
+    bldr.append(kTimestampFieldName, _timestamp);
+    bldr.append(kTermFieldName, _term);
+    return bldr.obj();
+}
+
 std::string OpTime::toString() const {
-    std::stringstream ss;
-    ss << "(term: " << _term << ", timestamp: " << _timestamp.toStringPretty() << ")";
-    return ss.str();
+    return toBSON().toString();
 }
 
 std::ostream& operator<<(std::ostream& out, const OpTime& opTime) {

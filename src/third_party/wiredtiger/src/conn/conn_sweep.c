@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -26,7 +26,7 @@ __sweep_mark(WT_SESSION_IMPL *session, time_t now)
 	conn = S2C(session);
 
 	TAILQ_FOREACH(dhandle, &conn->dhqh, q) {
-		if (WT_IS_METADATA(dhandle))
+		if (WT_IS_METADATA(session, dhandle))
 			continue;
 
 		/*
@@ -64,11 +64,9 @@ __sweep_expire_one(WT_SESSION_IMPL *session)
 	WT_BTREE *btree;
 	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
-	int evict_reset;
 
 	btree = S2BT(session);
 	dhandle = session->dhandle;
-	evict_reset = 0;
 
 	/*
 	 * Acquire an exclusive lock on the handle and mark it dead.
@@ -92,18 +90,12 @@ __sweep_expire_one(WT_SESSION_IMPL *session)
 	    !__wt_txn_visible_all(session, btree->rec_max_txn))
 		goto err;
 
-	/* Ensure that we aren't racing with the eviction server */
-	WT_ERR(__wt_evict_file_exclusive_on(session, &evict_reset));
-
 	/*
-	 * Mark the handle as dead and close the underlying file
-	 * handle. Closing the handle decrements the open file count,
-	 * meaning the close loop won't overrun the configured minimum.
+	 * Mark the handle dead and close the underlying file handle.
+	 * Closing the handle decrements the open file count, meaning the close
+	 * loop won't overrun the configured minimum.
 	 */
-	ret = __wt_conn_btree_sync_and_close(session, 0, 1);
-
-	if (evict_reset)
-		__wt_evict_file_exclusive_off(session);
+	ret = __wt_conn_btree_sync_and_close(session, false, true);
 
 err:	WT_TRET(__wt_writeunlock(session, dhandle->rwlock));
 
@@ -132,11 +124,12 @@ __sweep_expire(WT_SESSION_IMPL *session, time_t now)
 		if (conn->open_btree_count < conn->sweep_handles_min)
 			break;
 
-		if (WT_IS_METADATA(dhandle) ||
+		if (WT_IS_METADATA(session, dhandle) ||
 		    !F_ISSET(dhandle, WT_DHANDLE_OPEN) ||
 		    dhandle->session_inuse != 0 ||
 		    dhandle->timeofdeath == 0 ||
-		    now <= dhandle->timeofdeath + conn->sweep_idle_time)
+		    difftime(now, dhandle->timeofdeath) <=
+		    conn->sweep_idle_time)
 			continue;
 
 		WT_WITH_DHANDLE(session, dhandle,
@@ -170,9 +163,9 @@ __sweep_discard_trees(WT_SESSION_IMPL *session, u_int *dead_handlesp)
 		    !F_ISSET(dhandle, WT_DHANDLE_DEAD))
 			continue;
 
-		/* If the handle is marked "dead", flush it from cache. */
+		/* If the handle is marked dead, flush it from cache. */
 		WT_WITH_DHANDLE(session, dhandle, ret =
-		    __wt_conn_btree_sync_and_close(session, 0, 0));
+		    __wt_conn_btree_sync_and_close(session, false, false));
 
 		/* We closed the btree handle. */
 		if (ret == 0) {
@@ -207,7 +200,7 @@ __sweep_remove_one(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle)
 		WT_ERR(EBUSY);
 
 	WT_WITH_DHANDLE(session, dhandle,
-	    ret = __wt_conn_dhandle_discard_single(session, 0, 1));
+	    ret = __wt_conn_dhandle_discard_single(session, false, true));
 
 	/*
 	 * If the handle was not successfully discarded, unlock it and
@@ -237,7 +230,7 @@ __sweep_remove_handles(WT_SESSION_IMPL *session)
 	    dhandle != NULL;
 	    dhandle = dhandle_next) {
 		dhandle_next = TAILQ_NEXT(dhandle, q);
-		if (WT_IS_METADATA(dhandle))
+		if (WT_IS_METADATA(session, dhandle))
 			continue;
 		if (!WT_DHANDLE_CAN_DISCARD(dhandle))
 			continue;
@@ -276,11 +269,18 @@ __sweep_server(void *arg)
 	while (F_ISSET(conn, WT_CONN_SERVER_RUN) &&
 	    F_ISSET(conn, WT_CONN_SERVER_SWEEP)) {
 		/* Wait until the next event. */
-		WT_ERR(__wt_cond_wait(session, conn->sweep_cond,
-		    (uint64_t)conn->sweep_interval * WT_MILLION));
+		WT_ERR(__wt_cond_wait(session,
+		    conn->sweep_cond, conn->sweep_interval * WT_MILLION));
 		WT_ERR(__wt_seconds(session, &now));
 
 		WT_STAT_FAST_CONN_INCR(session, dh_sweeps);
+
+		/*
+		 * Sweep the lookaside table. If the lookaside table hasn't yet
+		 * been written, there's no work to do.
+		 */
+		if (__wt_las_is_written(session))
+			WT_ERR(__wt_las_sweep(session));
 
 		/*
 		 * Mark handles with a time of death, and report whether any
@@ -322,18 +322,25 @@ __wt_sweep_config(WT_SESSION_IMPL *session, const char *cfg[])
 
 	conn = S2C(session);
 
-	/* Pull out the sweep configurations. */
-	WT_RET(__wt_config_gets(session,
-	    cfg, "file_manager.close_idle_time", &cval));
-	conn->sweep_idle_time = (time_t)cval.val;
+	/*
+	 * A non-zero idle time is incompatible with in-memory, and the default
+	 * is non-zero; set the in-memory configuration idle time to zero.
+	 */
+	conn->sweep_idle_time = 0;
+	WT_RET(__wt_config_gets(session, cfg, "in_memory", &cval));
+	if (cval.val == 0) {
+		WT_RET(__wt_config_gets(session,
+		    cfg, "file_manager.close_idle_time", &cval));
+		conn->sweep_idle_time = (uint64_t)cval.val;
+	}
 
 	WT_RET(__wt_config_gets(session,
 	    cfg, "file_manager.close_scan_interval", &cval));
-	conn->sweep_interval = (time_t)cval.val;
+	conn->sweep_interval = (uint64_t)cval.val;
 
 	WT_RET(__wt_config_gets(session,
 	    cfg, "file_manager.close_handle_minimum", &cval));
-	conn->sweep_handles_min = (u_int)cval.val;
+	conn->sweep_handles_min = (uint64_t)cval.val;
 
 	return (0);
 }
@@ -346,24 +353,31 @@ int
 __wt_sweep_create(WT_SESSION_IMPL *session)
 {
 	WT_CONNECTION_IMPL *conn;
+	uint32_t session_flags;
 
 	conn = S2C(session);
 
 	/* Set first, the thread might run before we finish up. */
 	F_SET(conn, WT_CONN_SERVER_SWEEP);
 
-	WT_RET(__wt_open_internal_session(
-	    conn, "sweep-server", 1, 1, &conn->sweep_session));
-	session = conn->sweep_session;
-
 	/*
 	 * Handle sweep does enough I/O it may be called upon to perform slow
 	 * operations for the block manager.
+	 *
+	 * The sweep thread sweeps the lookaside table for outdated records,
+	 * it gets its own cursor for that purpose.
+	 *
+	 * Don't tap the sweep thread for eviction.
 	 */
-	F_SET(session, WT_SESSION_CAN_WAIT);
+	session_flags = WT_SESSION_CAN_WAIT | WT_SESSION_NO_EVICTION;
+	if (F_ISSET(conn, WT_CONN_LAS_OPEN))
+		session_flags |= WT_SESSION_LOOKASIDE_CURSOR;
+	WT_RET(__wt_open_internal_session(
+	    conn, "sweep-server", true, session_flags, &conn->sweep_session));
+	session = conn->sweep_session;
 
 	WT_RET(__wt_cond_alloc(
-	    session, "handle sweep server", 0, &conn->sweep_cond));
+	    session, "handle sweep server", false, &conn->sweep_cond));
 
 	WT_RET(__wt_thread_create(
 	    session, &conn->sweep_tid, __sweep_server, session));
@@ -399,5 +413,9 @@ __wt_sweep_destroy(WT_SESSION_IMPL *session)
 
 		conn->sweep_session = NULL;
 	}
+
+	/* Discard any saved lookaside key. */
+	__wt_buf_free(session, &conn->las_sweep_key);
+
 	return (ret);
 }

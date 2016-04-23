@@ -1,47 +1,55 @@
 /**
  * Starts up a sharded cluster with the given specifications. The cluster
  * will be fully operational after the execution of this constructor function.
- * 
- * @param {Object} testName Contains the key value pair for the cluster
+ *
+ * @param {Object} params Contains the key-value pairs for the cluster
  *   configuration. Accepted keys are:
- * 
+ *
  *   {
  *     name {string}: name for this test
  *     verbose {number}: the verbosity for the mongos
  *     keyFile {string}: the location of the keyFile
  *     chunksize {number}:
  *     nopreallocj {boolean|number}:
- * 
+ *
  *     mongos {number|Object|Array.<Object>}: number of mongos or mongos
  *       configuration object(s)(*). @see MongoRunner.runMongos
- * 
+ *
  *     rs {Object|Array.<Object>}: replica set configuration object. Can
  *       contain:
  *       {
  *         nodes {number}: number of replica members. Defaults to 3.
+ *         protocolVersion {number}: protocol version of replset used by the
+ *             replset initiation.
+ *         initiateTimeout {number}: timeout in milliseconds to specify
+ *              to ReplSetTest.prototype.initiate().
  *         For other options, @see ReplSetTest#start
  *       }
- * 
+ *
  *     shards {number|Object|Array.<Object>}: number of shards or shard
  *       configuration object(s)(*). @see MongoRunner.runMongod
- *     
+ *
  *     config {number|Object|Array.<Object>}: number of config server or
- *       config server configuration object(s)(*). If this field has 3 or
- *       more members, it implies other.sync = true. @see MongoRunner.runMongod
- * 
+ *       config server configuration object(s)(*). @see MongoRunner.runMongod
+ *
  *     (*) There are two ways For multiple configuration objects.
  *       (1) Using the object format. Example:
- * 
+ *
  *           { d0: { verbose: 5 }, d1: { auth: '' }, rs2: { oplogsize: 10 }}
- * 
+ *
  *           In this format, d = mongod, s = mongos & c = config servers
- * 
+ *
  *       (2) Using the array format. Example:
- * 
+ *
  *           [{ verbose: 5 }, { auth: '' }]
- * 
+ *
  *       Note: you can only have single server shards for array format.
- * 
+ *
+ *       Note: A special "bridgeOptions" property can be specified in both the object and array
+ *          formats to configure the options for the mongobridge corresponding to that node. These
+ *          options are merged with the params.bridgeOptions options, where the node-specific
+ *          options take precedence.
+ *
  *     other: {
  *       nopreallocj: same as above
  *       rs: same as above
@@ -49,9 +57,7 @@
  *
  *       shardOptions {Object}: same as the shards property above.
  *          Can be used to specify options that are common all shards.
- * 
- *       sync {boolean}: Use SyncClusterConnection, and readies
- *          3 config servers.
+ *
  *       configOptions {Object}: same as the config property above.
  *          Can be used to specify options that are common all config servers.
  *       mongosOptions {Object}: same as the mongos property above.
@@ -59,15 +65,20 @@
  *       enableBalancer {boolean} : if true, enable the balancer
  *       manualAddShard {boolean}: shards will not be added if true.
  *
+ *       useBridge {boolean}: If true, then a mongobridge process is started for each node in the
+ *          sharded cluster. Defaults to false.
+ *
+ *       bridgeOptions {Object}: Options to apply to all mongobridge processes. Defaults to {}.
+ *
  *       // replica Set only:
  *       rsOptions {Object}: same as the rs property above. Can be used to
  *         specify options that are common all replica members.
  *       useHostname {boolean}: if true, use hostname of machine,
  *         otherwise use localhost
- *       numReplicas {number} 
+ *       numReplicas {number}
  *     }
  *   }
- * 
+ *
  * Member variables:
  * s {Mongo} - connection to the first mongos
  * s0, s1, ... {Mongo} - connection to different mongos
@@ -78,1111 +89,1304 @@
  * c0, c1, ... {Mongo} - same as config0, config1, ...
  * configRS - If the config servers are a replset, this will contain the config ReplSetTest object
  */
-ShardingTest = function( testName , numShards , verboseLevel , numMongos , otherParams ){
-    
-    this._startTime = new Date();
+var ShardingTest = function(params) {
 
-    // Check if testName is an object, if so, pull params from there
-    var keyFile = undefined
-    var numConfigs = 3;
-    otherParams = Object.merge( otherParams || {}, {} )
+    if (!(this instanceof ShardingTest)) {
+        return new ShardingTest(params);
+    }
 
-    if( isObject( testName ) ){
-        
-        var params = Object.merge( testName, {} )
-        
-        testName = params.name || "test"
-        otherParams = Object.merge(otherParams, params);
-        otherParams = Object.merge(params.other || {}, otherParams);
+    // Capture the 'this' reference
+    var self = this;
 
-        numShards = otherParams.shards || 2
-        verboseLevel = otherParams.verbose || 0
-        numMongos = otherParams.mongos || 1
-        numConfigs = otherParams.config || numConfigs;
+    // Used for counting the test duration
+    var _startTime = new Date();
 
+    // Populated with the paths of all shard hosts (config servers + hosts) and is used for
+    // cleaning up the data files on shutdown
+    var _alldbpaths = [];
+
+    // Publicly exposed variables
+
+    /**
+     * Attempts to open a connection to the specified connection string or throws if unable to
+     * connect.
+     */
+    function _connectWithRetry(url) {
+        var conn;
+        assert.soon(function() {
+            try {
+                conn = new Mongo(url);
+                return true;
+            } catch (e) {
+                print("Error connecting to " + url + ": " + e);
+                return false;
+            }
+        });
+
+        return conn;
+    }
+
+    /**
+     * Constructs a human-readable string representing a chunk's range.
+     */
+    function _rangeToString(r) {
+        return tojsononeline(r.min) + " -> " + tojsononeline(r.max);
+    }
+
+    /**
+     * Checks whether the specified collection is sharded by consulting the config metadata.
+     */
+    function _isSharded(collName) {
+        var collName = "" + collName;
+        var dbName;
+
+        if (typeof collName.getCollectionNames == 'function') {
+            dbName = "" + collName;
+            collName = undefined;
+        }
+
+        if (dbName) {
+            var x = self.config.databases.findOne({_id: dbname});
+            if (x)
+                return x.partitioned;
+            else
+                return false;
+        }
+
+        if (collName) {
+            var x = self.config.collections.findOne({_id: collName});
+            if (x)
+                return true;
+            else
+                return false;
+        }
+    }
+
+    function connectionURLTheSame(a, b) {
+        if (a == b)
+            return true;
+
+        if (!a || !b)
+            return false;
+
+        if (a.host)
+            return connectionURLTheSame(a.host, b);
+        if (b.host)
+            return connectionURLTheSame(a, b.host);
+
+        if (a.name)
+            return connectionURLTheSame(a.name, b);
+        if (b.name)
+            return connectionURLTheSame(a, b.name);
+
+        if (a.indexOf("/") < 0 && b.indexOf("/") < 0) {
+            a = a.split(":");
+            b = b.split(":");
+
+            if (a.length != b.length)
+                return false;
+
+            if (a.length == 2 && a[1] != b[1])
+                return false;
+
+            if (a[0] == "localhost" || a[0] == "127.0.0.1")
+                a[0] = getHostName();
+            if (b[0] == "localhost" || b[0] == "127.0.0.1")
+                b[0] = getHostName();
+
+            return a[0] == b[0];
+        } else {
+            var a0 = a.split("/")[0];
+            var b0 = b.split("/")[0];
+            return a0 == b0;
+        }
+    }
+
+    assert(connectionURLTheSame("foo", "foo"));
+    assert(!connectionURLTheSame("foo", "bar"));
+
+    assert(connectionURLTheSame("foo/a,b", "foo/b,a"));
+    assert(!connectionURLTheSame("foo/a,b", "bar/a,b"));
+
+    // ShardingTest API
+
+    this.getRSEntry = function(setName) {
+        for (var i = 0; i < this._rs.length; i++)
+            if (this._rs[i].setName == setName)
+                return this._rs[i];
+        throw Error("can't find rs: " + setName);
+    };
+
+    this.getDB = function(name) {
+        return this.s.getDB(name);
+    };
+
+    /*
+     * Finds the _id of the primary shard for database 'dbname', e.g., 'test-rs0'
+     */
+    this.getPrimaryShardIdForDatabase = function(dbname) {
+        var x = this.config.databases.findOne({_id: "" + dbname});
+        if (x) {
+            return x.primary;
+        }
+
+        var countDBsFound = 0;
+        this.config.databases.find().forEach(function(db) {
+            countDBsFound++;
+            printjson(db);
+        });
+        throw Error("couldn't find dbname: " + dbname + " in config.databases. Total DBs: " +
+                    countDBsFound);
+    };
+
+    this.getNonPrimaries = function(dbname) {
+        var x = this.config.databases.findOne({_id: dbname});
+        if (!x) {
+            this.config.databases.find().forEach(printjson);
+            throw Error("couldn't find dbname: " + dbname + " total: " +
+                        this.config.databases.count());
+        }
+
+        return this.config.shards.find({_id: {$ne: x.primary}}).map(z => z._id);
+    };
+
+    this.getConnNames = function() {
+        var names = [];
+        for (var i = 0; i < this._connections.length; i++) {
+            names.push(this._connections[i].name);
+        }
+        return names;
+    };
+
+    /*
+     * Find the connection to the primary shard for database 'dbname'.
+     */
+    this.getPrimaryShard = function(dbname) {
+        var dbPrimaryShardId = this.getPrimaryShardIdForDatabase(dbname);
+        var primaryShard = this.config.shards.findOne({_id: dbPrimaryShardId});
+
+        if (primaryShard) {
+            shardConnectionString = primaryShard.host;
+            var rsName = shardConnectionString.substring(0, shardConnectionString.indexOf("/"));
+
+            for (var i = 0; i < this._connections.length; i++) {
+                var c = this._connections[i];
+                if (connectionURLTheSame(shardConnectionString, c.name) ||
+                    connectionURLTheSame(rsName, c.name))
+                    return c;
+            }
+        }
+
+        throw Error("can't find server connection for db '" + dbname + "'s primary shard: " +
+                    tojson(primaryShard));
+    };
+
+    this.normalize = function(x) {
+        var z = this.config.shards.findOne({host: x});
+        if (z)
+            return z._id;
+        return x;
+    };
+
+    /*
+     * Find a different shard connection than the one given.
+     */
+    this.getOther = function(one) {
+        if (this._connections.length < 2) {
+            throw Error("getOther only works with 2 shards");
+        }
+
+        if (one._mongo) {
+            one = one._mongo;
+        }
+
+        for (var i = 0; i < this._connections.length; i++) {
+            if (this._connections[i] != one) {
+                return this._connections[i];
+            }
+        }
+
+        return null;
+    };
+
+    this.getAnother = function(one) {
+        if (this._connections.length < 2) {
+            throw Error("getAnother() only works with multiple servers");
+        }
+
+        if (one._mongo) {
+            one = one._mongo;
+        }
+
+        for (var i = 0; i < this._connections.length; i++) {
+            if (this._connections[i] == one)
+                return this._connections[(i + 1) % this._connections.length];
+        }
+    };
+
+    this.getFirstOther = function(one) {
+        for (var i = 0; i < this._connections.length; i++) {
+            if (this._connections[i] != one) {
+                return this._connections[i];
+            }
+        }
+
+        throw Error("impossible");
+    };
+
+    this.stop = function(opts) {
+        for (var i = 0; i < this._mongos.length; i++) {
+            this.stopMongos(i, opts);
+        }
+
+        for (var i = 0; i < this._connections.length; i++) {
+            if (this._rs[i]) {
+                this._rs[i].test.stopSet(15, undefined, opts);
+            } else {
+                this.stopMongod(i, opts);
+            }
+        }
+
+        if (this.configRS) {
+            this.configRS.stopSet(undefined, undefined, opts);
+        } else {
+            // Old style config triplet
+            for (var i = 0; i < this._configServers.length; i++) {
+                this.stopConfigServer(i, opts);
+            }
+        }
+
+        for (var i = 0; i < _alldbpaths.length; i++) {
+            resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
+        }
+
+        var timeMillis = new Date().getTime() - _startTime.getTime();
+
+        print('*** ShardingTest ' + this._testName + " completed successfully in " +
+              (timeMillis / 1000) + " seconds ***");
+    };
+
+    this.getDBPaths = function() {
+        return _alldbpaths.map((path) => {
+            return MongoRunner.dataPath + path;
+        });
+    };
+
+    this.adminCommand = function(cmd) {
+        var res = this.admin.runCommand(cmd);
+        if (res && res.ok == 1)
+            return true;
+
+        throw _getErrorWithCode(res, "command " + tojson(cmd) + " failed: " + tojson(res));
+    };
+
+    this.printChangeLog = function() {
+        this.config.changelog.find().forEach(function(z) {
+            var msg = z.server + "\t" + z.time + "\t" + z.what;
+            for (var i = z.what.length; i < 15; i++)
+                msg += " ";
+
+            msg += " " + z.ns + "\t";
+            if (z.what == "split") {
+                msg += _rangeToString(z.details.before) + " -->> (" +
+                    _rangeToString(z.details.left) + "), (" + _rangeToString(z.details.right) + ")";
+            } else if (z.what == "multi-split") {
+                msg += _rangeToString(z.details.before) + "  -->> (" + z.details.number + "/" +
+                    z.details.of + " " + _rangeToString(z.details.chunk) + ")";
+            } else {
+                msg += tojsononeline(z.details);
+            }
+
+            print("ShardingTest " + msg);
+        });
+    };
+
+    this.getChunksString = function(ns) {
+        var q = {};
+        if (ns) {
+            q.ns = ns;
+        }
+
+        var s = "";
+        this.config.chunks.find(q)
+            .sort({ns: 1, min: 1})
+            .forEach(function(z) {
+                s += "  " + z._id + "\t" + z.lastmod.t + "|" + z.lastmod.i + "\t" + tojson(z.min) +
+                    " -> " + tojson(z.max) + " " + z.shard + "  " + z.ns + "\n";
+            });
+
+        return s;
+    };
+
+    this.printChunks = function(ns) {
+        print("ShardingTest " + this.getChunksString(ns));
+    };
+
+    this.printShardingStatus = function(verbose) {
+        printShardingStatus(this.config, verbose);
+    };
+
+    this.printCollectionInfo = function(ns, msg) {
+        var out = "";
+        if (msg) {
+            out += msg + "\n";
+        }
+        out += "sharding collection info: " + ns + "\n";
+
+        for (var i = 0; i < this._connections.length; i++) {
+            var c = this._connections[i];
+            out += "  mongod " + c + " " +
+                tojson(c.getCollection(ns).getShardVersion(), " ", true) + "\n";
+        }
+
+        for (var i = 0; i < this._mongos.length; i++) {
+            var c = this._mongos[i];
+            out += "  mongos " + c + " " +
+                tojson(c.getCollection(ns).getShardVersion(), " ", true) + "\n";
+        }
+
+        out += this.getChunksString(ns);
+
+        print("ShardingTest " + out);
+    };
+
+    this.sync = function() {
+        this.adminCommand("connpoolsync");
+    };
+
+    this.onNumShards = function(collName, dbName) {
+        dbName = dbName || "test";
+
+        // We should sync since we're going directly to mongod here
+        this.sync();
+
+        var num = 0;
+        for (var i = 0; i < this._connections.length; i++) {
+            if (this._connections[i].getDB(dbName).getCollection(collName).count() > 0) {
+                num++;
+            }
+        }
+
+        return num;
+    };
+
+    this.shardCounts = function(collName, dbName) {
+        dbName = dbName || "test";
+
+        // We should sync since we're going directly to mongod here
+        this.sync();
+
+        var counts = {};
+        for (var i = 0; i < this._connections.length; i++) {
+            counts[i] = this._connections[i].getDB(dbName).getCollection(collName).count();
+        }
+
+        return counts;
+    };
+
+    this.chunkCounts = function(collName, dbName) {
+        dbName = dbName || "test";
+
+        var x = {};
+        this.config.shards.find().forEach(function(z) {
+            x[z._id] = 0;
+        });
+
+        this.config.chunks.find({ns: dbName + "." + collName})
+            .forEach(function(z) {
+                if (x[z.shard])
+                    x[z.shard]++;
+                else
+                    x[z.shard] = 1;
+            });
+
+        return x;
+    };
+
+    this.chunkDiff = function(collName, dbName) {
+        var c = this.chunkCounts(collName, dbName);
+
+        var min = 100000000;
+        var max = 0;
+        for (var s in c) {
+            if (c[s] < min)
+                min = c[s];
+            if (c[s] > max)
+                max = c[s];
+        }
+
+        print("ShardingTest input: " + tojson(c) + " min: " + min + " max: " + max);
+        return max - min;
+    };
+
+    /**
+     * Waits up to one minute for the difference in chunks between the most loaded shard and least
+     * loaded shard to be 0 or 1, indicating that the collection is well balanced. This should only
+     * be called after creating a big enough chunk difference to trigger balancing.
+     */
+    this.awaitBalance = function(collName, dbName, timeToWait) {
+        timeToWait = timeToWait || 60000;
+
+        assert.soon(function() {
+            var x = self.chunkDiff(collName, dbName);
+            print("chunk diff: " + x);
+            return x < 2;
+        }, "no balance happened", timeToWait);
+    };
+
+    this.getShardNames = function() {
+        var shards = [];
+        this.s.getCollection("config.shards")
+            .find()
+            .forEach(function(shardDoc) {
+                shards.push(shardDoc._id);
+            });
+        return shards;
+    };
+
+    this.getShard = function(coll, query, includeEmpty) {
+        var shards = this.getShardsForQuery(coll, query, includeEmpty);
+        assert.eq(shards.length, 1);
+        return shards[0];
+    };
+
+    /**
+     * Returns the shards on which documents matching a particular query reside.
+     */
+    this.getShardsForQuery = function(coll, query, includeEmpty) {
+        if (!coll.getDB) {
+            coll = this.s.getCollection(coll);
+        }
+
+        var explain = coll.find(query).explain("executionStats");
+        var shards = [];
+
+        var execStages = explain.executionStats.executionStages;
+        var plannerShards = explain.queryPlanner.winningPlan.shards;
+
+        if (execStages.shards) {
+            for (var i = 0; i < execStages.shards.length; i++) {
+                var hasResults = execStages.shards[i].executionStages.nReturned &&
+                    execStages.shards[i].executionStages.nReturned > 0;
+                if (includeEmpty || hasResults) {
+                    shards.push(plannerShards[i].connectionString);
+                }
+            }
+        }
+
+        for (var i = 0; i < shards.length; i++) {
+            for (var j = 0; j < this._connections.length; j++) {
+                if (connectionURLTheSame(this._connections[j], shards[i])) {
+                    shards[i] = this._connections[j];
+                    break;
+                }
+            }
+        }
+
+        return shards;
+    };
+
+    this.shardColl = function(collName, key, split, move, dbName, waitForDelete) {
+        split = (split != false ? (split || key) : split);
+        move = (split != false && move != false ? (move || split) : false);
+
+        if (collName.getDB)
+            dbName = "" + collName.getDB();
+        else
+            dbName = dbName || "test";
+
+        var c = dbName + "." + collName;
+        if (collName.getDB) {
+            c = "" + collName;
+        }
+
+        var isEmpty = (this.s.getCollection(c).count() == 0);
+
+        if (!_isSharded(dbName)) {
+            this.s.adminCommand({enableSharding: dbName});
+        }
+
+        var result = this.s.adminCommand({shardcollection: c, key: key});
+        if (!result.ok) {
+            printjson(result);
+            assert(false);
+        }
+
+        if (split == false) {
+            return;
+        }
+
+        result = this.s.adminCommand({split: c, middle: split});
+        if (!result.ok) {
+            printjson(result);
+            assert(false);
+        }
+
+        if (move == false) {
+            return;
+        }
+
+        var result;
+        for (var i = 0; i < 5; i++) {
+            var otherShard = this.getOther(this.getPrimaryShard(dbName)).name;
+            result = this.s.adminCommand(
+                {movechunk: c, find: move, to: otherShard, _waitForDelete: waitForDelete});
+            if (result.ok)
+                break;
+
+            sleep(5 * 1000);
+        }
+
+        printjson(result);
+        assert(result.ok);
+    };
+
+    this.stopBalancer = function(timeout, interval) {
+        if (typeof db == "undefined") {
+            db = undefined;
+        }
+
+        var oldDB = db;
+        db = this.config;
+        timeout = timeout || 60000;
+
+        try {
+            assert.writeOK(sh.setBalancerState(false));
+            sh.waitForBalancer(false, timeout, interval);
+        } finally {
+            db = oldDB;
+        }
+    };
+
+    this.startBalancer = function(timeout, interval) {
+        if (typeof db == "undefined") {
+            db = undefined;
+        }
+
+        var oldDB = db;
+        db = this.config;
+        timeout = timeout || 60000;
+
+        try {
+            assert.writeOK(sh.setBalancerState(true));
+            sh.waitForBalancer(true, timeout, interval);
+        } finally {
+            db = oldDB;
+        }
+    };
+
+    /*
+     * Returns true after the balancer has completed a balancing round.
+     *
+     * Checks that three pings were sent to config.mongos. The balancer writes a ping
+     * at the start and end of a balancing round. If the balancer is in the middle of
+     * a round, there could be three pings before the first full balancing round
+     * completes: end ping of a round, and start and end pings of the following round.
+     */
+    this.waitForBalancerRound = function() {
+        if (typeof db == "undefined") {
+            db = undefined;
+        }
+        var oldDB = db;
+        db = this.config;
+
+        var getPings = function() {
+            return sh._getConfigDB().mongos.find().toArray();
+        };
+
+        try {
+            // If sh.waitForPingChange returns a non-empty array, config.mongos
+            // was not successfully updated and no balancer round was reported.
+            for (var i = 0; i < 3; ++i) {
+                if (sh.waitForPingChange(getPings()).length != 0) {
+                    return false;
+                }
+            }
+
+            db = oldDB;
+            return true;
+        } catch (e) {
+            print("Error running waitForPingChange: " + tojson(e));
+            db = oldDB;
+            return false;
+        }
+    };
+
+    this.isAnyBalanceInFlight = function() {
+        if (this.config.locks.find({_id: {$ne: "balancer"}, state: 2}).count() > 0)
+            return true;
+
+        var allCurrent = this.s.getDB("admin").currentOp().inprog;
+        for (var i = 0; i < allCurrent.length; i++) {
+            if (allCurrent[i].desc && allCurrent[i].desc.indexOf("cleanupOldData") == 0)
+                return true;
+        }
+        return false;
+    };
+
+    /**
+     * Kills the mongos with index n.
+     */
+    this.stopMongos = function(n, opts) {
+        if (otherParams.useBridge) {
+            MongoRunner.stopMongos(unbridgedMongos[n], undefined, opts);
+            this["s" + n].stop();
+        } else {
+            MongoRunner.stopMongos(this["s" + n], undefined, opts);
+        }
+    };
+
+    /**
+     * Kills the shard mongod with index n.
+     */
+    this.stopMongod = function(n, opts) {
+        if (otherParams.useBridge) {
+            MongoRunner.stopMongod(unbridgedConnections[n], undefined, opts);
+            this["d" + n].stop();
+        } else {
+            MongoRunner.stopMongod(this["d" + n], undefined, opts);
+        }
+    };
+
+    /**
+     * Kills the config server mongod with index n.
+     */
+    this.stopConfigServer = function(n, opts) {
+        if (otherParams.useBridge) {
+            MongoRunner.stopMongod(unbridgedConfigServers[n], undefined, opts);
+            this._configServers[n].stop();
+        } else {
+            MongoRunner.stopMongod(this._configServers[n], undefined, opts);
+        }
+    };
+
+    /**
+     * Stops and restarts a mongos process.
+     *
+     * If opts is specified, the new mongos is started using those options. Otherwise, it is started
+     * with its previous parameters.
+     *
+     * Warning: Overwrites the old s (if n = 0) admin, config, and sn member variables.
+     */
+    this.restartMongos = function(n, opts) {
+        var mongos;
+
+        if (otherParams.useBridge) {
+            mongos = unbridgedMongos[n];
+        } else {
+            mongos = this["s" + n];
+        }
+
+        opts = opts || mongos;
+        opts.port = opts.port || mongos.port;
+
+        this.stopMongos(n);
+
+        if (otherParams.useBridge) {
+            var bridgeOptions =
+                (opts !== mongos) ? opts.bridgeOptions : mongos.fullOptions.bridgeOptions;
+            bridgeOptions = Object.merge(otherParams.bridgeOptions, bridgeOptions || {});
+            bridgeOptions = Object.merge(
+                bridgeOptions,
+                {
+                  hostName: otherParams.useHostname ? hostName : "localhost",
+                  port: this._mongos[n].port,
+                  // The mongos processes identify themselves to mongobridge as host:port, where the
+                  // host is the actual hostname of the machine and not localhost.
+                  dest: hostName + ":" + opts.port,
+                });
+
+            this._mongos[n] = new MongoBridge(bridgeOptions);
+        }
+
+        var newConn = MongoRunner.runMongos(opts);
+        if (!newConn) {
+            throw new Error("Failed to restart mongos " + n);
+        }
+
+        if (otherParams.useBridge) {
+            this._mongos[n].connectToBridge();
+            unbridgedMongos[n] = newConn;
+        } else {
+            this._mongos[n] = newConn;
+        }
+
+        this['s' + n] = this._mongos[n];
+        if (n == 0) {
+            this.s = this._mongos[n];
+            this.admin = this._mongos[n].getDB('admin');
+            this.config = this._mongos[n].getDB('config');
+        }
+    };
+
+    /**
+     * Stops and restarts a shard mongod process.
+     *
+     * If opts is specified, the new mongod is started using those options. Otherwise, it is started
+     * with its previous parameters. The 'beforeRestartCallback' parameter is an optional function
+     * that will be run after the MongoD is stopped, but before it is restarted. The intended uses
+     * of the callback are modifications to the dbpath of the mongod that must be made while it is
+     * stopped.
+     *
+     * Warning: Overwrites the old dn/shardn member variables.
+     */
+    this.restartMongod = function(n, opts, beforeRestartCallback) {
+        var mongod;
+
+        if (otherParams.useBridge) {
+            mongod = unbridgedConnections[n];
+        } else {
+            mongod = this["d" + n];
+        }
+
+        opts = opts || mongod;
+        opts.port = opts.port || mongod.port;
+
+        this.stopMongod(n);
+
+        if (otherParams.useBridge) {
+            var bridgeOptions =
+                (opts !== mongod) ? opts.bridgeOptions : mongod.fullOptions.bridgeOptions;
+            bridgeOptions = Object.merge(otherParams.bridgeOptions, bridgeOptions || {});
+            bridgeOptions = Object.merge(
+                bridgeOptions,
+                {
+                  hostName: otherParams.useHostname ? hostName : "localhost",
+                  port: this._connections[n].port,
+                  // The mongod processes identify themselves to mongobridge as host:port, where the
+                  // host is the actual hostname of the machine and not localhost.
+                  dest: hostName + ":" + opts.port,
+                });
+
+            this._connections[n] = new MongoBridge(bridgeOptions);
+        }
+
+        if (arguments.length >= 3) {
+            if (typeof(beforeRestartCallback) !== "function") {
+                throw new Error("beforeRestartCallback must be a function but was of type " +
+                                typeof(beforeRestartCallback));
+            }
+            beforeRestartCallback();
+        }
+
+        opts.restart = true;
+
+        var newConn = MongoRunner.runMongod(opts);
+        if (!newConn) {
+            throw new Error("Failed to restart shard " + n);
+        }
+
+        if (otherParams.useBridge) {
+            this._connections[n].connectToBridge();
+            unbridgedConnections[n] = newConn;
+        } else {
+            this._connections[n] = newConn;
+        }
+
+        this["shard" + n] = this._connections[n];
+        this["d" + n] = this._connections[n];
+    };
+
+    /**
+     * Stops and restarts a config server mongod process.
+     *
+     * If opts is specified, the new mongod is started using those options. Otherwise, it is started
+     * with its previous parameters.
+     *
+     * Warning: Overwrites the old cn/confign member variables.
+     */
+    this.restartConfigServer = function(n) {
+        var mongod;
+
+        if (otherParams.useBridge) {
+            mongod = unbridgedConfigServers[n];
+        } else {
+            mongod = this["c" + n];
+        }
+
+        this.stopConfigServer(n);
+
+        if (otherParams.useBridge) {
+            var bridgeOptions =
+                Object.merge(otherParams.bridgeOptions, mongod.fullOptions.bridgeOptions || {});
+            bridgeOptions = Object.merge(
+                bridgeOptions,
+                {
+                  hostName: otherParams.useHostname ? hostName : "localhost",
+                  port: this._configServers[n].port,
+                  // The mongod processes identify themselves to mongobridge as host:port, where the
+                  // host is the actual hostname of the machine and not localhost.
+                  dest: hostName + ":" + mongod.port,
+                });
+
+            this._configServers[n] = new MongoBridge(bridgeOptions);
+        }
+
+        mongod.restart = true;
+        var newConn = MongoRunner.runMongod(mongod);
+        if (!newConn) {
+            throw new Error("Failed to restart config server " + n);
+        }
+
+        if (otherParams.useBridge) {
+            this._configServers[n].connectToBridge();
+            unbridgedConfigServers[n] = newConn;
+        } else {
+            this._configServers[n] = newConn;
+        }
+
+        this["config" + n] = this._configServers[n];
+        this["c" + n] = this._configServers[n];
+    };
+
+    /**
+     * Helper method for setting primary shard of a database and making sure that it was successful.
+     * Note: first mongos needs to be up.
+     */
+    this.ensurePrimaryShard = function(dbName, shardName) {
+        var db = this.s0.getDB('admin');
+        var res = db.adminCommand({movePrimary: dbName, to: shardName});
+        assert(res.ok || res.errmsg == "it is already the primary", tojson(res));
+    };
+
+    // ShardingTest initialization
+
+    assert(isObject(params), 'ShardingTest configuration must be a JSON object');
+
+    var testName = params.name || "test";
+    var otherParams = Object.merge(params, params.other || {});
+
+    var numShards = otherParams.hasOwnProperty('shards') ? otherParams.shards : 2;
+    var verboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
+    var numMongos = otherParams.hasOwnProperty('mongos') ? otherParams.mongos : 1;
+    var numConfigs = otherParams.hasOwnProperty('config') ? otherParams.config : 3;
+
+    // Allow specifying mixed-type options like this:
+    // { mongos : [ { noprealloc : "" } ],
+    //   config : [ { smallfiles : "" } ],
+    //   shards : { rs : true, d : true } }
+    if (Array.isArray(numShards)) {
+        for (var i = 0; i < numShards.length; i++) {
+            otherParams["d" + i] = numShards[i];
+        }
+
+        numShards = numShards.length;
+    } else if (isObject(numShards)) {
         var tempCount = 0;
-        
-        // Allow specifying options like :
-        // { mongos : [ { noprealloc : "" } ], config : [ { smallfiles : "" } ], shards : { rs : true, d : true } } 
-        if( Array.isArray( numShards ) ){
-            for( var i = 0; i < numShards.length; i++ ){
-                otherParams[ "d" + i ] = numShards[i];
-            }
+        for (var i in numShards) {
+            otherParams[i] = numShards[i];
+            tempCount++;
+        }
 
-            numShards = numShards.length;
-        }
-        else if( isObject( numShards ) ){
-            tempCount = 0;
-            for( var i in numShards ) {
-                otherParams[ i ] = numShards[i];
-                tempCount++;
-            }
-            
-            numShards = tempCount;
-        }
-        
-        if( Array.isArray( numMongos ) ){
-            for( var i = 0; i < numMongos.length; i++ ) {
-                otherParams[ "s" + i ] = numMongos[i];
-            }
-                
-            numMongos = numMongos.length;
-        }
-        else if( isObject( numMongos ) ){
-            tempCount = 0;
-            for( var i in numMongos ) {
-                otherParams[ i ] = numMongos[i];
-                tempCount++;
-            }
-            
-            numMongos = tempCount;
-        }
-        
-        if( Array.isArray( numConfigs ) ){
-            for( var i = 0; i < numConfigs.length; i++ ){
-                otherParams[ "c" + i ] = numConfigs[i];
-            }
+        numShards = tempCount;
+    }
 
-            numConfigs = numConfigs.length
+    if (Array.isArray(numMongos)) {
+        for (var i = 0; i < numMongos.length; i++) {
+            otherParams["s" + i] = numMongos[i];
         }
-        else if( isObject( numConfigs ) ){
-            tempCount = 0;
-            for( var i in numConfigs ) {
-                otherParams[ i ] = numConfigs[i];
-                tempCount++;
-            }
-            numConfigs = tempCount;
+
+        numMongos = numMongos.length;
+    } else if (isObject(numMongos)) {
+        var tempCount = 0;
+        for (var i in numMongos) {
+            otherParams[i] = numMongos[i];
+            tempCount++;
         }
+
+        numMongos = tempCount;
+    }
+
+    if (Array.isArray(numConfigs)) {
+        for (var i = 0; i < numConfigs.length; i++) {
+            otherParams["c" + i] = numConfigs[i];
+        }
+
+        numConfigs = numConfigs.length;
+    } else if (isObject(numConfigs)) {
+        var tempCount = 0;
+        for (var i in numConfigs) {
+            otherParams[i] = numConfigs[i];
+            tempCount++;
+        }
+
+        numConfigs = tempCount;
     }
 
     otherParams.extraOptions = otherParams.extraOptions || {};
-    otherParams.useHostname = otherParams.useHostname == undefined ?
-        true : otherParams.useHostname;
-    keyFile = otherParams.keyFile || otherParams.extraOptions.keyFile
+    otherParams.useHostname = otherParams.useHostname == undefined ? true : otherParams.useHostname;
+    otherParams.useBridge = otherParams.useBridge || false;
+    otherParams.bridgeOptions = otherParams.bridgeOptions || {};
 
+    var keyFile = otherParams.keyFile || otherParams.extraOptions.keyFile;
+    var hostName = getHostName();
 
-    this._testName = testName
-    this._otherParams = otherParams
-    
-    var pathOpts = this.pathOpts = { testName : testName }
+    this._testName = testName;
+    this._otherParams = otherParams;
 
-    var hasRS = false
-    for( var k in otherParams ){
-        if( k.startsWith( "rs" ) && otherParams[k] != undefined ){
-            hasRS = true
-            break
+    var pathOpts = {
+        testName: testName
+    };
+
+    for (var k in otherParams) {
+        if (k.startsWith("rs") && otherParams[k] != undefined) {
+            break;
         }
     }
 
-    this._alldbpaths = []
-    this._connections = []
-    this._shardServers = this._connections
-    this._rs = []
-    this._rsObjects = []
+    this._connections = [];
+    this._rs = [];
+    this._rsObjects = [];
 
-    for ( var i = 0; i < numShards; i++ ) {
-        if( otherParams.rs || otherParams["rs" + i] ){
+    if (otherParams.useBridge) {
+        var unbridgedConnections = [];
+        var unbridgedConfigServers = [];
+        var unbridgedMongos = [];
+    }
+
+    // Start the MongoD servers (shards)
+    for (var i = 0; i < numShards; i++) {
+        if (otherParams.rs || otherParams["rs" + i]) {
             var setName = testName + "-rs" + i;
 
-            rsDefaults = { useHostname : otherParams.useHostname,
-                           noJournalPrealloc : otherParams.nopreallocj, 
-                           oplogSize : 40,
-                           pathOpts : Object.merge( pathOpts, { shard : i } )}
-            
-            rsDefaults = Object.merge( rsDefaults, ShardingTest.rsOptions || {} )
-            rsDefaults = Object.merge( rsDefaults, otherParams.rs )
-            rsDefaults = Object.merge( rsDefaults, otherParams.rsOptions )
-            rsDefaults = Object.merge( rsDefaults, otherParams["rs" + i] )
-            rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas
-            
-            var numReplicas = rsDefaults.nodes || 3
-            delete rsDefaults.nodes
-            
-            print( "Replica set test!" )
-            
-            var rs = new ReplSetTest( { name : setName , nodes : numReplicas , startPort : 31100 + ( i * 100 ), useHostName : otherParams.useHostname, keyFile : keyFile, shardSvr : true } );
-            this._rs[i] = { setName : setName , test : rs , nodes : rs.startSet( rsDefaults ) , url : rs.getURL() };
-            rs.initiate();
-            this["rs" + i] = rs
-            
-            this._rsObjects[i] = rs
-            
-            this._alldbpaths.push( null )
-            this._connections.push( null )
-        }
-        else {
-            var options = { useHostname : otherParams.useHostname,
-                            noJournalPrealloc : otherParams.nopreallocj,
-                            port : 30000 + i,
-                            pathOpts : Object.merge( pathOpts, { shard : i } ),
-                            dbpath : "$testName$shard",
-                            keyFile : keyFile
-                          }
-            
-            options = Object.merge( options, ShardingTest.shardOptions || {} )
-            
-            if( otherParams.shardOptions && otherParams.shardOptions.binVersion ){
-                otherParams.shardOptions.binVersion = 
-                    MongoRunner.versionIterator( otherParams.shardOptions.binVersion )
+            var rsDefaults = {
+                useHostname: otherParams.useHostname,
+                noJournalPrealloc: otherParams.nopreallocj,
+                oplogSize: 16,
+                shardsvr: '',
+                pathOpts: Object.merge(pathOpts, {shard: i})
+            };
+
+            rsDefaults = Object.merge(rsDefaults, otherParams.rs);
+            rsDefaults = Object.merge(rsDefaults, otherParams.rsOptions);
+            rsDefaults = Object.merge(rsDefaults, otherParams["rs" + i]);
+            rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas;
+            var rsSettings = rsDefaults.settings;
+            delete rsDefaults.settings;
+
+            var numReplicas = rsDefaults.nodes || 3;
+            delete rsDefaults.nodes;
+
+            var protocolVersion = rsDefaults.protocolVersion;
+            delete rsDefaults.protocolVersion;
+            var initiateTimeout = rsDefaults.initiateTimeout;
+            delete rsDefaults.initiateTimeout;
+
+            var rs = new ReplSetTest({
+                name: setName,
+                nodes: numReplicas,
+                useHostName: otherParams.useHostname,
+                useBridge: otherParams.useBridge,
+                bridgeOptions: otherParams.bridgeOptions,
+                keyFile: keyFile,
+                protocolVersion: protocolVersion,
+                settings: rsSettings
+            });
+
+            this._rs[i] = {
+                setName: setName,
+                test: rs,
+                nodes: rs.startSet(rsDefaults),
+                url: rs.getURL()
+            };
+
+            rs.initiate(null, null, initiateTimeout);
+
+            this["rs" + i] = rs;
+            this._rsObjects[i] = rs;
+
+            _alldbpaths.push(null);
+            this._connections.push(null);
+
+            if (otherParams.useBridge) {
+                unbridgedConnections.push(null);
             }
-            
-            options = Object.merge( options, otherParams.shardOptions )
-            options = Object.merge( options, otherParams["d" + i] )
-            
-            var conn = MongoRunner.runMongod( options );
-            
-            this._alldbpaths.push( testName +i )
-            this._connections.push( conn );
-            this["shard" + i] = conn
-            this["d" + i] = conn
-            
-            this._rs[i] = null
-            this._rsObjects[i] = null
+        } else {
+            var options = {
+                useHostname: otherParams.useHostname,
+                noJournalPrealloc: otherParams.nopreallocj,
+                pathOpts: Object.merge(pathOpts, {shard: i}),
+                dbpath: "$testName$shard",
+                shardsvr: '',
+                keyFile: keyFile
+            };
+
+            if (otherParams.shardOptions && otherParams.shardOptions.binVersion) {
+                otherParams.shardOptions.binVersion =
+                    MongoRunner.versionIterator(otherParams.shardOptions.binVersion);
+            }
+
+            options = Object.merge(options, otherParams.shardOptions);
+            options = Object.merge(options, otherParams["d" + i]);
+
+            options.port = options.port || allocatePort();
+
+            if (otherParams.useBridge) {
+                var bridgeOptions =
+                    Object.merge(otherParams.bridgeOptions, options.bridgeOptions || {});
+                bridgeOptions = Object.merge(
+                    bridgeOptions,
+                    {
+                      hostName: otherParams.useHostname ? hostName : "localhost",
+                      // The mongod processes identify themselves to mongobridge as host:port, where
+                      // the host is the actual hostname of the machine and not localhost.
+                      dest: hostName + ":" + options.port,
+                    });
+
+                var bridge = new MongoBridge(bridgeOptions);
+            }
+
+            var conn = MongoRunner.runMongod(options);
+            if (!conn) {
+                throw new Error("Failed to start shard " + i);
+            }
+
+            if (otherParams.useBridge) {
+                bridge.connectToBridge();
+                this._connections.push(bridge);
+                unbridgedConnections.push(conn);
+            } else {
+                this._connections.push(conn);
+            }
+
+            _alldbpaths.push(testName + i);
+            this["shard" + i] = this._connections[i];
+            this["d" + i] = this._connections[i];
+
+            this._rs[i] = null;
+            this._rsObjects[i] = null;
         }
     }
-        
+
     // Do replication on replica sets if required
-    for ( var i = 0; i < numShards; i++ ){
-        if( ! otherParams.rs && ! otherParams["rs" + i] ) continue
-        
+    for (var i = 0; i < numShards; i++) {
+        if (!otherParams.rs && !otherParams["rs" + i]) {
+            continue;
+        }
+
         var rs = this._rs[i].test;
-        
-        rs.getMaster().getDB( "admin" ).foo.save( { x : 1 } )
+        rs.getPrimary().getDB("admin").foo.save({x: 1});
+
         if (keyFile) {
-            authutil.asCluster(rs.nodes, keyFile, function() { rs.awaitReplication(); });
+            authutil.asCluster(rs.nodes,
+                               keyFile,
+                               function() {
+                                   rs.awaitReplication();
+                               });
         }
+
         rs.awaitSecondaryNodes();
-        
-        var rsConn = new Mongo( rs.getURL() );
+
+        var rsConn = new Mongo(rs.getURL());
         rsConn.name = rs.getURL();
-        this._connections[i] = rsConn
-        this["shard" + i] = rsConn
-        rsConn.rs = rs
+
+        this._connections[i] = rsConn;
+        this["shard" + i] = rsConn;
+        rsConn.rs = rs;
     }
 
-    // Default to using 3-node legacy config servers if jsTestOptions().useLegacyOptions is true
-    // and the user didn't explicity specify a different config server configuration
-    if (jsTestOptions().useLegacyConfigServers &&
-            otherParams.sync !== false &&
-            (typeof otherParams.config === 'undefined' || numConfigs === 3)) {
-        otherParams.sync = true;
+    this._configServers = [];
+
+    // Using replica set for config servers
+    var rstOptions = {
+        useHostName: otherParams.useHostname,
+        useBridge: otherParams.useBridge,
+        bridgeOptions: otherParams.bridgeOptions,
+        keyFile: keyFile,
+        name: testName + "-configRS",
+    };
+
+    // when using CSRS, always use wiredTiger as the storage engine
+    var startOptions = {
+        pathOpts: pathOpts,
+        // Ensure that journaling is always enabled for config servers.
+        journal: "",
+        configsvr: "",
+        noJournalPrealloc: otherParams.nopreallocj,
+        storageEngine: "wiredTiger",
+    };
+
+    if (otherParams.configOptions && otherParams.configOptions.binVersion) {
+        otherParams.configOptions.binVersion =
+            MongoRunner.versionIterator(otherParams.configOptions.binVersion);
     }
 
-    this._configServers = []
-    this._configServersAreRS = !otherParams.sync;
+    startOptions = Object.merge(startOptions, otherParams.configOptions);
+    rstOptions = Object.merge(rstOptions, otherParams.configReplSetTestOptions);
 
-    if (otherParams.sync) {
-        var configNames = [];
-        for ( var i = 0; i < 3 ; i++ ) {
-
-            var options = { useHostname : otherParams.useHostname,
-                            noJournalPrealloc : otherParams.nopreallocj,
-                            port : 29000 + i,
-                            pathOpts : Object.merge( pathOpts, { config : i } ),
-                            dbpath : "$testName-config$config",
-                            keyFile : keyFile,
-                            configsvr : ""
-                          }
-
-            options = Object.merge( options, ShardingTest.configOptions || {} )
-
-            if( otherParams.configOptions && otherParams.configOptions.binVersion ){
-                otherParams.configOptions.binVersion =
-                    MongoRunner.versionIterator( otherParams.configOptions.binVersion )
-            }
-
-            options = Object.merge( options, otherParams.configOptions )
-            options = Object.merge( options, otherParams["c" + i] )
-
-            var conn = MongoRunner.runMongod( options )
-
-            this._alldbpaths.push( testName + "-config" + i )
-
-            this._configServers.push( conn );
-            configNames.push( conn.name )
-            this["config" + i] = conn
-            this["c" + i] = conn
-        }
-        this._configDB = configNames.join( "," );
+    var nodeOptions = [];
+    for (var i = 0; i < numConfigs; ++i) {
+        nodeOptions.push(otherParams["c" + i] || {});
     }
-    else {
-        // Using replica set for config servers
 
-        var rstOptions = { useHostName : otherParams.useHostname,
-                           startPort : 29000,
-                           keyFile : keyFile,
-                           name: testName + "-configRS"
-                      };
+    rstOptions.nodes = nodeOptions;
 
-        // when using CSRS, always use wiredTiger as the storage engine
-        var startOptions = { pathOpts: pathOpts,
-                             configsvr : "",
-                             noJournalPrealloc : otherParams.nopreallocj,
-                             storageEngine : "wiredTiger"
-                           };
+    this.configRS = new ReplSetTest(rstOptions);
+    this.configRS.startSet(startOptions);
 
-        startOptions = Object.merge( startOptions, ShardingTest.configOptions || {} )
+    var config = this.configRS.getReplSetConfig();
+    config.configsvr = true;
+    config.settings = config.settings || {};
+    var initiateTimeout = otherParams.rsOptions && otherParams.rsOptions.initiateTimeout;
+    this.configRS.initiate(config, null, initiateTimeout);
 
-        if( otherParams.configOptions && otherParams.configOptions.binVersion ){
-            otherParams.configOptions.binVersion =
-                MongoRunner.versionIterator( otherParams.configOptions.binVersion )
-        }
+    this.configRS.getPrimary();  // Wait for master to be elected before starting mongos
 
-        startOptions = Object.merge( startOptions, otherParams.configOptions )
-        var nodeOptions = [];
-        for (var i = 0; i < numConfigs; ++i) {
-            nodeOptions.push(otherParams["c" + i] || {});
-        }
-        rstOptions["nodes"] = nodeOptions;
-
-        this.configRS = new ReplSetTest(rstOptions);
-        this.configRS.startSet(startOptions);
-
-        var config = this.configRS.getReplSetConfig();
-        config.configsvr = true;
-        this.configRS.initiate(config);
-
-        this.configRS.getMaster(); // Wait for master to be elected before starting mongos
-
-        this._configDB = this.configRS.getURL();
-        this._configServers = this.configRS.nodes;
-        for (var i = 0; i < numConfigs; ++i) {
-            var conn = this._configServers[i];
-            this["config" + i] = conn;
-            this["c" + i] = conn;
-        }
+    this._configDB = this.configRS.getURL();
+    this._configServers = this.configRS.nodes;
+    for (var i = 0; i < numConfigs; ++i) {
+        var conn = this._configServers[i];
+        this["config" + i] = conn;
+        this["c" + i] = conn;
     }
 
     printjson("config servers: " + this._configDB);
-    var connectWithRetry = function(url) {
-        var conn = null;
-        assert.soon( function() {
-                         try {
-                             conn = new Mongo(url);
-                             return true;
-                         } catch (e) {
-                             print("Error connecting to " + url + ": " + e);
-                             return false;
-                         }
-                     });
-        return conn;
-    }
-    this._configConnection = connectWithRetry(this._configDB);
 
-    print( "ShardingTest " + this._testName + " :\n" + tojson( { config : this._configDB, shards : this._connections } ) );
+    var configConnection = _connectWithRetry(this._configDB);
 
-    if ( numMongos == 0 && !otherParams.noChunkSize ) {
-        if ( keyFile ) {
+    print("ShardingTest " + this._testName + " :\n" +
+          tojson({config: this._configDB, shards: this._connections}));
+
+    if (numMongos == 0 && !otherParams.noChunkSize) {
+        if (keyFile) {
             throw Error("Cannot set chunk size without any mongos when using auth");
         } else {
-            this._configConnection.getDB( "config" ).settings.insert(
-                { _id : "chunksize" , value : otherParams.chunksize || otherParams.chunkSize || 50 } );
+            configConnection.getDB("config").settings.insert(
+                {_id: "chunksize", value: otherParams.chunksize || otherParams.chunkSize || 50});
         }
     }
 
-    this._mongos = []
-    this._mongoses = this._mongos
-    for ( var i = 0; i < ( ( numMongos == 0 ? -1 : numMongos ) || 1 ); i++ ){
-        
-        var options = { useHostname : otherParams.useHostname, 
-                        port : 31000 - i - 1,
-                        pathOpts : Object.merge( pathOpts, { mongos : i } ),
-                        configdb : this._configDB,
-                        verbose : verboseLevel || 0,
-                        keyFile : keyFile
-                      }
-        if ( ! otherParams.noChunkSize ) {
+    this._mongos = [];
+
+    // Start the MongoS servers
+    for (var i = 0; i < ((numMongos == 0 ? -1 : numMongos) || 1); i++) {
+        options = {
+            useHostname: otherParams.useHostname,
+            pathOpts: Object.merge(pathOpts, {mongos: i}),
+            configdb: this._configDB,
+            verbose: verboseLevel || 0,
+            keyFile: keyFile,
+        };
+
+        if (!otherParams.noChunkSize) {
             options.chunkSize = otherParams.chunksize || otherParams.chunkSize || 50;
         }
 
-        options = Object.merge( options, ShardingTest.mongosOptions || {} )
-        
-        if( otherParams.mongosOptions && otherParams.mongosOptions.binVersion ){
-            otherParams.mongosOptions.binVersion = 
-                MongoRunner.versionIterator( otherParams.mongosOptions.binVersion )
+        if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion) {
+            otherParams.mongosOptions.binVersion =
+                MongoRunner.versionIterator(otherParams.mongosOptions.binVersion);
         }
-        
-        options = Object.merge( options, otherParams.mongosOptions )
-        options = Object.merge( options, otherParams.extraOptions )
-        options = Object.merge( options, otherParams["s" + i] )
-        
-        var conn = MongoRunner.runMongos( options )
 
-        this._mongos.push( conn );
-        if ( i == 0 ) this.s = conn
-        this["s" + i] = conn
+        options = Object.merge(options, otherParams.mongosOptions);
+        options = Object.merge(options, otherParams.extraOptions);
+        options = Object.merge(options, otherParams["s" + i]);
+
+        options.port = options.port || allocatePort();
+
+        if (otherParams.useBridge) {
+            var bridgeOptions =
+                Object.merge(otherParams.bridgeOptions, options.bridgeOptions || {});
+            bridgeOptions = Object.merge(
+                bridgeOptions,
+                {
+                  hostName: otherParams.useHostname ? hostName : "localhost",
+                  // The mongos processes identify themselves to mongobridge as host:port, where the
+                  // host is the actual hostname of the machine and not localhost.
+                  dest: hostName + ":" + options.port,
+                });
+
+            var bridge = new MongoBridge(bridgeOptions);
+        }
+
+        var conn = MongoRunner.runMongos(options);
+        if (!conn) {
+            throw new Error("Failed to start mongos " + i);
+        }
+
+        if (otherParams.useBridge) {
+            bridge.connectToBridge();
+            this._mongos.push(bridge);
+            unbridgedMongos.push(conn);
+        } else {
+            this._mongos.push(conn);
+        }
+
+        if (i === 0) {
+            this.s = this._mongos[i];
+            this.admin = this._mongos[i].getDB('admin');
+            this.config = this._mongos[i].getDB('config');
+        }
+
+        this["s" + i] = this._mongos[i];
     }
 
-    var admin = this.admin = this.s.getDB( "admin" );
-    this.config = this.s.getDB( "config" );
+    // If auth is enabled for the test, login the mongos connections as system in order to
+    // configure the instances and then log them out again.
+    if (keyFile) {
+        authutil.assertAuthenticate(this._mongos,
+                                    'admin',
+                                    {
+                                      user: '__system',
+                                      mechanism: 'MONGODB-CR',
+                                      pwd: cat(keyFile).replace(/[\011-\015\040]/g, '')
+                                    });
+    }
 
-    // Disable the balancer unless it is explicitly turned on
-    if ( !otherParams.enableBalancer ) {
-        if (keyFile) {
-            authutil.assertAuthenticate(this._mongos, 'admin', {
-                user: '__system',
-                mechanism: 'MONGODB-CR',
-                pwd: cat(keyFile).replace(/[\011-\015\040]/g, '')
-            });
-
-            try {
-                this.stopBalancer();
-            }
-            finally {
-                authutil.logout(this._mongos, 'admin');
-            }
-        }
-        else {
+    try {
+        // Disable the balancer unless it is explicitly turned on
+        if (!otherParams.enableBalancer) {
             this.stopBalancer();
         }
+
+        // Lower the mongos replica set monitor's threshold for deeming RS shard hosts as
+        // inaccessible in order to speed up tests, which shutdown entire shards and check for
+        // errors. This attempt is best-effort and failure should not have effect on the actual
+        // test execution, just the execution time.
+        this._mongos.forEach(function(mongos) {
+            var res = mongos.adminCommand({setParameter: 1, replMonitorMaxFailedChecks: 2});
+
+            // For tests, which use x509 certificate for authentication, the command above will not
+            // work due to authorization error.
+            if (res.code != ErrorCodes.Unauthorized) {
+                assert.commandWorked(res);
+            }
+        });
+    } finally {
+        if (keyFile) {
+            authutil.logout(this._mongos, 'admin');
+        }
     }
 
-    if ( ! otherParams.manualAddShard ){
-        this._shardNames = []
-        var shardNames = this._shardNames
-        this._connections.forEach(
-            function(z){
-                var n = z.name;
-                if ( ! n ){
-                    n = z.host;
-                    if ( ! n )
-                        n = z;
-                }
-                print( "ShardingTest " + this._testName + " going to add shard : " + n )
-                x = admin.runCommand( { addshard : n } );
-                printjson( x )
-                assert( x.ok );
-                shardNames.push( x.shardAdded )
-                z.shardName = x.shardAdded
-            }
-        );
+    try {
+        if (!otherParams.manualAddShard) {
+            this._shardNames = [];
+
+            var testName = this._testName;
+            var admin = this.admin;
+            var shardNames = this._shardNames;
+
+            this._connections.forEach(function(z) {
+                var n = z.name || z.host || z;
+
+                print("ShardingTest " + testName + " going to add shard : " + n);
+
+                var result = admin.runCommand({addshard: n});
+                assert.commandWorked(result, "Failed to add shard " + n);
+
+                shardNames.push(result.shardAdded);
+                z.shardName = result.shardAdded;
+            });
+        }
+    } catch (e) {
+        // Clean up the running procceses on failure
+        print("Failed to add shards, stopping cluster.");
+        this.stop();
+        throw e;
     }
 
     if (jsTestOptions().keyFile) {
-        jsTest.authenticate( this._configConnection );
-        jsTest.authenticateNodes( this._configServers );
-        jsTest.authenticateNodes( this._mongos );
+        jsTest.authenticate(configConnection);
+        jsTest.authenticateNodes(this._configServers);
+        jsTest.authenticateNodes(this._mongos);
     }
-}
-
-ShardingTest.prototype.getRSEntry = function( setName ){
-    for ( var i=0; i<this._rs.length; i++ )
-        if ( this._rs[i].setName == setName )
-            return this._rs[i];
-    throw Error( "can't find rs: " + setName );
-}
-
-ShardingTest.prototype.getConfigIndex = function( config ){
-    
-    // Assume config is a # if not a conn object
-    if( ! isObject( config ) ) config = getHostName() + ":" + config
-    
-    for( var i = 0; i < this._configServers.length; i++ ){
-        if( connectionURLTheSame( this._configServers[i], config ) ) return i
-    }
-    
-    return -1
-}
-
-ShardingTest.prototype.getDB = function( name ){
-    return this.s.getDB( name );
-}
-
-ShardingTest.prototype.getServerName = function( dbname ){
-    var x = this.config.databases.findOne( { _id : "" + dbname } );
-    if ( x )
-        return x.primary;
-    this.config.databases.find().forEach( printjson );
-    throw Error( "couldn't find dbname: " + dbname + " total: " + this.config.databases.count() );
-}
-
-
-ShardingTest.prototype.getNonPrimaries = function( dbname ){
-    var x = this.config.databases.findOne( { _id : dbname } );
-    if ( ! x ){
-        this.config.databases.find().forEach( printjson );
-        throw Error( "couldn't find dbname: " + dbname + " total: " + this.config.databases.count() );
-    }
-    
-    return this.config.shards.find( { _id : { $ne : x.primary } } ).map( function(z){ return z._id; } )
-}
-
-
-ShardingTest.prototype.getConnNames = function(){
-    var names = [];
-    for ( var i=0; i<this._connections.length; i++ ){
-        names.push( this._connections[i].name );
-    }
-    return names; 
-}
-
-ShardingTest.prototype.getServer = function( dbname ){
-    var name = this.getServerName( dbname );
-
-    var x = this.config.shards.findOne( { _id : name } );
-    if ( x )
-        name = x.host;
-
-    var rsName = null;
-    if ( name.indexOf( "/" ) > 0 )
-	rsName = name.substring( 0 , name.indexOf( "/" ) );
-    
-    for ( var i=0; i<this._connections.length; i++ ){
-        var c = this._connections[i];
-        if ( connectionURLTheSame( name , c.name ) || 
-             connectionURLTheSame( rsName , c.name ) )
-            return c;
-    }
-    
-    throw Error( "can't find server for: " + dbname + " name:" + name );
-
-}
-
-ShardingTest.prototype.normalize = function( x ){
-    var z = this.config.shards.findOne( { host : x } );
-    if ( z )
-        return z._id;
-    return x;
-}
-
-ShardingTest.prototype.getOther = function( one ){
-    if ( this._connections.length < 2 )
-        throw Error("getOther only works with 2 servers");
-
-    if ( one._mongo )
-        one = one._mongo
-    
-    for( var i = 0; i < this._connections.length; i++ ){
-        if( this._connections[i] != one ) return this._connections[i]
-    }
-    
-    return null
-}
-
-ShardingTest.prototype.getAnother = function( one ){
-    if(this._connections.length < 2)
-        throw Error("getAnother() only works with multiple servers");
-	
-	if ( one._mongo )
-        one = one._mongo
-    
-    for(var i = 0; i < this._connections.length; i++){
-    	if(this._connections[i] == one)
-    		return this._connections[(i + 1) % this._connections.length];
-    }
-}
-
-ShardingTest.prototype.getFirstOther = function( one ){
-    for ( var i=0; i<this._connections.length; i++ ){
-        if ( this._connections[i] != one )
-        return this._connections[i];
-    }
-    throw Error("impossible");
-}
-
-ShardingTest.prototype.stop = function(){
-    for ( var i=0; i<this._mongos.length; i++ ){
-        _stopMongoProgram( 31000 - i - 1 );
-    }
-    for ( var i=0; i<this._connections.length; i++){
-        _stopMongoProgram( 30000 + i );
-    }
-    if ( this._rs ){
-        for ( var i=0; i<this._rs.length; i++ ){
-            if( this._rs[i] ) this._rs[i].test.stopSet( 15 );
-        }
-    }
-    if (this._configServersAreRS) {
-        this.configRS.stopSet();
-    }
-    else {
-        // Old style config triplet
-        for ( var i=0; i<this._configServers.length; i++ ){
-            MongoRunner.stopMongod( this._configServers[i] )
-        }
-    }
-    if ( this._alldbpaths ){
-        for( i=0; i<this._alldbpaths.length; i++ ){
-            resetDbpath( MongoRunner.dataPath + this._alldbpaths[i] );
-        }
-    }
-
-    var timeMillis = new Date().getTime() - this._startTime.getTime();
-
-    print('*** ShardingTest ' + this._testName + " completed successfully in " + ( timeMillis / 1000 ) + " seconds ***");
-}
-
-ShardingTest.prototype.adminCommand = function(cmd){
-    var res = this.admin.runCommand( cmd );
-    if ( res && res.ok == 1 )
-        return true;
-
-    throw _getErrorWithCode(res, "command " + tojson(cmd) + " failed: " + tojson(res));
-}
-
-ShardingTest.prototype._rangeToString = function(r){
-    return tojsononeline( r.min ) + " -> " + tojsononeline( r.max );
-}
-
-ShardingTest.prototype.printChangeLog = function(){
-    var s = this;
-    this.config.changelog.find().forEach( 
-        function(z){
-            var msg = z.server + "\t" + z.time + "\t" + z.what;
-            for ( i=z.what.length; i<15; i++ )
-                msg += " ";
-            msg += " " + z.ns + "\t";
-            if ( z.what == "split" ){
-                msg += s._rangeToString( z.details.before ) + " -->> (" + s._rangeToString( z.details.left ) + "),(" + s._rangeToString( z.details.right ) + ")";
-            }
-            else if (z.what == "multi-split" ){
-                msg += s._rangeToString( z.details.before ) + "  -->> (" + z.details.number + "/" + z.details.of + " " + s._rangeToString( z.details.chunk ) + ")"; 
-            }
-            else {
-                msg += tojsononeline( z.details );
-            }
-
-            print( "ShardingTest " + msg )
-        }
-    );
-
-}
-
-ShardingTest.prototype.getChunksString = function( ns ){
-    var q = {}
-    if ( ns )
-        q.ns = ns;
-
-    var s = "";
-    this.config.chunks.find( q ).sort( { ns : 1 , min : 1 } ).forEach( 
-        function(z){
-            s +=  "  " + z._id + "\t" + z.lastmod.t + "|" + z.lastmod.i + "\t" + tojson(z.min) + " -> " + tojson(z.max) + " " + z.shard + "  " + z.ns + "\n";
-        }
-    );
-    
-    return s;
-}
-
-ShardingTest.prototype.printChunks = function( ns ){
-    print( "ShardingTest " + this.getChunksString( ns ) );
-}
-
-ShardingTest.prototype.printShardingStatus = function(){
-    printShardingStatus( this.config );
-}
-
-ShardingTest.prototype.printCollectionInfo = function( ns , msg ){
-    var out = "";
-    if ( msg )
-        out += msg + "\n";
-    out += "sharding collection info: " + ns + "\n";
-    for ( var i=0; i<this._connections.length; i++ ){
-        var c = this._connections[i];
-        out += "  mongod " + c + " " + tojson( c.getCollection( ns ).getShardVersion() , " " , true ) + "\n";
-    }
-    for ( var i=0; i<this._mongos.length; i++ ){
-        var c = this._mongos[i];
-        out += "  mongos " + c + " " + tojson( c.getCollection( ns ).getShardVersion() , " " , true ) + "\n";
-    }
-    
-    out += this.getChunksString( ns );
-
-    print( "ShardingTest " + out );
-}
-
-printShardingStatus = function( configDB , verbose ){
-    // configDB is a DB object that contains the sharding metadata of interest.
-    // Defaults to the db named "config" on the current connection.
-    if (configDB === undefined)
-        configDB = db.getSisterDB('config')
-    
-    var version = configDB.getCollection( "version" ).findOne();
-    if ( version == null ){
-        print( "printShardingStatus: this db does not have sharding enabled. be sure you are connecting to a mongos from the shell and not to a mongod." );
-        return;
-    }
-    
-    var raw = "";
-    var output = function(s){
-        raw += s + "\n";
-    }
-    output( "--- Sharding Status --- " );
-    output( "  sharding version: " + tojson( configDB.getCollection( "version" ).findOne() ) );
-    
-    output( "  shards:" );
-    configDB.shards.find().sort( { _id : 1 } ).forEach( 
-        function(z){
-            output( "\t" + tojsononeline( z ) );
-        }
-    );
-
-    output( "  balancer:" );
-
-    //Is the balancer currently enabled
-    output( "\tCurrently enabled:  " + ( sh.getBalancerState(configDB) ? "yes" : "no" ) );
-
-    //Is the balancer currently active
-    output( "\tCurrently running:  " + ( sh.isBalancerRunning(configDB) ? "yes" : "no" ) );
-
-    //Output details of the current balancer round
-    var balLock = sh.getBalancerLockDetails(configDB)
-    if ( balLock ) {
-        output( "\t\tBalancer lock taken at " + balLock.when + " by " + balLock.who );
-    }
-
-    //Output the balancer window
-    var balSettings = sh.getBalancerWindow(configDB)
-    if ( balSettings ) {
-        output( "\t\tBalancer active window is set between " +
-            balSettings.start + " and " + balSettings.stop + " server local time");
-    }
-
-    //Output the list of active migrations
-    var activeMigrations = sh.getActiveMigrations(configDB)
-    if (activeMigrations.length > 0 ){
-        output("\tCollections with active migrations: ");
-        activeMigrations.forEach( function(migration){
-            output("\t\t"+migration._id+ " started at " + migration.when );
-        });
-    }
-
-    // Actionlog and version checking only works on 2.7 and greater
-    var versionHasActionlog = false;
-    var metaDataVersion = configDB.getCollection("version").findOne().currentVersion
-    if ( metaDataVersion > 5 ) {
-        versionHasActionlog = true;
-    }
-    if ( metaDataVersion == 5 ) {
-        var verArray = db.serverBuildInfo().versionArray
-        if (verArray[0] == 2 && verArray[1] > 6){
-            versionHasActionlog = true;
-        }
-    }
-
-    if ( versionHasActionlog ) {
-        //Review config.actionlog for errors
-        var actionReport = sh.getRecentFailedRounds(configDB);
-        //Always print the number of failed rounds
-        output( "\tFailed balancer rounds in last 5 attempts:  " + actionReport.count )
-
-        //Only print the errors if there are any
-        if ( actionReport.count > 0 ){
-            output( "\tLast reported error:  " + actionReport.lastErr )
-            output( "\tTime of Reported error:  " + actionReport.lastTime )
-        }
-
-        output("\tMigration Results for the last 24 hours: ");
-        var migrations = sh.getRecentMigrations(configDB)
-        if(migrations.length > 0) {
-            migrations.forEach( function(x) {
-                if (x._id === "Success"){
-                    output( "\t\t" + x.count + " : " + x._id)
-                } else {
-                    output( "\t\t" + x.count + " : Failed with error '" +  x._id
-                    + "', from " + x.from + " to " + x.to )
-                }
-            });
-        } else {
-                output( "\t\tNo recent migrations");
-        }
-    }
-
-    output( "  databases:" );
-    configDB.databases.find().sort( { name : 1 } ).forEach( 
-        function(db){
-            output( "\t" + tojsononeline(db,"",true) );
-        
-            if (db.partitioned){
-                configDB.collections.find( { _id : new RegExp( "^" +
-                    RegExp.escape(db._id) + "\\." ) } ).
-                    sort( { _id : 1 } ).forEach( function( coll ){
-                        if ( ! coll.dropped ){
-                            output( "\t\t" + coll._id );
-                            output( "\t\t\tshard key: " + tojson(coll.key) );
-                            output( "\t\t\tchunks:" );
-
-                            res = configDB.chunks.aggregate( { $match : { ns : coll._id } } ,
-                                                             { $group : { _id : "$shard" ,
-                                                                          cnt : { $sum : 1 } } } ,
-                                                             { $project : { _id : 0 ,
-                                                                            shard : "$_id" ,
-                                                                            nChunks : "$cnt" } } ,
-                                                             { $sort : { shard : 1 } } ).toArray();
-                            var totalChunks = 0;
-                            res.forEach( function(z){
-                                totalChunks += z.nChunks;
-                                output( "\t\t\t\t" + z.shard + "\t" + z.nChunks );
-                            } )
-                            
-                            if ( totalChunks < 20 || verbose ){
-                                configDB.chunks.find( { "ns" : coll._id } ).sort( { min : 1 } ).forEach( 
-                                    function(chunk){
-                                        output( "\t\t\t" + tojson( chunk.min ) + " -->> " + tojson( chunk.max ) + 
-                                                " on : " + chunk.shard + " " + tojson( chunk.lastmod ) + " " +
-                                                ( chunk.jumbo ? "jumbo " : "" ) );
-                                    }
-                                );
-                            }
-                            else {
-                                output( "\t\t\ttoo many chunks to print, use verbose if you want to force print" );
-                            }
-
-                            configDB.tags.find( { ns : coll._id } ).sort( { min : 1 } ).forEach( 
-                                function( tag ) {
-                                    output( "\t\t\t tag: " + tag.tag + "  " + tojson( tag.min ) + " -->> " + tojson( tag.max ) );
-                                }
-                            )
-                        }
-                    }
-                )
-            }
-        }
-    );
-    
-    print( raw );
-}
-
-printShardingSizes = function(){
-    configDB = db.getSisterDB('config')
-    
-    var version = configDB.getCollection( "version" ).findOne();
-    if ( version == null ){
-        print( "printShardingSizes : not a shard db!" );
-        return;
-    }
-    
-    var raw = "";
-    var output = function(s){
-        raw += s + "\n";
-    }
-    output( "--- Sharding Status --- " );
-    output( "  sharding version: " + tojson( configDB.getCollection( "version" ).findOne() ) );
-    
-    output( "  shards:" );
-    var shards = {};
-    configDB.shards.find().forEach( 
-        function(z){
-            shards[z._id] = new Mongo(z.host);
-            output( "      " + tojson(z) );
-        }
-    );
-
-    var saveDB = db;
-    output( "  databases:" );
-    configDB.databases.find().sort( { name : 1 } ).forEach( 
-        function(db){
-            output( "\t" + tojson(db,"",true) );
-        
-            if (db.partitioned){
-                configDB.collections.find( { _id : new RegExp( "^" +
-                    RegExp.escape(db._id) + "\." ) } ).
-                    sort( { _id : 1 } ).forEach( function( coll ){
-                        output("\t\t" + coll._id + " chunks:");
-                        configDB.chunks.find( { "ns" : coll._id } ).sort( { min : 1 } ).forEach( 
-                            function(chunk){
-                                var mydb = shards[chunk.shard].getDB(db._id)
-                                var out = mydb.runCommand({dataSize: coll._id,
-                                                           keyPattern: coll.key, 
-                                                           min: chunk.min,
-                                                           max: chunk.max });
-                                delete out.millis;
-                                delete out.ok;
-
-                                output( "\t\t\t" + tojson( chunk.min ) + " -->> " + tojson( chunk.max ) + 
-                                        " on : " + chunk.shard + " " + tojson( out ) );
-
-                            }
-                        );
-                    }
-                )
-            }
-        }
-    );
-    
-    print( raw );
-}
-
-ShardingTest.prototype.sync = function(){
-    this.adminCommand( "connpoolsync" );
-}
-
-ShardingTest.prototype.onNumShards = function( collName , dbName ){
-    this.sync(); // we should sync since we're going directly to mongod here
-    dbName = dbName || "test";
-    var num=0;
-    for ( var i=0; i<this._connections.length; i++ )
-        if ( this._connections[i].getDB( dbName ).getCollection( collName ).count() > 0 )
-            num++;
-    return num;
-}
-
-
-ShardingTest.prototype.shardCounts = function( collName , dbName ){
-    this.sync(); // we should sync since we're going directly to mongod here
-    dbName = dbName || "test";
-    var counts = {}
-    for ( var i=0; i<this._connections.length; i++ )
-        counts[i] = this._connections[i].getDB( dbName ).getCollection( collName ).count();
-    return counts;
-}
-
-ShardingTest.prototype.chunkCounts = function( collName , dbName ){
-    dbName = dbName || "test";
-    var x = {}
-
-    this.config.shards.find().forEach(
-        function(z){
-            x[z._id] = 0;
-        }
-    );
-    
-    this.config.chunks.find( { ns : dbName + "." + collName } ).forEach(
-        function(z){
-            if ( x[z.shard] )
-                x[z.shard]++
-            else
-                x[z.shard] = 1;
-        }
-    );
-    return x;
-
-}
-
-ShardingTest.prototype.chunkDiff = function( collName , dbName ){
-    var c = this.chunkCounts( collName , dbName );
-    var min = 100000000;
-    var max = 0;
-    for ( var s in c ){
-        if ( c[s] < min )
-            min = c[s];
-        if ( c[s] > max )
-            max = c[s];
-    }
-    print( "ShardingTest input: " + tojson( c ) + " min: " + min + " max: " + max  );
-    return max - min;
-}
-
-// Waits up to one minute for the difference in chunks between the most loaded shard and least
-// loaded shard to be 0 or 1, indicating that the collection is well balanced.
-// This should only be called after creating a big enough chunk difference to trigger balancing.
-ShardingTest.prototype.awaitBalance = function( collName , dbName , timeToWait ) {
-    timeToWait = timeToWait || 60000;
-    var shardingTest = this;
-    assert.soon( function() {
-        var x = shardingTest.chunkDiff( collName , dbName );
-        print( "chunk diff: " + x );
-        return x < 2;
-    } , "no balance happened", 60000 );
-
-}
-
-ShardingTest.prototype.getShard = function( coll, query, includeEmpty ){
-    var shards = this.getShards( coll, query, includeEmpty )
-    assert.eq( shards.length, 1 )
-    return shards[0]
-}
-
-// Returns the shards on which documents matching a particular query reside
-ShardingTest.prototype.getShards = function( coll, query, includeEmpty ){
-    if( ! coll.getDB )
-        coll = this.s.getCollection( coll )
-
-    var explain = coll.find( query ).explain("executionStats")
-    var shards = []
-
-    var execStages = explain.executionStats.executionStages;
-    var plannerShards = explain.queryPlanner.winningPlan.shards;
-
-    if( execStages.shards ){
-        for( var i = 0; i < execStages.shards.length; i++ ){
-            var hasResults = execStages.shards[i].executionStages.nReturned &&
-                             execStages.shards[i].executionStages.nReturned > 0;
-            if( includeEmpty || hasResults ){
-                shards.push(plannerShards[i].connectionString);
-            }
-        }
-    }
-
-    for( var i = 0; i < shards.length; i++ ){
-        for( var j = 0; j < this._connections.length; j++ ){
-            if ( connectionURLTheSame(  this._connections[j] , shards[i] ) ){
-                shards[i] = this._connections[j]
-                break;
-            }
-        }
-    }
-
-    return shards
-}
-
-ShardingTest.prototype.isSharded = function( collName ){
-    
-    var collName = "" + collName
-    var dbName = undefined
-    
-    if( typeof collName.getCollectionNames == 'function' ){
-        dbName = "" + collName
-        collName = undefined
-    }
-    
-    if( dbName ){
-        var x = this.config.databases.findOne( { _id : dbname } )
-        if( x ) return x.partitioned
-        else return false
-    }
-    
-    if( collName ){
-        var x = this.config.collections.findOne( { _id : collName } )
-        if( x ) return true
-        else return false
-    }
-    
-}
-
-ShardingTest.prototype.shardGo = function( collName , key , split , move , dbName, waitForDelete ){
-
-    split = ( split != false ? ( split || key ) : split )
-    move = ( split != false && move != false ? ( move || split ) : false )
-    
-    if( collName.getDB )
-        dbName = "" + collName.getDB()
-    else dbName = dbName || "test";
-
-    var c = dbName + "." + collName;
-    if( collName.getDB )
-        c = "" + collName
-
-    var isEmpty = this.s.getCollection( c ).count() == 0
-        
-    if( ! this.isSharded( dbName ) )
-        this.s.adminCommand( { enableSharding : dbName } )
-    
-    var result = this.s.adminCommand( { shardcollection : c , key : key } )
-    if( ! result.ok ){
-        printjson( result )
-        assert( false )
-    }
-    
-    if( split == false ) return
-    
-    result = this.s.adminCommand( { split : c , middle : split } );
-    if( ! result.ok ){
-        printjson( result )
-        assert( false )
-    }
-        
-    if( move == false ) return
-    
-    var result = null
-    for( var i = 0; i < 5; i++ ){
-        result = this.s.adminCommand( { movechunk : c , find : move , to : this.getOther( this.getServer( dbName ) ).name, _waitForDelete: waitForDelete } );
-        if( result.ok ) break;
-        sleep( 5 * 1000 );
-    }
-    printjson( result )
-    assert( result.ok )
-    
-};
-
-ShardingTest.prototype.shardColl = ShardingTest.prototype.shardGo
-
-ShardingTest.prototype.setBalancer = function( balancer ){
-    if( balancer || balancer == undefined ){
-        this.config.settings.update( { _id: "balancer" }, { $set : { stopped: false } } , true )
-    }
-    else if( balancer == false ){
-        this.config.settings.update( { _id: "balancer" }, { $set : { stopped: true } } , true )
-    }
-}
-
-ShardingTest.prototype.stopBalancer = function( timeout, interval ) {
-    this.setBalancer( false )
-    
-    if( typeof db == "undefined" ) db = undefined
-    var oldDB = db
-    
-    db = this.config
-    sh.waitForBalancer( false, timeout, interval )
-    db = oldDB
-}
-
-ShardingTest.prototype.startBalancer = function( timeout, interval ) {
-    this.setBalancer( true )
-    
-    if( typeof db == "undefined" ) db = undefined
-    var oldDB = db
-    
-    db = this.config
-    sh.waitForBalancer( true, timeout, interval )
-    db = oldDB
-}
-
-ShardingTest.prototype.isAnyBalanceInFlight = function() {
-    if ( this.config.locks.find({ _id : { $ne : "balancer" }, state : 2 }).count() > 0 )
-        return true;
-
-    var allCurrent = this.s.getDB( "admin" ).currentOp().inprog;
-    for ( var i = 0; i < allCurrent.length; i++ ) {
-        if ( allCurrent[i].desc &&
-             allCurrent[i].desc.indexOf( "cleanupOldData" ) == 0 )
-            return true;
-    }
-    return false;
-}
-
-/**
- * Kills the mongos with index n.
- */
-ShardingTest.prototype.stopMongos = function(n) {
-    MongoRunner.stopMongos(this['s' + n].port);
-};
-
-/**
- * Kills the mongod with index n.
- */
-ShardingTest.prototype.stopMongod = function(n) {
-    MongoRunner.stopMongod(this['d' + n].port);
-};
-
-/**
- * Restarts a previously stopped mongos using the same parameters as before.
- *
- * Warning: Overwrites the old s (if n = 0) and sn member variables.
- */
-ShardingTest.prototype.restartMongos = function(n) {
-    var mongos = this['s' + n];
-    MongoRunner.stopMongos(mongos);
-    mongos.restart = true;
-
-    var newConn = MongoRunner.runMongos(mongos);
-
-    this['s' + n] = newConn;
-    if (n == 0) {
-        this.s = newConn;
-    }
-};
-
-/**
- * Restarts a previously stopped mongod using the same parameters as before.
- *
- * Warning: Overwrites the old dn member variables.
- */
-ShardingTest.prototype.restartMongod = function(n) {
-    var mongod = this['d' + n];
-    MongoRunner.stopMongod(mongod);
-    mongod.restart = true;
-
-    var newConn = MongoRunner.runMongod(mongod);
-
-    this['d' + n] = newConn;
-};
-
-/**
- * Helper method for setting primary shard of a database and making sure that it was successful.
- * Note: first mongos needs to be up.
- */
-ShardingTest.prototype.ensurePrimaryShard = function(dbName, shardName) {
-    var db = this.s0.getDB('admin');
-    var res = db.adminCommand({ movePrimary: dbName, to: shardName });
-    assert(res.ok || res.errmsg == "it is already the primary", tojson(res));
 };

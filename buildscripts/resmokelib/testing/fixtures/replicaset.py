@@ -29,6 +29,7 @@ class ReplicaSetFixture(interface.ReplFixture):
                  dbpath_prefix=None,
                  preserve_dbpath=False,
                  num_nodes=2,
+                 write_concern_majority_journal_default=None,
                  auth_options=None,
                  replset_config_options=None):
 
@@ -38,6 +39,7 @@ class ReplicaSetFixture(interface.ReplFixture):
         self.mongod_options = utils.default_if_none(mongod_options, {})
         self.preserve_dbpath = preserve_dbpath
         self.num_nodes = num_nodes
+        self.write_concern_majority_journal_default = write_concern_majority_journal_default
         self.auth_options = auth_options
         self.replset_config_options = utils.default_if_none(replset_config_options, {})
 
@@ -60,10 +62,13 @@ class ReplicaSetFixture(interface.ReplFixture):
     def setup(self):
         self.replset_name = self.mongod_options.get("replSet", "rs")
 
-        for i in xrange(self.num_nodes):
-            node = self._new_mongod(i, self.replset_name)
+        if not self.nodes:
+            for i in xrange(self.num_nodes):
+                node = self._new_mongod(i, self.replset_name)
+                self.nodes.append(node)
+
+        for node in self.nodes:
             node.setup()
-            self.nodes.append(node)
 
         self.port = self.get_primary().port
 
@@ -78,8 +83,14 @@ class ReplicaSetFixture(interface.ReplFixture):
             member_info = {"_id": i, "host": node.get_connection_string()}
             if i > 0:
                 member_info["priority"] = 0
+            if i >= 7:
+                # Only 7 nodes in a replica set can vote, so the other members must be non-voting.
+                member_info["votes"] = 0
             members.append(member_info)
         initiate_cmd_obj = {"replSetInitiate": {"_id": self.replset_name, "members": members}}
+
+        if self.write_concern_majority_journal_default is not None:
+            initiate_cmd_obj["replSetInitiate"]["writeConcernMajorityJournalDefault"] = self.write_concern_majority_journal_default
 
         client = utils.new_mongo_client(port=self.port)
         if self.auth_options is not None:
@@ -91,7 +102,7 @@ class ReplicaSetFixture(interface.ReplFixture):
         if self.replset_config_options.get("configsvr", False):
             initiate_cmd_obj["replSetInitiate"]["configsvr"] = True
 
-        self.logger.info("Issuing replSetInitiate command...")
+        self.logger.info("Issuing replSetInitiate command...%s", initiate_cmd_obj)
         client.admin.command(initiate_cmd_obj)
 
     def await_ready(self):
@@ -102,7 +113,7 @@ class ReplicaSetFixture(interface.ReplFixture):
             if is_master:
                 break
             self.logger.info("Waiting for primary on port %d to be elected.", self.port)
-            time.sleep(1)  # Wait a little bit before trying again.
+            time.sleep(0.1)  # Wait a little bit before trying again.
 
         # Wait for the secondaries to become available.
         for secondary in self.get_secondaries():
@@ -114,7 +125,7 @@ class ReplicaSetFixture(interface.ReplFixture):
                     break
                 self.logger.info("Waiting for secondary on port %d to become available.",
                                  secondary.port)
-                time.sleep(1)  # Wait a little bit before trying again.
+                time.sleep(0.1)  # Wait a little bit before trying again.
 
     def teardown(self):
         running_at_start = self.is_running()
@@ -146,6 +157,13 @@ class ReplicaSetFixture(interface.ReplFixture):
         return self.nodes[1:]
 
     def await_repl(self):
+        client = utils.new_mongo_client(port=self.port)
+
+        self.logger.info("Starting fsync on primary on port %d to flush all pending writes",
+                         self.port)
+        client.fsync()
+        self.logger.info("fsync on primary completed")
+
         self.logger.info("Awaiting replication of insert (w=%d, wtimeout=%d min) to primary on port"
                          " %d", self.num_nodes, interface.ReplFixture.AWAIT_REPL_TIMEOUT_MINS,
                          self.port)
@@ -153,10 +171,10 @@ class ReplicaSetFixture(interface.ReplFixture):
         # Keep retrying this until it times out waiting for replication.
         def insert_fn(remaining_secs):
             remaining_millis = int(round(remaining_secs * 1000))
-            client = utils.new_mongo_client(port=self.port)
-            client.resmoke.await_repl.insert({"awaiting": "repl"},
-                                             w=self.num_nodes,
-                                             wtimeout=remaining_millis)
+            write_concern = pymongo.WriteConcern(w=self.num_nodes, wtimeout=remaining_millis)
+            coll = client.resmoke.get_collection("await_repl", write_concern=write_concern)
+            coll.insert_one({"awaiting": "repl"})
+
         try:
             self.retry_until_wtimeout(insert_fn)
         except pymongo.errors.WTimeoutError:

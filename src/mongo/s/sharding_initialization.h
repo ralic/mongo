@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace mongo {
 
 class ConnectionString;
@@ -38,8 +40,15 @@ class Status;
  * Takes in the connection string for reaching the config servers and initializes the global
  * CatalogManager, ShardingRegistry, and grid objects.
  */
-Status initializeGlobalShardingState(OperationContext* txn,
-                                     const ConnectionString& configCS,
-                                     bool allowNetworking);
+Status initializeGlobalShardingStateForMongos(const ConnectionString& configCS,
+                                              uint64_t maxChunkSizeBytes);
+
+Status initializeGlobalShardingStateForMongod(const ConnectionString& configCS);
+
+/**
+ * Tries to contact the config server and reload the shard registry until it succeeds or
+ * is interrupted.
+ */
+Status reloadShardRegistryUntilSuccess(OperationContext* txn);
 
 }  // namespace mongo

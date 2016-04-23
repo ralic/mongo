@@ -32,8 +32,12 @@
 
 #include "mongo/db/query/query_planner_test_fixture.h"
 
+#include <algorithm>
+
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
@@ -101,6 +105,35 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, MatchExpression* filterExpr)
                                         BSONObj()));
 }
 
+void QueryPlannerTest::addIndex(BSONObj keyPattern, const MultikeyPaths& multikeyPaths) {
+    invariant(multikeyPaths.size() == static_cast<size_t>(keyPattern.nFields()));
+
+    const bool multikey =
+        std::any_of(multikeyPaths.cbegin(),
+                    multikeyPaths.cend(),
+                    [](const std::set<size_t>& components) { return !components.empty(); });
+    const bool sparse = false;
+    const bool unique = false;
+    const char name[] = "my_index_with_path_level_multikey_info";
+    const MatchExpression* filterExpr = nullptr;
+    const BSONObj infoObj;
+    IndexEntry entry(keyPattern, multikey, sparse, unique, name, filterExpr, infoObj);
+    entry.multikeyPaths = multikeyPaths;
+    params.indices.push_back(entry);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, CollatorInterface* collator) {
+    const bool sparse = false;
+    const bool unique = false;
+    const bool multikey = false;
+    const char name[] = "my_index_with_collator";
+    const MatchExpression* filterExpr = nullptr;
+    const BSONObj infoObj;
+    IndexEntry entry(keyPattern, multikey, sparse, unique, name, filterExpr, infoObj);
+    entry.collator = collator;
+    params.indices.push_back(entry);
+}
+
 void QueryPlannerTest::runQuery(BSONObj query) {
     runQuerySortProjSkipLimit(query, BSONObj(), BSONObj(), 0, 0);
 }
@@ -164,6 +197,7 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
                                     bool snapshot) {
     // Clean up any previous state from a call to runQueryFull
     solns.clear();
+    cq.reset();
 
     auto statusWithCQ = CanonicalQuery::canonicalize(nss,
                                                      query,
@@ -175,10 +209,12 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
                                                      minObj,
                                                      maxObj,
                                                      snapshot,
-                                                     false);  // explain
+                                                     false,  // explain
+                                                     ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
+    cq = std::move(statusWithCQ.getValue());
 
-    ASSERT_OK(QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns.mutableVector()));
+    ASSERT_OK(QueryPlanner::plan(*cq, params, &solns.mutableVector()));
 }
 
 void QueryPlannerTest::runInvalidQuery(const BSONObj& query) {
@@ -229,6 +265,7 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
                                            const BSONObj& maxObj,
                                            bool snapshot) {
     solns.clear();
+    cq.reset();
 
     auto statusWithCQ = CanonicalQuery::canonicalize(nss,
                                                      query,
@@ -240,15 +277,18 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
                                                      minObj,
                                                      maxObj,
                                                      snapshot,
-                                                     false);  // explain
+                                                     false,  // explain
+                                                     ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
+    cq = std::move(statusWithCQ.getValue());
 
-    Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns.mutableVector());
+    Status s = QueryPlanner::plan(*cq, params, &solns.mutableVector());
     ASSERT_NOT_OK(s);
 }
 
 void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
     solns.clear();
+    cq.reset();
 
     invariant(nss.isValid());
 
@@ -256,11 +296,11 @@ void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
     std::unique_ptr<LiteParsedQuery> lpq(
         assertGet(LiteParsedQuery::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    WhereCallbackNoop whereCallback;
-    auto statusWithCQ = CanonicalQuery::canonicalize(lpq.release(), whereCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(lpq.release(), ExtensionsCallbackNoop());
     ASSERT_OK(statusWithCQ.getStatus());
+    cq = std::move(statusWithCQ.getValue());
 
-    Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns.mutableVector());
+    Status s = QueryPlanner::plan(*cq, params, &solns.mutableVector());
     ASSERT_OK(s);
 }
 
@@ -334,7 +374,8 @@ void QueryPlannerTest::assertHasOneSolutionOf(const std::vector<std::string>& so
 }
 
 std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(const BSONObj& obj) {
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj);
+    StatusWithMatchExpression status =
+        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions());
     if (!status.isOK()) {
         FAIL(str::stream() << "failed to parse query: " << obj.toString()
                            << ". Reason: " << status.getStatus().toString());

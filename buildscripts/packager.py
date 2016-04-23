@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 # This program makes Debian and RPM repositories for MongoDB, by
 # downloading our tarballs of statically linked executables and
@@ -42,7 +42,7 @@ import time
 import urlparse
 
 # The MongoDB names for the architectures we support.
-DEFAULT_ARCHES=["x86_64"]
+ARCH_CHOICES=["x86_64"]
 
 # Made up names for the flavors of distribution we package for.
 DISTROS=["suse", "debian","redhat","ubuntu", "amazon"]
@@ -54,8 +54,10 @@ class Spec(object):
         self.gitspec = gitspec
         self.rel = rel
 
+    # Nightly version numbers can be in the form: 3.0.7-pre-, or 3.0.7-5-g3b67ac
+    #
     def is_nightly(self):
-        return bool(re.search("-$", self.version()))
+        return bool(re.search("-$", self.version())) or bool(re.search("\d-\d+-g[0-9a-f]+$", self.version()))
 
     def is_rc(self):
         return bool(re.search("-rc\d+$", self.version()))
@@ -93,10 +95,10 @@ class Spec(object):
       else:
         corenum = 1
       # RC's
-      if re.search("-rc\d+$", self.version()):
+      if self.is_rc():
         return "0.%s.%s" % (corenum, re.sub('.*-','',self.version()))
       # Nightlies
-      elif re.search("-$", self.version()):
+      elif self.is_nightly():
         return "0.%s.%s" % (corenum, time.strftime("%Y%m%d"))
       else:
         return str(corenum)
@@ -130,10 +132,28 @@ class Distro(object):
         return "mongodb"
 
     def archname(self, arch):
+        """Return the packaging system's architecture name.
+        Power and x86 have different names for apt/yum (ppc64le/ppc64el
+        and x86_64/amd64)
+        """
         if re.search("^(debian|ubuntu)", self.n):
-            return "i386" if arch.endswith("86") else "amd64"
+            if arch == "ppc64le":
+                return "ppc64el"
+            elif arch == "s390x":
+                return "s390x"
+            elif arch.endswith("86"):
+              return "i386"
+            else:
+              return "amd64"
         elif re.search("^(suse|centos|redhat|fedora|amazon)", self.n):
-            return "i686" if arch.endswith("86") else "x86_64"
+            if arch == "ppc64le":
+                return "ppc64le"
+            elif arch == "s390x":
+                return "s390x"
+            elif arch.endswith("86"):
+              return "i686"
+            else:
+              return "x86_64"
         else:
             raise Exception("BUG: unsupported platform?")
 
@@ -203,11 +223,15 @@ class Distro(object):
                 return "precise"
             elif build_os == 'ubuntu1404':
                 return "trusty"
+            elif build_os == 'ubuntu1504':
+                return "vivid"
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         elif self.n == 'debian':
             if build_os == 'debian71':
                 return 'wheezy'
+            elif build_os == 'debian81':
+                return 'jessie'
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         else:
@@ -221,21 +245,23 @@ class Distro(object):
         else:
             raise Exception("BUG: unsupported platform?")
 
-    def build_os(self):
-        """Return the build os label in the binary package to download ("rhel55", "rhel62" and "rhel70"
-        for redhat, "ubuntu1204" and "ubuntu1404" for Ubuntu, "debian71" for Debian), and "suse11"
-        for SUSE)"""
+    def build_os(self, arch):
+        """Return the build os label in the binary package to download (e.g. "rhel55" for redhat,
+        "ubuntu1204" for ubuntu, "debian71" for debian, "suse11" for suse, etc.)"""
+        # Community builds only support amd64
+        if arch not in ['x86_64', 'ppc64le', 's390x']:
+            raise Exception("BUG: unsupported architecture (%s)" % arch)
 
         if re.search("(suse)", self.n):
-            return [ "suse11" ]
+            return [ "suse11", "suse12" ]
         elif re.search("(redhat|fedora|centos)", self.n):
-            return [ "rhel70", "rhel62", "rhel55" ]
+            return [ "rhel70", "rhel71", "rhel72", "rhel62", "rhel55" ]
         elif self.n == 'amazon':
             return [ "amazon" ]
         elif self.n == 'ubuntu':
             return [ "ubuntu1204", "ubuntu1404" ]
         elif self.n == 'debian':
-            return [ "debian71" ]
+            return [ "debian71", "debian81" ]
         else:
             raise Exception("BUG: unsupported platform?")
 
@@ -248,19 +274,20 @@ class Distro(object):
         else:
           return re.sub(r'^rh(el\d).*$', r'\1', build_os)
 
-def get_args(distros):
+def get_args(distros, arch_choices):
 
-    DISTRO_CHOICES=[]
+    distro_choices=[]
     for distro in distros:
-      DISTRO_CHOICES.extend(distro.build_os())
+        for arch in arch_choices:
+          distro_choices.extend(distro.build_os(arch))
 
     parser = argparse.ArgumentParser(description='Build MongoDB Packages')
     parser.add_argument("-s", "--server-version", help="Server version to build (e.g. 2.7.8-rc0)", required=True)
     parser.add_argument("-m", "--metadata-gitspec", help="Gitspec to use for package metadata files", required=False)
     parser.add_argument("-r", "--release-number", help="RPM release number base", type=int, required=False)
-    parser.add_argument("-d", "--distros", help="Distros to build for", choices=DISTRO_CHOICES, required=False, default=[], action='append')
+    parser.add_argument("-d", "--distros", help="Distros to build for", choices=distro_choices, required=False, default=[], action='append')
     parser.add_argument("-p", "--prefix", help="Directory to build into", required=False)
-    parser.add_argument("-a", "--arches", help="Architecture to build", choices=DEFAULT_ARCHES, default=DEFAULT_ARCHES, required=False, action='append')
+    parser.add_argument("-a", "--arches", help="Architecture to build", choices=arch_choices, default=[], required=False, action='append')
     parser.add_argument("-t", "--tarball", help="Local tarball to package instead of downloading (only valid with one distro/arch combination)", required=False, type=lambda x: is_valid_file(parser, x))
 
     args = parser.parse_args()
@@ -274,7 +301,7 @@ def main(argv):
 
     distros=[Distro(distro) for distro in DISTROS]
 
-    args = get_args(distros)
+    args = get_args(distros, ARCH_CHOICES)
 
     spec = Spec(args.server_version, args.metadata_gitspec, args.release_number)
 
@@ -297,7 +324,7 @@ def main(argv):
       # accumulate the repository-layout directories.
       for (distro, arch) in crossproduct(distros, args.arches):
 
-          for build_os in distro.build_os():
+          for build_os in distro.build_os(arch):
             if build_os in args.distros or not args.distros:
 
               if args.tarball:
@@ -441,11 +468,21 @@ def make_deb(distro, build_os, arch, spec, srcdir):
     suffix=spec.suffix()
     sdir=setupdir(distro, build_os, arch, spec)
     if re.search("debian", distro.name()):
-        os.link(sdir+"debian/init.d", sdir+"debian/%s%s-server.mongod.init" % (distro.pkgbase(), suffix))
         os.unlink(sdir+"debian/mongod.upstart")
+        if build_os == "debian71":
+            os.link(sdir+"debian/init.d", sdir+"debian/%s%s-server.mongod.init" % (distro.pkgbase(), suffix))
+            os.unlink(sdir+"debian/mongod.service")
+        else:
+            os.link(sdir+"debian/mongod.service", sdir+"debian/%s%s-server.mongod.service" % (distro.pkgbase(), suffix))
+            os.unlink(sdir+"debian/init.d")
     elif re.search("ubuntu", distro.name()):
-        os.link(sdir+"debian/mongod.upstart", sdir+"debian/%s%s-server.mongod.upstart" % (distro.pkgbase(), suffix))
         os.unlink(sdir+"debian/init.d")
+        if build_os in ("ubuntu1204", "ubuntu1404", "ubuntu1410"):
+            os.link(sdir+"debian/mongod.upstart", sdir+"debian/%s%s-server.mongod.upstart" % (distro.pkgbase(), suffix))
+            os.unlink(sdir+"debian/mongod.service")
+        else:
+            os.link(sdir+"debian/mongod.service", sdir+"debian/%s%s-server.mongod.service" % (distro.pkgbase(), suffix))
+            os.unlink(sdir+"debian/mongod.upstart")
     else:
         raise Exception("unknown debianoid flavor: not debian or ubuntu?")
     # Rewrite the control and rules files
@@ -635,7 +672,7 @@ def make_rpm(distro, build_os, arch, spec, srcdir):
     # all of this is to let us do our work with some guarantee that
     # we're not clobbering anything that doesn't belong to us.
     #
-    # On RHEL systems, --rcfile will generally be used and 
+    # On RHEL systems, --rcfile will generally be used and
     # --macros will be used in Ubuntu.
     #
     macrofiles=[l for l in backtick(["rpm", "--showrc"]).split("\n") if l.startswith("macrofiles")]
@@ -656,7 +693,7 @@ def make_rpm(distro, build_os, arch, spec, srcdir):
     # Put the specfile and the tar'd up binaries and stuff in
     # place.
     #
-    # The version of rpm and rpm tools in RHEL 5.5 can't interpolate the 
+    # The version of rpm and rpm tools in RHEL 5.5 can't interpolate the
     # %{dynamic_version} macro, so do it manually
     with open(specfile, "r") as spec_source:
       with open(topdir+"SPECS/" + os.path.basename(specfile), "w") as spec_dest:
@@ -724,5 +761,3 @@ def is_valid_file(parser, filename):
 
 if __name__ == "__main__":
     main(sys.argv)
-
-

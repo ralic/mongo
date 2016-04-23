@@ -47,13 +47,8 @@
     assert.eq(cmdRes.cursor.ns, coll.getFullName());
 
     // Should also succeed if maxTimeMS is supplied on the original find.
-    cmdRes = db.runCommand({
-        find: collName,
-        batchSize: 2,
-        awaitData: true,
-        tailable: true,
-        maxTimeMS: 2000
-    });
+    cmdRes = db.runCommand(
+        {find: collName, batchSize: 2, awaitData: true, tailable: true, maxTimeMS: 2000});
     assert.commandWorked(cmdRes);
     assert.gt(cmdRes.cursor.id, NumberLong(0));
     assert.eq(cmdRes.cursor.ns, coll.getFullName());
@@ -83,7 +78,7 @@
         getMore: cmdRes.cursor.id,
         collection: coll.getName(),
         batchSize: NumberInt(2),
-        maxTimeMS: 1000
+        maxTimeMS: 4000
     });
     assert.commandWorked(cmdRes);
     assert.gt(cmdRes.cursor.id, NumberLong(0));
@@ -91,46 +86,41 @@
 
     // Keep issuing getMore until we get an empty batch after the timeout expires.
     while (cmdRes.cursor.nextBatch.length > 0) {
+        var now = new Date();
         cmdRes = db.runCommand({
             getMore: cmdRes.cursor.id,
             collection: coll.getName(),
             batchSize: NumberInt(2),
-            maxTimeMS: 1000
+            maxTimeMS: 4000
         });
         assert.commandWorked(cmdRes);
         assert.gt(cmdRes.cursor.id, NumberLong(0));
         assert.eq(cmdRes.cursor.ns, coll.getFullName());
     }
+    assert.gte((new Date()) - now, 2000);
 
     // Repeat the test, this time tailing the oplog rather than a user-created capped collection.
-    cmdRes = localDB.runCommand({
-        find: oplogColl.getName(),
-        batchSize: 2,
-        awaitData: true,
-        tailable: true
-    });
+    cmdRes = localDB.runCommand(
+        {find: oplogColl.getName(), batchSize: 2, awaitData: true, tailable: true});
     assert.commandWorked(cmdRes);
     assert.gt(cmdRes.cursor.id, NumberLong(0));
     assert.eq(cmdRes.cursor.ns, oplogColl.getFullName());
     assert.eq(cmdRes.cursor.firstBatch.length, 2);
 
-    cmdRes = localDB.runCommand({
-        getMore: cmdRes.cursor.id,
-        collection: oplogColl.getName(),
-        maxTimeMS: 1000
-    });
+    cmdRes = localDB.runCommand(
+        {getMore: cmdRes.cursor.id, collection: oplogColl.getName(), maxTimeMS: 1000});
     assert.commandWorked(cmdRes);
     assert.gt(cmdRes.cursor.id, NumberLong(0));
     assert.eq(cmdRes.cursor.ns, oplogColl.getFullName());
 
     while (cmdRes.cursor.nextBatch.length > 0) {
-        cmdRes = localDB.runCommand({
-            getMore: cmdRes.cursor.id,
-            collection: oplogColl.getName(),
-            maxTimeMS: 1000
-        });
+        now = new Date();
+        cmdRes = localDB.runCommand(
+            {getMore: cmdRes.cursor.id, collection: oplogColl.getName(), maxTimeMS: 4000});
         assert.commandWorked(cmdRes);
         assert.gt(cmdRes.cursor.id, NumberLong(0));
         assert.eq(cmdRes.cursor.ns, oplogColl.getFullName());
     }
+    assert.gte((new Date()) - now, 2000);
+
 })();

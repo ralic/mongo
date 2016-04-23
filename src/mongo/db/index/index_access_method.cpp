@@ -43,7 +43,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
 
@@ -102,8 +102,8 @@ Status IndexAccessMethod::insert(OperationContext* txn,
                                  const RecordId& loc,
                                  const InsertDeleteOptions& options,
                                  int64_t* numInserted) {
+    invariant(numInserted);
     *numInserted = 0;
-
     BSONObjSet keys;
     // Delegate to the subclass.
     getKeys(obj, &keys);
@@ -168,15 +168,21 @@ std::unique_ptr<SortedDataInterface::Cursor> IndexAccessMethod::newCursor(Operat
     return _newInterface->newCursor(txn, isForward);
 }
 
+std::unique_ptr<SortedDataInterface::Cursor> IndexAccessMethod::newRandomCursor(
+    OperationContext* txn) const {
+    return _newInterface->newRandomCursor(txn);
+}
+
 // Remove the provided doc from the index.
 Status IndexAccessMethod::remove(OperationContext* txn,
                                  const BSONObj& obj,
                                  const RecordId& loc,
                                  const InsertDeleteOptions& options,
                                  int64_t* numDeleted) {
+    invariant(numDeleted);
+    *numDeleted = 0;
     BSONObjSet keys;
     getKeys(obj, &keys);
-    *numDeleted = 0;
 
     for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
         removeOneKey(txn, *i, loc, options.dupsAllowed);
@@ -245,10 +251,9 @@ RecordId IndexAccessMethod::findSingle(OperationContext* txn, const BSONObj& key
 Status IndexAccessMethod::validate(OperationContext* txn,
                                    bool full,
                                    int64_t* numKeys,
-                                   BSONObjBuilder* output) {
-    // XXX: long long vs int64_t
+                                   ValidateResults* fullResults) {
     long long keys = 0;
-    _newInterface->fullValidate(txn, full, &keys, output);
+    _newInterface->fullValidate(txn, full, &keys, fullResults);
     *numKeys = keys;
     return Status::OK();
 }
@@ -287,7 +292,14 @@ Status IndexAccessMethod::validateUpdate(OperationContext* txn,
 
 Status IndexAccessMethod::update(OperationContext* txn,
                                  const UpdateTicket& ticket,
-                                 int64_t* numUpdated) {
+                                 int64_t* numInserted,
+                                 int64_t* numDeleted) {
+    invariant(numInserted);
+    invariant(numDeleted);
+
+    *numInserted = 0;
+    *numDeleted = 0;
+
     if (!ticket._isValid) {
         return Status(ErrorCodes::InternalError, "Invalid UpdateTicket in update");
     }
@@ -313,9 +325,14 @@ Status IndexAccessMethod::update(OperationContext* txn,
         }
     }
 
-    *numUpdated = ticket.added.size();
+    *numInserted = ticket.added.size();
+    *numDeleted = ticket.removed.size();
 
     return Status::OK();
+}
+
+Status IndexAccessMethod::compact(OperationContext* txn) {
+    return this->_newInterface->compact(txn);
 }
 
 std::unique_ptr<IndexAccessMethod::BulkBuilder> IndexAccessMethod::initiateBulk() {

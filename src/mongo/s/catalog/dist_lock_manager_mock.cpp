@@ -59,12 +59,31 @@ DistLockManagerMock::DistLockManagerMock()
 
 void DistLockManagerMock::startUp() {}
 
-void DistLockManagerMock::shutDown(bool allowNetworking) {
+void DistLockManagerMock::shutDown(OperationContext* txn) {
     uassert(28659, "DistLockManagerMock shut down with outstanding locks present", _locks.empty());
 }
 
+std::string DistLockManagerMock::getProcessID() {
+    return "Mock dist lock manager process id";
+}
+
 StatusWith<DistLockManager::ScopedDistLock> DistLockManagerMock::lock(
-    StringData name, StringData whyMessage, milliseconds waitFor, milliseconds lockTryInterval) {
+    OperationContext* txn,
+    StringData name,
+    StringData whyMessage,
+    milliseconds waitFor,
+    milliseconds lockTryInterval) {
+    return lockWithSessionID(
+        txn, name, whyMessage, DistLockHandle::gen(), waitFor, lockTryInterval);
+}
+
+StatusWith<DistLockManager::ScopedDistLock> DistLockManagerMock::lockWithSessionID(
+    OperationContext* txn,
+    StringData name,
+    StringData whyMessage,
+    const OID lockSessionID,
+    milliseconds waitFor,
+    milliseconds lockTryInterval) {
     _lockChecker(name, whyMessage, waitFor, lockTryInterval);
     _lockChecker = NoLockFuncSet;
 
@@ -81,13 +100,17 @@ StatusWith<DistLockManager::ScopedDistLock> DistLockManagerMock::lock(
 
     LockInfo info;
     info.name = name.toString();
-    info.lockID = DistLockHandle::gen();
+    info.lockID = lockSessionID;
     _locks.push_back(info);
 
-    return DistLockManager::ScopedDistLock(info.lockID, this);
+    return DistLockManager::ScopedDistLock(nullptr, info.lockID, this);
 }
 
-void DistLockManagerMock::unlock(const DistLockHandle& lockHandle) {
+void DistLockManagerMock::unlockAll(OperationContext* txn, const std::string& processID) {
+    fassertFailed(34366);  // Not implemented for the mock
+}
+
+void DistLockManagerMock::unlock(OperationContext* txn, const DistLockHandle& lockHandle) {
     std::vector<LockInfo>::iterator it =
         std::find_if(_locks.begin(),
                      _locks.end(),
@@ -98,7 +121,7 @@ void DistLockManagerMock::unlock(const DistLockHandle& lockHandle) {
     _locks.erase(it);
 }
 
-Status DistLockManagerMock::checkStatus(const DistLockHandle& lockHandle) {
+Status DistLockManagerMock::checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) {
     return Status::OK();
 }
 

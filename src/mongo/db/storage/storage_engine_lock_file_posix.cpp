@@ -96,9 +96,17 @@ Status StorageEngineLockFile::open() {
                                     << ": " << ex.what());
     }
 
-    int lockFile = ::open(_filespec.c_str(), O_RDWR | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO);
+    // Use file permissions 644
+    int lockFile =
+        ::open(_filespec.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     if (lockFile < 0) {
         int errorcode = errno;
+        if (errorcode == EACCES) {
+            return Status(ErrorCodes::IllegalOperation,
+                          str::stream()
+                              << "Attempted to create a lock file on a read-only directory: "
+                              << _dbpath);
+        }
         return Status(ErrorCodes::DBPathInUse,
                       str::stream() << "Unable to create/open lock file: " << _filespec << ' '
                                     << errnoWithDescription(errorcode)
@@ -184,7 +192,7 @@ void StorageEngineLockFile::clearPidAndUnlock() {
     log() << "shutdown: removing fs lock...";
     // This ought to be an unlink(), but Eliot says the last
     // time that was attempted, there was a race condition
-    // with acquirePathLock().
+    // with StorageEngineLockFile::open().
     if (::ftruncate(_lockFileHandle->_fd, 0)) {
         int errorcode = errno;
         log() << "couldn't remove fs lock " << errnoWithDescription(errorcode);

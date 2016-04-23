@@ -37,9 +37,9 @@
 #include <limits>
 
 #include "mongo/base/parse_number.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/scripting/engine.h"
@@ -118,7 +118,8 @@ public:
         s->setNumber("notANumberVal", std::numeric_limits<double>::quiet_NaN());
         ASSERT(!s->getBoolean("notANumberVal"));
 
-        s->setElement("nullVal", BSONObjBuilder().appendNull("null").obj().getField("null"));
+        auto obj = BSONObjBuilder().appendNull("null").obj();
+        s->setElement("nullVal", obj.getField("null"), obj);
         ASSERT(!s->getBoolean("nullVal"));
 
         s->setNumber("zeroVal", 0);
@@ -849,12 +850,12 @@ public:
     }
 };
 
-class InvalidTimestamp {
+class MaxTimestamp {
 public:
     void run() {
         unique_ptr<Scope> s(globalScriptEngine->newScope());
 
-        // Timestamp 't' component cannot exceed max for int32_t.
+        // Timestamp 't' component can exceed max for int32_t.
         BSONObj in;
         {
             BSONObjBuilder b;
@@ -866,7 +867,7 @@ public:
         }
         s->setObject("a", in);
 
-        ASSERT_FALSE(s->exec("x = tojson( a ); ", "foo", false, true, false));
+        ASSERT(s->exec("x = tojson( a ); ", "foo", false, true, false));
     }
 };
 
@@ -985,7 +986,8 @@ public:
         string utf8ObjSpec = "{'_id':'\\u0001\\u007f\\u07ff\\uffff'}";
         BSONObj utf8Obj = fromjson(utf8ObjSpec);
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.insert(ns(), utf8Obj);
@@ -1005,7 +1007,8 @@ private:
     }
 
     void reset() {
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.dropCollection(ns());
@@ -1028,7 +1031,8 @@ public:
         if (!globalScriptEngine->utf8Ok())
             return;
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.eval("unittest",
@@ -1037,7 +1041,8 @@ public:
 
 private:
     void reset() {
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.dropCollection(ns());
@@ -1116,7 +1121,8 @@ public:
         // Insert in Javascript -> Find using DBDirectClient
 
         // Drop the collection
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.dropCollection("unittest.testroundtrip");
@@ -1504,17 +1510,8 @@ class Undefined : public TestRoundTrip {
         return b.obj();
     }
 
-    // Don't need to return anything because we are overriding both jsonOut and jsonIn
     virtual string json() const {
-        return "";
-    }
-
-    // undefined values come out as null in the shell.  See SERVER-6102.
-    virtual string jsonIn() const {
         return "{ \"a\" : undefined }";
-    }
-    virtual string jsonOut() const {
-        return "{ \"a\" : null }";
     }
 };
 
@@ -2233,7 +2230,8 @@ public:
         update.appendCode("value",
                           "function () { db.test.find().forEach(function(obj) { continue; }); }");
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
         client.update("test.system.js", query.obj(), update.obj(), true /* upsert */);
 
@@ -2385,7 +2383,7 @@ public:
             add<NumberDecimalBigObject>();
         }
 
-        add<InvalidTimestamp>();
+        add<MaxTimestamp>();
         add<RenameTest>();
 
         add<WeirdObjects>();

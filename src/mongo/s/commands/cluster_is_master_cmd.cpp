@@ -30,7 +30,6 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/s/catalog/forwarding_catalog_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 
@@ -41,7 +40,8 @@ class CmdIsMaster : public Command {
 public:
     CmdIsMaster() : Command("isMaster", false, "ismaster") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -72,21 +72,10 @@ public:
         result.appendNumber("maxWriteBatchSize", BatchedCommandRequest::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
 
-        // Mongos can only send the wire version indicating find and getMore commands support if the
-        // config server mode has been upgraded to CSRS.
-        //
-        // TODO: This special case will no longer be required for 3.4.
-        auto catalogManager = grid.catalogManager(txn);
-        int maxVersionToSend = maxWireVersion;
-        if (maxVersionToSend == WireVersion::FIND_COMMAND &&
-            catalogManager->getMode() != CatalogManager::ConfigServerMode::CSRS) {
-            maxVersionToSend = WireVersion::RELEASE_2_7_7;
-        }
-
         // Mongos tries to keep exactly the same version range of the server for which
         // it is compiled.
-        result.append("maxWireVersion", maxVersionToSend);
-        result.append("minWireVersion", minWireVersion);
+        result.append("maxWireVersion", WireSpec::instance().maxWireVersionIncoming);
+        result.append("minWireVersion", WireSpec::instance().minWireVersionIncoming);
 
         return true;
     }

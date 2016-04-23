@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -473,7 +473,7 @@ __wt_ovfl_reuse_search(WT_SESSION_IMPL *session, WT_PAGE *page,
 
 	if (WT_VERBOSE_ISSET(session, WT_VERB_OVERFLOW))
 		WT_RET(__ovfl_reuse_verbose(session, page, reuse, "reclaim"));
-	return (1);
+	return (0);
 }
 
 /*
@@ -820,7 +820,7 @@ __wt_ovfl_txnc_add(WT_SESSION_IMPL *session, WT_PAGE *page,
 	txnc->value_offset = WT_PTRDIFF32(p, txnc);
 	txnc->value_size = WT_STORE_SIZE(value_size);
 	memcpy(p, value, value_size);
-	txnc->current = __wt_txn_new_id(session);
+	txnc->current = __wt_txn_id_alloc(session, false);
 
 	__wt_cache_page_inmem_incr(
 	    session, page, WT_OVFL_SIZE(txnc, WT_OVFL_TXNC));

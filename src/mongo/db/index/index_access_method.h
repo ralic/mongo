@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "mongo/base/disallow_copying.h"
@@ -39,6 +40,8 @@
 #include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo {
+
+extern std::atomic<bool> failIndexKeyTooLong;  // NOLINT
 
 class BSONObjBuilder;
 class MatchExpression;
@@ -68,7 +71,7 @@ public:
 
     /**
      * Internally generate the keys {k1, ..., kn} for 'obj'.  For each key k, insert (k ->
-     * 'loc') into the index.  'obj' is the object at the location 'loc'.  If not NULL,
+     * 'loc') into the index.  'obj' is the object at the location 'loc'.
      * 'numInserted' will be set to the number of keys added to the index for the document.  If
      * there is more than one key for 'obj', either all keys will be inserted or none will.
      *
@@ -81,8 +84,8 @@ public:
                   int64_t* numInserted);
 
     /**
-     * Analogous to above, but remove the records instead of inserting them.  If not NULL,
-     * numDeleted will be set to the number of keys removed from the index for the document.
+     * Analogous to above, but remove the records instead of inserting them.
+     * 'numDeleted' will be set to the number of keys removed from the index for the document.
      */
     Status remove(OperationContext* txn,
                   const BSONObj& obj,
@@ -115,14 +118,24 @@ public:
      * 'from' will remain.  Assumes that the index has not changed since validateUpdate was
      * called.  If the index was changed, we may return an error, as our ticket may have been
      * invalidated.
+     *
+     * 'numInserted' will be set to the number of keys inserted into the index for the document.
+     * 'numDeleted' will be set to the number of keys removed from the index for the document.
      */
-    Status update(OperationContext* txn, const UpdateTicket& ticket, int64_t* numUpdated);
+    Status update(OperationContext* txn,
+                  const UpdateTicket& ticket,
+                  int64_t* numInserted,
+                  int64_t* numDeleted);
 
     /**
      * Returns an unpositioned cursor over 'this' index.
      */
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* txn,
                                                            bool isForward = true) const;
+    /**
+     * Returns a pseudo-random cursor over 'this' index.
+     */
+    std::unique_ptr<SortedDataInterface::Cursor> newRandomCursor(OperationContext* txn) const;
 
     // ------ index level operations ------
 
@@ -159,7 +172,10 @@ public:
      * Currently wasserts that the index is invalid.  This could/should be changed in
      * the future to return a Status.
      */
-    Status validate(OperationContext* txn, bool full, int64_t* numKeys, BSONObjBuilder* output);
+    Status validate(OperationContext* txn,
+                    bool full,
+                    int64_t* numKeys,
+                    ValidateResults* fullResults);
 
     /**
      * Add custom statistics about this index to BSON object builder, for display.
@@ -177,6 +193,12 @@ public:
     long long getSpaceUsedBytes(OperationContext* txn) const;
 
     RecordId findSingle(OperationContext* txn, const BSONObj& key) const;
+
+    /**
+     * Attempt compaction to regain disk space if the indexed record store supports
+     * compaction-in-place.
+     */
+    Status compact(OperationContext* txn);
 
     //
     // Bulk operations support

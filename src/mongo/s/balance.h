@@ -1,44 +1,47 @@
-//@file balance.h
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2016 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
+ */
 
 #pragma once
 
+#include <string>
+#include <vector>
 
 #include "mongo/util/background.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 
-class BalancerPolicy;
+class ClusterStatistics;
 struct MigrateInfo;
+class MigrationSecondaryThrottleOptions;
 class OperationContext;
-struct WriteConcernOptions;
+template <typename T>
+class StatusWith;
 
 /**
  * The balancer is a background task that tries to keep the number of chunks across all
@@ -53,7 +56,16 @@ struct WriteConcernOptions;
 class Balancer : public BackgroundJob {
 public:
     Balancer();
-    virtual ~Balancer();
+    ~Balancer();
+
+    /**
+     * Retrieves the per-service instance of the Balancer.
+     */
+    static Balancer* get(OperationContext* operationContext);
+
+    ClusterStatistics* getClusterStatistics() const {
+        return _clusterStats.get();
+    }
 
     // BackgroundJob methods
 
@@ -64,18 +76,6 @@ public:
     }
 
 private:
-    // hostname:port of my mongos
-    std::string _myid;
-
-    // time the Balancer started running
-    time_t _started;
-
-    // number of moved chunks in last round
-    int _balancedLastTime;
-
-    // decide which chunks to move; owned here.
-    std::unique_ptr<BalancerPolicy> _policy;
-
     /**
      * Checks that the balancer can connect to all servers it needs to do its job.
      *
@@ -86,15 +86,23 @@ private:
     bool _init(OperationContext* txn);
 
     /**
+     * Marks this balancer as being live on the config server(s).
+     */
+    void _ping(OperationContext* txn, bool waiting);
+
+    /**
+     * Returns true if all the servers listed in configdb as being shards are reachable and are
+     * distinct processes (no hostname mixup).
+     */
+    bool _checkOIDs(OperationContext* txn);
+
+    /**
      * Gathers all the necessary information about shards and chunks, and decides whether there are
      * candidate chunks to be moved.
      *
-     * @param conn is the connection with the config server(s)
-     * @param candidateChunks (IN/OUT) filled with candidate chunks, one per collection, that could
-     *                          possibly be moved
+     * Returns candidate chunks, one per collection, that could possibly be moved
      */
-    void _doBalanceRound(OperationContext* txn,
-                         std::vector<std::shared_ptr<MigrateInfo>>* candidateChunks);
+    StatusWith<std::vector<MigrateInfo>> _getCandidateChunks(OperationContext* txn);
 
     /**
      * Issues chunk migration request, one at a time.
@@ -105,21 +113,21 @@ private:
      * @return number of chunks effectively moved
      */
     int _moveChunks(OperationContext* txn,
-                    const std::vector<std::shared_ptr<MigrateInfo>>& candidateChunks,
-                    const WriteConcernOptions* writeConcern,
+                    const std::vector<MigrateInfo>& candidateChunks,
+                    const MigrationSecondaryThrottleOptions& secondaryThrottle,
                     bool waitForDelete);
 
-    /**
-     * Marks this balancer as being live on the config server(s).
-     */
-    void _ping(OperationContext* txn, bool waiting = false);
+    // hostname:port of my mongos
+    std::string _myid;
 
-    /**
-     * @return true if all the servers listed in configdb as being shards are reachable and are
-     *         distinct processes
-     */
-    bool _checkOIDs(OperationContext* txn);
+    // Time the Balancer started running
+    Timer _timer;
+
+    // number of moved chunks in last round
+    int _balancedLastTime;
+
+    // Source for cluster statistics
+    std::unique_ptr<ClusterStatistics> _clusterStats;
 };
 
-extern Balancer balancer;
-}
+}  // namespace mongo

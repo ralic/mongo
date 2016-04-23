@@ -36,6 +36,7 @@
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/text.h"
 
@@ -43,76 +44,64 @@ namespace mongo {
 namespace mozjs {
 
 const JSFunctionSpec NumberLongInfo::methods[5] = {
-    MONGO_ATTACH_JS_FUNCTION(toNumber),
-    MONGO_ATTACH_JS_FUNCTION(toString),
-    MONGO_ATTACH_JS_FUNCTION(valueOf),
-    MONGO_ATTACH_JS_FUNCTION(compare),
-    JS_FS_END,
-};
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toNumber, NumberLongInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(toString, NumberLongInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(valueOf, NumberLongInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD(compare, NumberLongInfo),
+    JS_FS_END};
 
 const char* const NumberLongInfo::className = "NumberLong";
 
-namespace {
-const char* const kTop = "top";
-const char* const kBottom = "bottom";
-const char* const kFloatApprox = "floatApprox";
-}  // namespace
+void NumberLongInfo::finalize(JSFreeOp* fop, JSObject* obj) {
+    auto numLong = static_cast<int*>(JS_GetPrivate(obj));
 
-long long NumberLongInfo::ToNumberLong(JSContext* cx, JS::HandleValue thisv) {
-    JS::RootedObject obj(cx, thisv.toObjectOrNull());
-    return ToNumberLong(cx, obj);
+    if (numLong)
+        delete numLong;
 }
 
-long long NumberLongInfo::ToNumberLong(JSContext* cx, JS::HandleObject thisv) {
-    ObjectWrapper o(cx, thisv);
-
-    if (!o.hasField(kTop)) {
-        if (!o.hasField(kFloatApprox))
-            uasserted(ErrorCodes::InternalError, "No top and no floatApprox fields");
-
-        return o.getNumber(kFloatApprox);
-    }
-
-    if (!o.hasField(kBottom))
-        uasserted(ErrorCodes::InternalError, "top but no bottom field");
-
-    return ((unsigned long long)((long long)o.getNumber(kTop) << 32) +
-            (unsigned)(o.getNumber(kBottom)));
+int64_t NumberLongInfo::ToNumberLong(JSContext* cx, JS::HandleValue thisv) {
+    auto numLong = static_cast<int64_t*>(JS_GetPrivate(thisv.toObjectOrNull()));
+    return numLong ? *numLong : 0;
 }
 
-void NumberLongInfo::Functions::valueOf(JSContext* cx, JS::CallArgs args) {
-    long long out = NumberLongInfo::ToNumberLong(cx, args.thisv());
+int64_t NumberLongInfo::ToNumberLong(JSContext* cx, JS::HandleObject thisv) {
+    auto numLong = static_cast<int64_t*>(JS_GetPrivate(thisv));
+    return numLong ? *numLong : 0;
+}
 
+void NumberLongInfo::Functions::valueOf::call(JSContext* cx, JS::CallArgs args) {
+    int64_t out = NumberLongInfo::ToNumberLong(cx, args.thisv());
     args.rval().setDouble(out);
 }
 
-void NumberLongInfo::Functions::toNumber(JSContext* cx, JS::CallArgs args) {
-    valueOf(cx, args);
+void NumberLongInfo::Functions::toNumber::call(JSContext* cx, JS::CallArgs args) {
+    valueOf::call(cx, args);
 }
 
-void NumberLongInfo::Functions::toString(JSContext* cx, JS::CallArgs args) {
+void NumberLongInfo::Functions::toString::call(JSContext* cx, JS::CallArgs args) {
     str::stream ss;
 
-    long long val = NumberLongInfo::ToNumberLong(cx, args.thisv());
+    int64_t val = NumberLongInfo::ToNumberLong(cx, args.thisv());
 
-    const long long limit = 2LL << 30;
+    const int64_t limit = 2LL << 30;
 
     if (val <= -limit || limit <= val)
         ss << "NumberLong(\"" << val << "\")";
     else
         ss << "NumberLong(" << val << ")";
 
+
     ValueReader(cx, args.rval()).fromStringData(ss.operator std::string());
 }
 
-void NumberLongInfo::Functions::compare(JSContext* cx, JS::CallArgs args) {
+void NumberLongInfo::Functions::compare::call(JSContext* cx, JS::CallArgs args) {
     uassert(ErrorCodes::BadValue, "NumberLong.compare() needs 1 argument", args.length() == 1);
     uassert(ErrorCodes::BadValue,
-            "NumberLong.compare() argument must be an object",
-            args.get(0).isObject());
+            "NumberLong.compare() argument must be a NumberLong",
+            getScope(cx)->getProto<NumberLongInfo>().instanceOf(args.get(0)));
 
-    long long thisVal = NumberLongInfo::ToNumberLong(cx, args.thisv());
-    long long otherVal = NumberLongInfo::ToNumberLong(cx, args.get(0));
+    int64_t thisVal = NumberLongInfo::ToNumberLong(cx, args.thisv());
+    int64_t otherVal = NumberLongInfo::ToNumberLong(cx, args.get(0));
 
     int comparison = 0;
     if (thisVal < otherVal) {
@@ -124,6 +113,35 @@ void NumberLongInfo::Functions::compare(JSContext* cx, JS::CallArgs args) {
     args.rval().setDouble(comparison);
 }
 
+void NumberLongInfo::Functions::floatApprox::call(JSContext* cx, JS::CallArgs args) {
+    int64_t numLong = NumberLongInfo::ToNumberLong(cx, args.thisv());
+    args.rval().setDouble(numLong);
+}
+
+void NumberLongInfo::Functions::top::call(JSContext* cx, JS::CallArgs args) {
+    int64_t numLong = NumberLongInfo::ToNumberLong(cx, args.thisv());
+
+    // values above 2^53 are not accurately represented in JS
+    if (numLong == INT64_MIN || std::abs(numLong) >= 9007199254740992LL) {
+        auto val64 = static_cast<unsigned long long>(numLong);
+        args.rval().setDouble(val64 >> 32);
+    } else {
+        args.rval().setUndefined();
+    }
+}
+
+void NumberLongInfo::Functions::bottom::call(JSContext* cx, JS::CallArgs args) {
+    int64_t numLong = NumberLongInfo::ToNumberLong(cx, args.thisv());
+
+    // values above 2^53 are not accurately represented in JS
+    if (numLong == INT64_MIN || std::abs(numLong) >= 9007199254740992LL) {
+        auto val64 = static_cast<unsigned long long>(numLong);
+        args.rval().setDouble(val64 & 0x00000000FFFFFFFF);
+    } else {
+        args.rval().setUndefined();
+    }
+}
+
 void NumberLongInfo::construct(JSContext* cx, JS::CallArgs args) {
     uassert(ErrorCodes::BadValue,
             "NumberLong needs 0, 1 or 3 arguments",
@@ -133,60 +151,98 @@ void NumberLongInfo::construct(JSContext* cx, JS::CallArgs args) {
 
     JS::RootedObject thisv(cx);
 
-    scope->getNumberLongProto().newObject(&thisv);
+    scope->getProto<NumberLongInfo>().newObject(&thisv);
+
+    int64_t numLong;
+
     ObjectWrapper o(cx, thisv);
 
-    JS::RootedValue floatApprox(cx);
-    JS::RootedValue top(cx);
-    JS::RootedValue bottom(cx);
-
     if (args.length() == 0) {
-        o.setNumber(kFloatApprox, 0);
+        numLong = 0;
     } else if (args.length() == 1) {
         auto arg = args.get(0);
-        if (arg.isNumber()) {
-            o.setValue(kFloatApprox, arg);
+
+        if (arg.isInt32()) {
+            numLong = arg.toInt32();
+        } else if (arg.isDouble()) {
+            numLong = arg.toDouble();
         } else {
             std::string str = ValueWriter(cx, arg).toString();
-            long long val;
+            int64_t val;
             // For string values we call strtoll because we expect non-number string
-            // values to fail rather than return 0 (which is the behavior of ToInt64.
+            // values to fail rather than return 0 (which is the behavior of ToInt64).
             if (arg.isString())
                 val = parseLL(str.c_str());
-            // Otherwise we call the toNumber on the js value to get the long long value.
+            // Otherwise we call the toNumber on the js value to get the int64_t value.
             else
                 val = ValueWriter(cx, arg).toInt64();
 
-            // values above 2^53 are not accurately represented in JS
-            if (val == INT64_MIN || std::abs(val) >= 9007199254740992LL) {
-                auto val64 = static_cast<unsigned long long>(val);
-                o.setNumber(kFloatApprox, val);
-                o.setNumber(kTop, val64 >> 32);
-                o.setNumber(kBottom, val64 & 0x00000000ffffffff);
-            } else {
-                o.setNumber(kFloatApprox, val);
-            }
+            numLong = val;
         }
     } else {
         if (!args.get(0).isNumber())
             uasserted(ErrorCodes::BadValue, "floatApprox must be a number");
 
-        if (!args.get(1).isNumber() ||
-            args.get(1).toNumber() !=
-                static_cast<double>(static_cast<uint32_t>(args.get(1).toNumber())))
+        double top = 0;
+        if (args.get(1).isNumber())
+            top = static_cast<double>(static_cast<uint32_t>(args.get(1).toNumber()));
+
+        if (!args.get(1).isNumber() || args.get(1).toNumber() != top)
             uasserted(ErrorCodes::BadValue, "top must be a 32 bit unsigned number");
 
-        if (!args.get(2).isNumber() ||
-            args.get(2).toNumber() !=
-                static_cast<double>(static_cast<uint32_t>(args.get(2).toNumber())))
+        double bot = 0;
+        if (args.get(2).isNumber())
+            bot = static_cast<double>(static_cast<uint32_t>(args.get(2).toNumber()));
+
+        if (!args.get(2).isNumber() || args.get(2).toNumber() != bot)
             uasserted(ErrorCodes::BadValue, "bottom must be a 32 bit unsigned number");
 
-        o.setValue(kFloatApprox, args.get(0));
-        o.setValue(kTop, args.get(1));
-        o.setValue(kBottom, args.get(2));
+        numLong = (static_cast<uint64_t>(top) << 32) + static_cast<uint64_t>(bot);
     }
 
+    JS_SetPrivate(thisv, new int64_t(numLong));
+
     args.rval().setObjectOrNull(thisv);
+}
+
+void NumberLongInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto) {
+    JS::RootedValue undef(cx);
+    undef.setUndefined();
+
+    // floatapprox
+    if (!JS_DefinePropertyById(
+            cx,
+            proto,
+            getScope(cx)->getInternedStringId(InternedString::floatApprox),
+            undef,
+            JSPROP_ENUMERATE | JSPROP_SHARED,
+            smUtils::wrapConstrainedMethod<Functions::floatApprox, true, NumberLongInfo>,
+            nullptr)) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
+    }
+
+    // top
+    if (!JS_DefinePropertyById(cx,
+                               proto,
+                               getScope(cx)->getInternedStringId(InternedString::top),
+                               undef,
+                               JSPROP_ENUMERATE | JSPROP_SHARED,
+                               smUtils::wrapConstrainedMethod<Functions::top, true, NumberLongInfo>,
+                               nullptr)) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
+    }
+
+    // bottom
+    if (!JS_DefinePropertyById(
+            cx,
+            proto,
+            getScope(cx)->getInternedStringId(InternedString::bottom),
+            undef,
+            JSPROP_ENUMERATE | JSPROP_SHARED,
+            smUtils::wrapConstrainedMethod<Functions::bottom, true, NumberLongInfo>,
+            nullptr)) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS_DefinePropertyById");
+    }
 }
 
 }  // namespace mozjs

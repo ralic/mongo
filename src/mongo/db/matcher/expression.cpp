@@ -55,22 +55,17 @@ bool MatchExpression::matchesBSON(const BSONObj& doc, MatchDetails* details) con
     return matches(&mydoc, details);
 }
 
-
-void AtomicMatchExpression::debugString(StringBuilder& debug, int level) const {
-    _debugAddSpace(debug, level);
-    debug << "$atomic\n";
-}
-
-void AtomicMatchExpression::toBSON(BSONObjBuilder* out) const {
-    out->append("$isolated", 1);
-}
-
 void FalseMatchExpression::debugString(StringBuilder& debug, int level) const {
     _debugAddSpace(debug, level);
-    debug << "$false\n";
+    debug << "$all: []\n";
 }
 
-void FalseMatchExpression::toBSON(BSONObjBuilder* out) const {
-    out->append("$false", 1);
+void FalseMatchExpression::serialize(BSONObjBuilder* out) const {
+    // Our query language has no "always false" operator aside from a $all with no children, so use
+    // that as a proxy here.
+    BSONObjBuilder child(out->subobjStart(_path));
+    BSONArrayBuilder allChild(child.subarrayStart("$all"));
+    allChild.doneFast();
+    child.doneFast();
 }
 }

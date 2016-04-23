@@ -33,7 +33,7 @@
 #include "mongo/s/chunk.h"
 
 #include "mongo/client/connpool.h"
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
@@ -41,15 +41,20 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/random.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/balance.h"
 #include "mongo/s/balancer_policy.h"
+#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/balancer/cluster_statistics.h"
 #include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/catalog/type_settings.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/move_chunk_request.h"
+#include "mongo/s/shard_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -65,7 +70,7 @@ using std::vector;
 
 namespace {
 
-const int kTooManySplitPoints = 4;
+const uint64_t kTooManySplitPoints = 4;
 
 /**
  * Attempts to move the given chunk to another shard.
@@ -75,25 +80,27 @@ const int kTooManySplitPoints = 4;
 bool tryMoveToOtherShard(OperationContext* txn,
                          const ChunkManager& manager,
                          const ChunkType& chunk) {
-    // reload sharding metadata before starting migration
-    ChunkManagerPtr chunkMgr = manager.reload(txn, false /* just reloaded in mulitsplit */);
-
-    ShardInfoMap shardInfo;
-    Status loadStatus = DistributionStatus::populateShardInfoMap(txn, &shardInfo);
-
-    if (!loadStatus.isOK()) {
-        warning() << "failed to load shard metadata while trying to moveChunk after "
-                  << "auto-splitting" << causedBy(loadStatus);
+    auto clusterStatsStatus(Balancer::get(txn)->getClusterStatistics()->getStats(txn));
+    if (!clusterStatsStatus.isOK()) {
+        warning() << "Could not get cluster statistics "
+                  << causedBy(clusterStatsStatus.getStatus());
         return false;
     }
 
-    if (shardInfo.size() < 2) {
+    const auto clusterStats(std::move(clusterStatsStatus.getValue()));
+
+    if (clusterStats.size() < 2) {
         LOG(0) << "no need to move top chunk since there's only 1 shard";
         return false;
     }
 
+    // Reload sharding metadata before starting migration. Only reload the differences though,
+    // because the entire chunk manager was reloaded during the call to split, which immediately
+    // precedes this move logic
+    shared_ptr<ChunkManager> chunkMgr = manager.reload(txn, false);
+
     map<string, vector<ChunkType>> shardToChunkMap;
-    DistributionStatus::populateShardToChunksMap(shardInfo, *chunkMgr, &shardToChunkMap);
+    DistributionStatus::populateShardToChunksMap(clusterStats, *chunkMgr, &shardToChunkMap);
 
     StatusWith<string> tagStatus =
         grid.catalogManager(txn)->getTagForChunk(txn, manager.getns(), chunk);
@@ -103,7 +110,7 @@ bool tryMoveToOtherShard(OperationContext* txn,
         return false;
     }
 
-    DistributionStatus chunkDistribution(shardInfo, shardToChunkMap);
+    DistributionStatus chunkDistribution(clusterStats, shardToChunkMap);
     const string newLocation(chunkDistribution.getBestReceieverShard(tagStatus.getValue()));
 
     if (newLocation.empty()) {
@@ -117,7 +124,7 @@ bool tryMoveToOtherShard(OperationContext* txn,
         return false;
     }
 
-    ChunkPtr toMove = chunkMgr->findIntersectingChunk(txn, chunk.getMin());
+    shared_ptr<Chunk> toMove = chunkMgr->findIntersectingChunk(txn, chunk.getMin());
 
     if (!(toMove->getMin() == chunk.getMin() && toMove->getMax() == chunk.getMax())) {
         LOG(1) << "recently split chunk: " << chunk << " modified before we could migrate "
@@ -135,13 +142,14 @@ bool tryMoveToOtherShard(OperationContext* txn,
 
     BSONObj res;
     WriteConcernOptions noThrottle;
-    if (!toMove->moveAndCommit(txn,
-                               newShard->getId(),
-                               Chunk::MaxChunkSize,
-                               &noThrottle, /* secondaryThrottle */
-                               false,       /* waitForDelete - small chunk, no need */
-                               0,           /* maxTimeMS - don't time out */
-                               res)) {
+    if (!toMove->moveAndCommit(
+            txn,
+            newShard->getId(),
+            Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes(),
+            MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kOff),
+            false, /* waitForDelete - small chunk, no need */
+            0,     /* maxTimeMS - don't time out */
+            res)) {
         msgassertedNoTrace(10412, str::stream() << "moveAndCommit failed: " << res);
     }
 
@@ -153,18 +161,11 @@ bool tryMoveToOtherShard(OperationContext* txn,
 
 }  // namespace
 
-long long Chunk::MaxChunkSize = 1024 * 1024 * 64;
-int Chunk::MaxObjectPerChunk = 250000;
-
-// Can be overridden from command line
-bool Chunk::ShouldAutoSplit = true;
-
-Chunk::Chunk(OperationContext* txn, const ChunkManager* manager, const ChunkType& from)
-    : _manager(manager), _lastmod(0, 0, OID()), _dataWritten(mkDataWritten()) {
+Chunk::Chunk(OperationContext* txn, ChunkManager* manager, const ChunkType& from)
+    : _manager(manager), _lastmod(from.getVersion()), _dataWritten(mkDataWritten()) {
     string ns = from.getNS();
     _shardId = from.getShard();
 
-    _lastmod = from.getVersion();
     verify(_lastmod.isSet());
 
     _min = from.getMin().getOwned();
@@ -179,22 +180,24 @@ Chunk::Chunk(OperationContext* txn, const ChunkManager* manager, const ChunkType
     uassert(10171, "Chunk needs a server", grid.shardRegistry()->getShard(txn, _shardId));
 }
 
-Chunk::Chunk(const ChunkManager* info,
+Chunk::Chunk(ChunkManager* info,
              const BSONObj& min,
              const BSONObj& max,
              const ShardId& shardId,
-             ChunkVersion lastmod)
+             ChunkVersion lastmod,
+             uint64_t initialDataWritten)
     : _manager(info),
       _min(min),
       _max(max),
       _shardId(shardId),
       _lastmod(lastmod),
       _jumbo(false),
-      _dataWritten(mkDataWritten()) {}
+      _dataWritten(initialDataWritten) {}
 
 int Chunk::mkDataWritten() {
     PseudoRandom r(static_cast<int64_t>(time(0)));
-    return r.nextInt32(MaxChunkSize / ChunkManager::SplitHeuristics::splitTestFactor);
+    return r.nextInt32(grid.getBalancerConfiguration()->getMaxChunkSizeBytes() /
+                       ChunkManager::SplitHeuristics::splitTestFactor);
 }
 
 bool Chunk::containsKey(const BSONObj& shardKey) const {
@@ -266,97 +269,55 @@ BSONObj Chunk::_getExtremeKey(OperationContext* txn, bool doSplitAtLower) const 
     return _manager->getShardKeyPattern().extractShardKeyFromDoc(end);
 }
 
-void Chunk::pickMedianKey(OperationContext* txn, BSONObj& medianKey) const {
-    // Ask the mongod holding this chunk to figure out the split points.
-    ScopedDbConnection conn(_getShardConnectionString(txn));
-    BSONObj result;
-    BSONObjBuilder cmd;
-    cmd.append("splitVector", _manager->getns());
-    cmd.append("keyPattern", _manager->getShardKeyPattern().toBSON());
-    cmd.append("min", getMin());
-    cmd.append("max", getMax());
-    cmd.appendBool("force", true);
-    BSONObj cmdObj = cmd.obj();
+std::vector<BSONObj> Chunk::_determineSplitPoints(OperationContext* txn, bool atMedian) const {
+    // If splitting is not obligatory we may return early if there are not enough data we cap the
+    // number of objects that would fall in the first half (before the split point) the rationale is
+    // we'll find a split point without traversing all the data.
+    vector<BSONObj> splitPoints;
 
-    if (!conn->runCommand("admin", cmdObj, result)) {
-        conn.done();
-        ostringstream os;
-        os << "splitVector command (median key) failed: " << result;
-        uassert(13503, os.str(), 0);
-    }
-
-    BSONObjIterator it(result.getObjectField("splitKeys"));
-    if (it.more()) {
-        medianKey = it.next().Obj().getOwned();
-    }
-
-    conn.done();
-}
-
-void Chunk::pickSplitVector(OperationContext* txn,
-                            vector<BSONObj>& splitPoints,
-                            long long chunkSize /* bytes */,
-                            int maxPoints,
-                            int maxObjs) const {
-    BSONObjBuilder cmd;
-    cmd.append("splitVector", _manager->getns());
-    cmd.append("keyPattern", _manager->getShardKeyPattern().toBSON());
-    cmd.append("min", getMin());
-    cmd.append("max", getMax());
-    cmd.append("maxChunkSizeBytes", chunkSize);
-    cmd.append("maxSplitPoints", maxPoints);
-    cmd.append("maxChunkObjects", maxObjs);
-    BSONObj cmdObj = cmd.obj();
-
-    const auto primaryShard = grid.shardRegistry()->getShard(txn, getShardId());
-    auto targetStatus =
-        primaryShard->getTargeter()->findHost({ReadPreference::PrimaryPreferred, TagSet{}});
-    uassertStatusOK(targetStatus);
-
-    auto result = grid.shardRegistry()->runCommand(targetStatus.getValue(), "admin", cmdObj);
-
-    uassertStatusOK(result.getStatus());
-    uassertStatusOK(Command::getStatusFromCommandResult(result.getValue()));
-
-    BSONObjIterator it(result.getValue().getObjectField("splitKeys"));
-    while (it.more()) {
-        splitPoints.push_back(it.next().Obj().getOwned());
-    }
-}
-
-void Chunk::determineSplitPoints(OperationContext* txn,
-                                 bool atMedian,
-                                 vector<BSONObj>* splitPoints) const {
-    // if splitting is not obligatory we may return early if there are not enough data
-    // we cap the number of objects that would fall in the first half (before the split point)
-    // the rationale is we'll find a split point without traversing all the data
     if (atMedian) {
-        BSONObj medianKey;
-        pickMedianKey(txn, medianKey);
-        if (!medianKey.isEmpty())
-            splitPoints->push_back(medianKey);
+        BSONObj medianKey =
+            uassertStatusOK(shardutil::selectMedianKey(txn,
+                                                       _shardId,
+                                                       NamespaceString(_manager->getns()),
+                                                       _manager->getShardKeyPattern(),
+                                                       _min,
+                                                       _max));
+        if (!medianKey.isEmpty()) {
+            splitPoints.push_back(medianKey);
+        }
     } else {
-        long long chunkSize = _manager->getCurrentDesiredChunkSize();
+        uint64_t chunkSize = _manager->getCurrentDesiredChunkSize();
 
         // Note: One split point for every 1/2 chunk size.
-        const int estNumSplitPoints = _dataWritten / chunkSize * 2;
-        if (estNumSplitPoints >= kTooManySplitPoints) {
-            // The current desired chunk size will split the chunk into lots of small chunks
-            // (At the worst case, this can result into thousands of chunks); so check and
-            // see if a bigger value can be used.
+        const uint64_t estNumSplitPoints = _dataWritten / chunkSize * 2;
 
-            chunkSize = std::min(_dataWritten, Chunk::MaxChunkSize);
+        if (estNumSplitPoints >= kTooManySplitPoints) {
+            // The current desired chunk size will split the chunk into lots of small chunk and at
+            // the worst case this can result into thousands of chunks. So check and see if a bigger
+            // value can be used.
+            chunkSize = std::min(
+                _dataWritten, Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes());
         }
 
-        pickSplitVector(txn, *splitPoints, chunkSize, 0, MaxObjectPerChunk);
-
-        if (splitPoints->size() <= 1) {
-            // no split points means there isn't enough data to split on
-            // 1 split point means we have between half the chunk size to full chunk size
-            // so we shouldn't split
-            splitPoints->clear();
+        splitPoints =
+            uassertStatusOK(shardutil::selectChunkSplitPoints(txn,
+                                                              _shardId,
+                                                              NamespaceString(_manager->getns()),
+                                                              _manager->getShardKeyPattern(),
+                                                              _min,
+                                                              _max,
+                                                              chunkSize,
+                                                              0,
+                                                              MaxObjectPerChunk));
+        if (splitPoints.size() <= 1) {
+            // No split points means there isn't enough data to split on 1 split point means we have
+            // between half the chunk size to full chunk size so we shouldn't split.
+            splitPoints.clear();
         }
     }
+
+    return splitPoints;
 }
 
 Status Chunk::split(OperationContext* txn,
@@ -369,9 +330,7 @@ Status Chunk::split(OperationContext* txn,
     }
 
     bool atMedian = mode == Chunk::atMedian;
-    vector<BSONObj> splitPoints;
-
-    determineSplitPoints(txn, atMedian, &splitPoints);
+    vector<BSONObj> splitPoints = _determineSplitPoints(txn, atMedian);
     if (splitPoints.empty()) {
         string msg;
         if (atMedian) {
@@ -442,24 +401,31 @@ Status Chunk::multiSplit(OperationContext* txn, const vector<BSONObj>& m, BSONOb
     cmd.append("from", getShardId());
     cmd.append("splitKeys", m);
     cmd.append("configdb", grid.shardRegistry()->getConfigServerConnectionString().toString());
-    cmd.append("epoch", _manager->getVersion().epoch());
-    BSONObj cmdObj = cmd.obj();
+    _manager->getVersion().appendForCommands(&cmd);
 
     BSONObj dummy;
     if (res == NULL) {
         res = &dummy;
     }
 
-    ShardConnection conn(_getShardConnectionString(txn), "");
-    if (!conn->runCommand("admin", cmdObj, *res)) {
-        string msg(str::stream() << "splitChunk failed - cmd: " << cmdObj << " result: " << *res);
-        warning() << msg;
-        conn.done();
+    BSONObj cmdObj = cmd.obj();
 
-        return Status(ErrorCodes::SplitFailed, msg);
+    Status status{ErrorCodes::NotYetInitialized, "Uninitialized"};
+
+    auto cmdStatus = Grid::get(txn)->shardRegistry()->runIdempotentCommandOnShard(
+        txn, _shardId, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, "admin", cmdObj);
+    if (cmdStatus.isOK()) {
+        *res = std::move(cmdStatus.getValue());
+        status = getStatusFromCommandResult(*res);
+    } else {
+        status = std::move(cmdStatus.getStatus());
     }
 
-    conn.done();
+    if (!status.isOK()) {
+        warning() << "splitChunk cmd " << cmdObj << " failed" << causedBy(status);
+        return {ErrorCodes::SplitFailed,
+                str::stream() << "command failed due to " << status.toString()};
+    }
 
     // force reload of config
     _manager->reload(txn);
@@ -470,74 +436,62 @@ Status Chunk::multiSplit(OperationContext* txn, const vector<BSONObj>& m, BSONOb
 bool Chunk::moveAndCommit(OperationContext* txn,
                           const ShardId& toShardId,
                           long long chunkSize /* bytes */,
-                          const WriteConcernOptions* writeConcern,
+                          const MigrationSecondaryThrottleOptions& secondaryThrottle,
                           bool waitForDelete,
                           int maxTimeMS,
                           BSONObj& res) const {
     uassert(10167, "can't move shard to its current location!", getShardId() != toShardId);
 
-    log() << "moving chunk ns: " << _manager->getns() << " moving ( " << toString() << ") "
-          << getShardId() << " -> " << toShardId;
-
     BSONObjBuilder builder;
-    builder.append("moveChunk", _manager->getns());
-    builder.append("from", _getShardConnectionString(txn).toString());
-    {
-        const auto toShard = grid.shardRegistry()->getShard(txn, toShardId);
-        builder.append("to", toShard->getConnString().toString());
-    }
-    // NEEDED FOR 2.0 COMPATIBILITY
-    builder.append("fromShard", getShardId());
-    builder.append("toShard", toShardId);
-    ///////////////////////////////
-    builder.append("min", _min);
-    builder.append("max", _max);
-    builder.append("maxChunkSizeBytes", chunkSize);
-    builder.append("configdb", grid.shardRegistry()->getConfigServerConnectionString().toString());
-
-    // For legacy secondary throttle setting.
-    bool secondaryThrottle = true;
-    if (writeConcern && writeConcern->wNumNodes <= 1 && writeConcern->wMode.empty()) {
-        secondaryThrottle = false;
-    }
-
-    builder.append("secondaryThrottle", secondaryThrottle);
-
-    if (secondaryThrottle && writeConcern) {
-        builder.append("writeConcern", writeConcern->toBSON());
-    }
-
-    builder.append("waitForDelete", waitForDelete);
+    MoveChunkRequest::appendAsCommand(&builder,
+                                      NamespaceString(_manager->getns()),
+                                      _manager->getVersion(),
+                                      grid.shardRegistry()->getConfigServerConnectionString(),
+                                      _shardId,
+                                      toShardId,
+                                      _min,
+                                      _max,
+                                      chunkSize,
+                                      secondaryThrottle,
+                                      waitForDelete);
     builder.append(LiteParsedQuery::cmdOptionMaxTimeMS, maxTimeMS);
-    builder.append("epoch", _manager->getVersion().epoch());
 
-    ShardConnection fromconn(_getShardConnectionString(txn), "");
-    bool worked = fromconn->runCommand("admin", builder.done(), res);
-    fromconn.done();
+    BSONObj cmdObj = builder.obj();
+    log() << "Moving chunk with the following arguments: " << cmdObj;
 
-    LOG(worked ? 1 : 0) << "moveChunk result: " << res;
+    Status status{ErrorCodes::NotYetInitialized, "Uninitialized"};
 
-    // if succeeded, needs to reload to pick up the new location
-    // if failed, mongos may be stale
-    // reload is excessive here as the failure could be simply because collection metadata is taken
+    auto cmdStatus = Grid::get(txn)->shardRegistry()->runIdempotentCommandOnShard(
+        txn, _shardId, ReadPreferenceSetting{ReadPreference::PrimaryOnly}, "admin", cmdObj);
+    if (!cmdStatus.isOK()) {
+        warning() << "Move chunk failed" << causedBy(cmdStatus.getStatus());
+        status = std::move(cmdStatus.getStatus());
+    } else {
+        res = std::move(cmdStatus.getValue());
+        status = getStatusFromCommandResult(res);
+        LOG(status.isOK() ? 1 : 0) << "moveChunk result: " << res;
+    }
+
+    // If succeeded we needs to reload the chunk manager in order to pick up the new location. If
+    // failed, mongos may be stale.
     _manager->reload(txn);
 
-    return worked;
+    return status.isOK();
 }
 
-bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) const {
-    dassert(ShouldAutoSplit);
+bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
     LastError::Disabled d(&LastError::get(cc()));
 
     try {
         _dataWritten += dataWritten;
-        int splitThreshold = getManager()->getCurrentDesiredChunkSize();
+        uint64_t splitThreshold = getManager()->getCurrentDesiredChunkSize();
         if (_minIsInf() || _maxIsInf()) {
-            splitThreshold = (int)((double)splitThreshold * .9);
+            splitThreshold = static_cast<uint64_t>((double)splitThreshold * 0.9);
         }
 
-        if (_dataWritten < splitThreshold / ChunkManager::SplitHeuristics::splitTestFactor)
+        if (_dataWritten < splitThreshold / ChunkManager::SplitHeuristics::splitTestFactor) {
             return false;
+        }
 
         if (!getManager()->_splitHeuristics._splitTickets.tryAcquire()) {
             LOG(1) << "won't auto split because not enough tickets: " << getManager()->getns();
@@ -545,13 +499,6 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) const {
         }
 
         TicketHolderReleaser releaser(&(getManager()->_splitHeuristics._splitTickets));
-
-        // this is a bit ugly
-        // we need it so that mongos blocks for the writes to actually be committed
-        // this does mean mongos has more back pressure than mongod alone
-        // since it nots 100% tcp queue bound
-        // this was implicit before since we did a splitVector on the same socket
-        ShardConnection::sync();
 
         LOG(1) << "about to initiate autosplit: " << *this << " dataWritten: " << _dataWritten
                << " splitThreshold: " << splitThreshold;
@@ -574,16 +521,23 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) const {
             _dataWritten = 0;
         }
 
-        bool shouldBalance = grid.getConfigShouldBalance(txn);
+        Status refreshStatus = Grid::get(txn)->getBalancerConfiguration()->refreshAndCheck(txn);
+        if (!refreshStatus.isOK()) {
+            warning() << "Unable to refresh balancer settings" << causedBy(refreshStatus);
+            return false;
+        }
+
+        bool shouldBalance = Grid::get(txn)->getBalancerConfiguration()->isBalancerActive();
         if (shouldBalance) {
-            auto status = grid.catalogManager(txn)->getCollection(txn, _manager->getns());
-            if (!status.isOK()) {
-                log() << "Auto-split for " << _manager->getns()
-                      << " failed to load collection metadata due to " << status.getStatus();
+            auto collStatus = grid.catalogManager(txn)->getCollection(txn, _manager->getns());
+            if (!collStatus.isOK()) {
+                warning() << "Auto-split for " << _manager->getns()
+                          << " failed to load collection metadata"
+                          << causedBy(collStatus.getStatus());
                 return false;
             }
 
-            shouldBalance = status.getValue().value.getAllowBalance();
+            shouldBalance = collStatus.getValue().value.getAllowBalance();
         }
 
         log() << "autosplitted " << _manager->getns() << " shard: " << toString() << " into "
@@ -610,7 +564,6 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) const {
         }
 
         return true;
-
     } catch (DBException& e) {
         // TODO: Make this better - there are lots of reasons a split could fail
         // Random so that we don't sync up with other failed splits
@@ -638,40 +591,6 @@ bool Chunk::operator==(const Chunk& s) const {
     return _min.woCompare(s._min) == 0 && _max.woCompare(s._max) == 0;
 }
 
-void Chunk::serialize(BSONObjBuilder& to, ChunkVersion myLastMod) {
-    to.append("_id", genID(_manager->getns(), _min));
-
-    if (myLastMod.isSet()) {
-        myLastMod.addToBSON(to, ChunkType::DEPRECATED_lastmod());
-    } else if (_lastmod.isSet()) {
-        _lastmod.addToBSON(to, ChunkType::DEPRECATED_lastmod());
-    } else {
-        verify(0);
-    }
-
-    to << ChunkType::ns(_manager->getns());
-    to << ChunkType::min(_min);
-    to << ChunkType::max(_max);
-    to << ChunkType::shard(_shardId);
-}
-
-string Chunk::genID() const {
-    return genID(_manager->getns(), _min);
-}
-
-string Chunk::genID(const string& ns, const BSONObj& o) {
-    StringBuilder buf;
-    buf << ns << "-";
-
-    BSONObjIterator i(o);
-    while (i.more()) {
-        BSONElement e = i.next();
-        buf << e.fieldName() << "_" << e.toString(false, true);
-    }
-
-    return buf.str();
-}
-
 string Chunk::toString() const {
     stringstream ss;
     ss << ChunkType::ns() << ": " << _manager->getns() << ", " << ChunkType::shard() << ": "
@@ -686,47 +605,17 @@ void Chunk::markAsJumbo(OperationContext* txn) const {
     // at least this mongos won't try and keep moving
     _jumbo = true;
 
-    Status result = grid.catalogManager(txn)->update(txn,
-                                                     ChunkType::ConfigNS,
-                                                     BSON(ChunkType::name(genID())),
-                                                     BSON("$set" << BSON(ChunkType::jumbo(true))),
-                                                     false,  // upsert
-                                                     false,  // multi
-                                                     NULL);
-    if (!result.isOK()) {
-        warning() << "couldn't set jumbo for chunk: " << genID() << result.reason();
+    const string chunkName = ChunkType::genID(_manager->getns(), _min);
+
+    auto status =
+        grid.catalogManager(txn)->updateConfigDocument(txn,
+                                                       ChunkType::ConfigNS,
+                                                       BSON(ChunkType::name(chunkName)),
+                                                       BSON("$set" << BSON(ChunkType::jumbo(true))),
+                                                       false);
+    if (!status.isOK()) {
+        warning() << "couldn't set jumbo for chunk: " << chunkName << causedBy(status.getStatus());
     }
-}
-
-void Chunk::refreshChunkSize(OperationContext* txn) {
-    auto chunkSizeSettingsResult =
-        grid.catalogManager(txn)->getGlobalSettings(txn, SettingsType::ChunkSizeDocKey);
-    if (!chunkSizeSettingsResult.isOK()) {
-        log() << chunkSizeSettingsResult.getStatus();
-        return;
-    }
-    SettingsType chunkSizeSettings = chunkSizeSettingsResult.getValue();
-    int csize = chunkSizeSettings.getChunkSizeMB();
-
-    LOG(1) << "Refreshing MaxChunkSize: " << csize << "MB";
-
-    if (csize != Chunk::MaxChunkSize / (1024 * 1024)) {
-        log() << "MaxChunkSize changing from " << Chunk::MaxChunkSize / (1024 * 1024) << "MB"
-              << " to " << csize << "MB";
-    }
-
-    if (!setMaxChunkSizeSizeMB(csize)) {
-        warning() << "invalid MaxChunkSize: " << csize;
-    }
-}
-
-bool Chunk::setMaxChunkSizeSizeMB(int newMaxChunkSize) {
-    if (newMaxChunkSize < 1)
-        return false;
-    if (newMaxChunkSize > 1024)
-        return false;
-    MaxChunkSize = newMaxChunkSize * 1024 * 1024;
-    return true;
 }
 
 }  // namespace mongo

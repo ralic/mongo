@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -39,7 +39,7 @@ err:		__wt_free(session, dlh->name);
  */
 int
 __wt_dlsym(WT_SESSION_IMPL *session,
-    WT_DLH *dlh, const char *name, int fail, void *sym_ret)
+    WT_DLH *dlh, const char *name, bool fail, void *sym_ret)
 {
 	void *sym;
 

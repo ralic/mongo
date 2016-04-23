@@ -11,20 +11,20 @@ var conn;
 var primeSystemReplset = function() {
     conn = MongoRunner.runMongod();
     var localDB = conn.getDB("local");
-    localDB.system.replset.insert({x:1});
+    localDB.system.replset.insert({x: 1});
 
     print("create a TTL collection");
     var testDB = conn.getDB("test");
-    assert.commandWorked(testDB.foo.ensureIndex({ x: 1 }, { expireAfterSeconds: 2 }));
+    assert.commandWorked(testDB.foo.ensureIndex({x: 1}, {expireAfterSeconds: 2}));
 };
 
 var restartWithConfig = function() {
     MongoRunner.stopMongod(conn.port, 15);
-    conn = MongoRunner.runMongod({restart:true, cleanData: false, dbpath: conn.dbpath});
+    conn = MongoRunner.runMongod({restart: true, cleanData: false, dbpath: conn.dbpath});
     testDB = conn.getDB("test");
     var n = 100;
-    for (var i=0; i<n; i++) {
-        testDB.foo.insert({x : new Date()});
+    for (var i = 0; i < n; i++) {
+        testDB.foo.insert({x: new Date()});
     }
 
     print("sleeping 65 seconds");
@@ -39,11 +39,11 @@ var restartWithoutConfig = function() {
 
     MongoRunner.stopMongod(conn.port, 15);
 
-    conn = MongoRunner.runMongod({restart:true, cleanData: false, dbpath: conn.dbpath});
+    conn = MongoRunner.runMongod({restart: true, cleanData: false, dbpath: conn.dbpath});
 
     assert.soon(function() {
         return conn.getDB("test").foo.count() < 100;
-    }, "never deleted", 65000);
+    }, "never deleted", 75000);
 
     MongoRunner.stopMongod(conn.port, 15);
 };
@@ -51,7 +51,7 @@ var restartWithoutConfig = function() {
 print("Create a TTL collection and put doc in local.system.replset");
 primeSystemReplset();
 
-print("make sure TTL doesn't work when member is started with system.replset doc")
+print("make sure TTL doesn't work when member is started with system.replset doc");
 restartWithConfig();
 
 print("remove system.replset entry & restart");

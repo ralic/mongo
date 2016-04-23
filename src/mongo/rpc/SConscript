@@ -24,10 +24,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on validation in a strange way right now
-        'incomplete'
+        '$BUILD_DIR/mongo/db/server_options_core',
     ],
 )
 
@@ -41,6 +38,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/db/service_context',
     ],
 )
 
@@ -76,10 +74,6 @@ env.Library(
         'document_range',
         '$BUILD_DIR/mongo/util/net/network',
     ],
-    LIBDEPS_TAGS=[
-        # Circular with rpc because it needs object_check.cpp
-        'incomplete'
-    ],
 )
 
 env.Library(
@@ -111,10 +105,6 @@ env.Library(
         'document_range',
         '$BUILD_DIR/mongo/util/net/network',
     ],
-    LIBDEPS_TAGS=[
-        # Circular with rpc because it needs object_check.cpp
-        'incomplete'
-    ],
 )
 
 env.Library(
@@ -126,6 +116,7 @@ env.Library(
         'legacy_reply_builder.cpp'
     ],
     LIBDEPS=[
+        'command_reply',
         'document_range',
         'metadata',
         '$BUILD_DIR/mongo/util/net/network',
@@ -139,6 +130,7 @@ env.Library(
     source=[
         'metadata.cpp',
         'metadata/audit_metadata.cpp',
+        'metadata/config_server_metadata.cpp',
         'metadata/server_selection_metadata.cpp',
         'metadata/sharding_metadata.cpp',
         'metadata/repl_set_metadata.cpp',
@@ -154,7 +146,7 @@ env.Library(
 
 env.CppUnitTest(
     target=[
-        'metadata_test',
+        'rpc_metadata_test',
     ],
     source=[
         'metadata/server_selection_metadata_test.cpp',
@@ -180,7 +172,8 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'rpc',
-        '$BUILD_DIR/mongo/client/clientdriver'
+        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/db/write_concern_options',
     ],
 )
 
@@ -192,3 +185,10 @@ env.CppUnitTest(
     LIBDEPS=['metadata']
 )
 
+env.CppUnitTest(
+    target='config_server_metadata_test',
+    source=[
+        'metadata/config_server_metadata_test.cpp',
+    ],
+    LIBDEPS=['metadata']
+)

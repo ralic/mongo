@@ -36,6 +36,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/fill_locker_info.h"
@@ -114,7 +115,7 @@ private:
 
             tablecell(ss, curOp->elapsedSeconds());
 
-            tablecell(ss, curOp->getOp());
+            tablecell(ss, curOp->getNetworkOp());
             tablecell(ss, html::escape(curOp->getNS()));
 
             if (curOp->haveQuery()) {
@@ -139,7 +140,8 @@ class CurrentOpContexts : public Command {
 public:
     CurrentOpContexts() : Command("currentOpCtx") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -166,8 +168,8 @@ public:
              BSONObjBuilder& result) {
         unique_ptr<MatchExpression> filter;
         if (cmdObj["filter"].isABSONObj()) {
-            StatusWithMatchExpression statusWithMatcher =
-                MatchExpressionParser::parse(cmdObj["filter"].Obj());
+            StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
+                cmdObj["filter"].Obj(), ExtensionsCallbackDisallowExtensions());
             if (!statusWithMatcher.isOK()) {
                 return appendCommandStatus(result, statusWithMatcher.getStatus());
             }

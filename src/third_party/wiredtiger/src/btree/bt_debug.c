@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -19,7 +19,7 @@ typedef struct {
 	 * When using the standard event handlers, the debugging output has to
 	 * do its own message handling because its output isn't line-oriented.
 	 */
-	FILE		*fp;			/* Output file stream */
+	WT_FH		*fh;			/* Output file stream */
 	WT_ITEM		*msg;			/* Buffered message */
 
 	WT_ITEM		*tmp;			/* Temporary space */
@@ -31,7 +31,7 @@ static const					/* Output separator */
 static int  __debug_cell(WT_DBG *, const WT_PAGE_HEADER *, WT_CELL_UNPACK *);
 static int  __debug_cell_data(
 	WT_DBG *, WT_PAGE *, int type, const char *, WT_CELL_UNPACK *);
-static void __debug_col_skip(WT_DBG *, WT_INSERT_HEAD *, const char *, int);
+static void __debug_col_skip(WT_DBG *, WT_INSERT_HEAD *, const char *, bool);
 static int  __debug_config(WT_SESSION_IMPL *, WT_DBG *, const char *);
 static int  __debug_dsk_cell(WT_DBG *, const WT_PAGE_HEADER *);
 static void __debug_dsk_col_fix(WT_DBG *, const WT_PAGE_HEADER *);
@@ -43,10 +43,11 @@ static int  __debug_page_col_var(WT_DBG *, WT_PAGE *);
 static int  __debug_page_metadata(WT_DBG *, WT_PAGE *);
 static int  __debug_page_row_int(WT_DBG *, WT_PAGE *, uint32_t);
 static int  __debug_page_row_leaf(WT_DBG *, WT_PAGE *);
-static int  __debug_ref(WT_DBG *, WT_REF *);
+static void __debug_ref(WT_DBG *, WT_REF *);
 static void __debug_row_skip(WT_DBG *, WT_INSERT_HEAD *);
-static int  __debug_tree(WT_SESSION_IMPL *, WT_PAGE *, const char *, uint32_t);
-static void __debug_update(WT_DBG *, WT_UPDATE *, int);
+static int  __debug_tree(
+	WT_SESSION_IMPL *, WT_BTREE *, WT_PAGE *, const char *, uint32_t);
+static void __debug_update(WT_DBG *, WT_UPDATE *, bool);
 static void __dmsg(WT_DBG *, const char *, ...)
 	WT_GCC_FUNC_DECL_ATTRIBUTE((format (printf, 2, 3)));
 static void __dmsg_wrapup(WT_DBG *);
@@ -73,9 +74,7 @@ __wt_debug_set_verbose(WT_SESSION_IMPL *session, const char *v)
 static inline void
 __debug_hex_byte(WT_DBG *ds, uint8_t v)
 {
-	static const char hex[] = "0123456789abcdef";
-
-	__dmsg(ds, "#%c%c", hex[(v & 0xf0) >> 4], hex[v & 0x0f]);
+	__dmsg(ds, "#%c%c", __wt_hex[(v & 0xf0) >> 4], __wt_hex[v & 0x0f]);
 }
 
 /*
@@ -98,11 +97,8 @@ __debug_config(WT_SESSION_IMPL *session, WT_DBG *ds, const char *ofile)
 	if (ofile == NULL)
 		return (__wt_scr_alloc(session, 512, &ds->msg));
 
-	/* If we're using a file, flush on each line. */
-	WT_RET(__wt_fopen(session, ofile, WT_FHANDLE_WRITE, 0, &ds->fp));
-
-	(void)setvbuf(ds->fp, NULL, _IOLBF, 0);
-	return (0);
+	return (__wt_open(session, ofile, WT_FILE_TYPE_REGULAR,
+	    WT_OPEN_CREATE | WT_STREAM_LINE_BUFFER | WT_STREAM_WRITE, &ds->fh));
 }
 
 /*
@@ -131,7 +127,7 @@ __dmsg_wrapup(WT_DBG *ds)
 	}
 
 	/* Close any file we opened. */
-	(void)__wt_fclose(&ds->fp, WT_FHANDLE_WRITE);
+	(void)__wt_close(session, &ds->fh);
 }
 
 /*
@@ -156,7 +152,7 @@ __dmsg(WT_DBG *ds, const char *fmt, ...)
 	 * the output chunk, and pass it to the event handler once we see a
 	 * terminating newline.
 	 */
-	if (ds->fp == NULL) {
+	if (ds->fh == NULL) {
 		msg = ds->msg;
 		for (;;) {
 			p = (char *)msg->mem + msg->size;
@@ -188,7 +184,7 @@ __dmsg(WT_DBG *ds, const char *fmt, ...)
 		}
 	} else {
 		va_start(ap, fmt);
-		(void)__wt_vfprintf(ds->fp, fmt, ap);
+		(void)__wt_vfprintf(session, ds->fh, fmt, ap);
 		va_end(ap);
 	}
 }
@@ -205,7 +201,7 @@ __wt_debug_addr_print(
 	WT_DECL_RET;
 
 	WT_RET(__wt_scr_alloc(session, 128, &buf));
-	ret = __wt_fprintf(stderr,
+	ret = __wt_fprintf(session, WT_STDERR(session),
 	    "%s\n", __wt_addr_string(session, addr, addr_size, buf));
 	__wt_scr_free(session, &buf);
 
@@ -223,6 +219,8 @@ __wt_debug_addr(WT_SESSION_IMPL *session,
 	WT_BM *bm;
 	WT_DECL_ITEM(buf);
 	WT_DECL_RET;
+
+	WT_ASSERT(session, S2BT_SAFE(session) != NULL);
 
 	bm = S2BT(session)->bm;
 
@@ -244,6 +242,8 @@ __wt_debug_offset_blind(
 {
 	WT_DECL_ITEM(buf);
 	WT_DECL_RET;
+
+	WT_ASSERT(session, S2BT_SAFE(session) != NULL);
 
 	/*
 	 * This routine depends on the default block manager's view of files,
@@ -273,6 +273,8 @@ __wt_debug_offset(WT_SESSION_IMPL *session,
 	WT_DECL_ITEM(buf);
 	WT_DECL_RET;
 	uint8_t addr[WT_BTREE_MAX_ADDR_COOKIE], *endp;
+
+	WT_ASSERT(session, S2BT_SAFE(session) != NULL);
 
 	/*
 	 * This routine depends on the default block manager's view of files,
@@ -340,6 +342,8 @@ __wt_debug_disk(
 		__dmsg(ds, ", empty-all");
 	if (F_ISSET(dsk, WT_PAGE_EMPTY_V_NONE))
 		__dmsg(ds, ", empty-none");
+	if (F_ISSET(dsk, WT_PAGE_LAS_UPDATE))
+		__dmsg(ds, ", LAS-update");
 
 	__dmsg(ds, ", generation %" PRIu64 "\n", dsk->write_gen);
 
@@ -375,6 +379,8 @@ __debug_dsk_col_fix(WT_DBG *ds, const WT_PAGE_HEADER *dsk)
 	uint32_t i;
 	uint8_t v;
 
+	WT_ASSERT(ds->session, S2BT_SAFE(ds->session) != NULL);
+
 	btree = S2BT(ds->session);
 
 	WT_FIX_FOREACH(btree, dsk, v, i) {
@@ -395,6 +401,8 @@ __debug_dsk_cell(WT_DBG *ds, const WT_PAGE_HEADER *dsk)
 	WT_CELL *cell;
 	WT_CELL_UNPACK *unpack, _unpack;
 	uint32_t i;
+
+	WT_ASSERT(ds->session, S2BT_SAFE(ds->session) != NULL);
 
 	btree = S2BT(ds->session);
 	unpack = &_unpack;
@@ -463,6 +471,8 @@ __wt_debug_tree_shape(
 {
 	WT_DBG *ds, _ds;
 
+	WT_ASSERT(session, S2BT_SAFE(session) != NULL);
+
 	ds = &_ds;
 	WT_RET(__debug_config(session, ds, ofile));
 
@@ -482,22 +492,30 @@ __wt_debug_tree_shape(
 /*
  * __wt_debug_tree_all --
  *	Dump the in-memory information for a tree, including leaf pages.
+ *	Takes an explicit btree as an argument, as one may not yet be set on
+ *	the session. This is often the case as this function will be called
+ *	from within a debugger, which makes setting a btree complicated.
  */
 int
-__wt_debug_tree_all(WT_SESSION_IMPL *session, WT_PAGE *page, const char *ofile)
+__wt_debug_tree_all(
+    WT_SESSION_IMPL *session, WT_BTREE *btree, WT_PAGE *page, const char *ofile)
 {
-	return (__debug_tree(
-	    session, page, ofile, WT_DEBUG_TREE_LEAF | WT_DEBUG_TREE_WALK));
+	return (__debug_tree(session,
+	    btree, page, ofile, WT_DEBUG_TREE_LEAF | WT_DEBUG_TREE_WALK));
 }
 
 /*
  * __wt_debug_tree --
  *	Dump the in-memory information for a tree, not including leaf pages.
+ *	Takes an explicit btree as an argument, as one may not yet be set on
+ *	the session. This is often the case as this function will be called
+ *	from within a debugger, which makes setting a btree complicated.
  */
 int
-__wt_debug_tree(WT_SESSION_IMPL *session, WT_PAGE *page, const char *ofile)
+__wt_debug_tree(
+    WT_SESSION_IMPL *session, WT_BTREE *btree, WT_PAGE *page, const char *ofile)
 {
-	return (__debug_tree(session, page, ofile, WT_DEBUG_TREE_WALK));
+	return (__debug_tree(session, btree, page, ofile, WT_DEBUG_TREE_WALK));
 }
 
 /*
@@ -509,6 +527,8 @@ __wt_debug_page(WT_SESSION_IMPL *session, WT_PAGE *page, const char *ofile)
 {
 	WT_DBG *ds, _ds;
 	WT_DECL_RET;
+
+	WT_ASSERT(session, S2BT_SAFE(session) != NULL);
 
 	ds = &_ds;
 	WT_RET(__debug_config(session, ds, ofile));
@@ -522,11 +542,16 @@ __wt_debug_page(WT_SESSION_IMPL *session, WT_PAGE *page, const char *ofile)
 
 /*
  * __debug_tree --
- *	Dump the in-memory information for a tree.
+ *	Dump the in-memory information for a tree. Takes an explicit btree
+ *	as an argument, as one may not be set on the session. This is often
+ *	the case as this function will be called from within a debugger, which
+ *	makes setting a btree complicated. We mark the session to the btree
+ *	in this function
  */
 static int
 __debug_tree(
-    WT_SESSION_IMPL *session, WT_PAGE *page, const char *ofile, uint32_t flags)
+    WT_SESSION_IMPL *session, WT_BTREE *btree,
+    WT_PAGE *page, const char *ofile, uint32_t flags)
 {
 	WT_DBG *ds, _ds;
 	WT_DECL_RET;
@@ -536,9 +561,9 @@ __debug_tree(
 
 	/* A NULL page starts at the top of the tree -- it's a convenience. */
 	if (page == NULL)
-		page = S2BT(session)->root.page;
+		page = btree->root.page;
 
-	ret = __debug_page(ds, page, flags);
+	WT_WITH_BTREE(session, btree, ret = __debug_page(ds, page, flags));
 
 	__dmsg_wrapup(ds);
 
@@ -634,7 +659,10 @@ __debug_page_metadata(WT_DBG *ds, WT_PAGE *page)
 
 	__dmsg(ds, ": %s\n", __wt_page_type_string(page->type));
 	__dmsg(ds, "\t" "disk %p, entries %" PRIu32, page->dsk, entries);
-	__dmsg(ds, "%s", __wt_page_is_modified(page) ? ", dirty" : ", clean");
+	__dmsg(ds, ", %s", __wt_page_is_modified(page) ? "dirty" : "clean");
+	__dmsg(ds, ", %s", __wt_fair_islocked(
+	    session, &page->page_lock) ? "locked" : "unlocked");
+
 	if (F_ISSET_ATOMIC(page, WT_PAGE_BUILD_KEYS))
 		__dmsg(ds, ", keys-built");
 	if (F_ISSET_ATOMIC(page, WT_PAGE_DISK_ALLOC))
@@ -643,15 +671,17 @@ __debug_page_metadata(WT_DBG *ds, WT_PAGE *page)
 		__dmsg(ds, ", disk-mapped");
 	if (F_ISSET_ATOMIC(page, WT_PAGE_EVICT_LRU))
 		__dmsg(ds, ", evict-lru");
-	if (F_ISSET_ATOMIC(page, WT_PAGE_SCANNING))
-		__dmsg(ds, ", scanning");
+	if (F_ISSET_ATOMIC(page, WT_PAGE_OVERFLOW_KEYS))
+		__dmsg(ds, ", overflow-keys");
+	if (F_ISSET_ATOMIC(page, WT_PAGE_SPLIT_BLOCK))
+		__dmsg(ds, ", split-block");
 	if (F_ISSET_ATOMIC(page, WT_PAGE_SPLIT_INSERT))
 		__dmsg(ds, ", split-insert");
-	if (F_ISSET_ATOMIC(page, WT_PAGE_SPLIT_LOCKED))
-		__dmsg(ds, ", split-locked");
+	if (F_ISSET_ATOMIC(page, WT_PAGE_UPDATE_IGNORE))
+		__dmsg(ds, ", update-ignore");
 
 	if (mod != NULL)
-		switch (F_ISSET(mod, WT_PM_REC_MASK)) {
+		switch (mod->rec_result) {
 		case WT_PM_REC_EMPTY:
 			__dmsg(ds, ", empty");
 			break;
@@ -660,9 +690,6 @@ __debug_page_metadata(WT_DBG *ds, WT_PAGE *page)
 			break;
 		case WT_PM_REC_REPLACE:
 			__dmsg(ds, ", replaced");
-			break;
-		case WT_PM_REC_REWRITE:
-			__dmsg(ds, ", rewrite");
 			break;
 		case 0:
 			break;
@@ -690,6 +717,8 @@ __debug_page_col_fix(WT_DBG *ds, WT_PAGE *page)
 	uint32_t i;
 	uint8_t v;
 
+	WT_ASSERT(ds->session, S2BT_SAFE(ds->session) != NULL);
+
 	session = ds->session;
 	btree = S2BT(session);
 	dsk = page->dsk;
@@ -707,7 +736,7 @@ __debug_page_col_fix(WT_DBG *ds, WT_PAGE *page)
 				__dmsg(ds,
 				    "\tupdate %" PRIu64 "\n",
 				    WT_INSERT_RECNO(ins));
-				__debug_update(ds, ins->upd, 1);
+				__debug_update(ds, ins->upd, true);
 				ins = WT_SKIP_NEXT(ins);
 			}
 			++recno;
@@ -716,11 +745,12 @@ __debug_page_col_fix(WT_DBG *ds, WT_PAGE *page)
 
 	if (WT_COL_UPDATE_SINGLE(page) != NULL) {
 		__dmsg(ds, "%s", sep);
-		__debug_col_skip(ds, WT_COL_UPDATE_SINGLE(page), "update", 1);
+		__debug_col_skip(
+		    ds, WT_COL_UPDATE_SINGLE(page), "update", true);
 	}
 	if (WT_COL_APPEND(page) != NULL) {
 		__dmsg(ds, "%s", sep);
-		__debug_col_skip(ds, WT_COL_APPEND(page), "append", 1);
+		__debug_col_skip(ds, WT_COL_APPEND(page), "append", true);
 	}
 }
 
@@ -738,7 +768,7 @@ __debug_page_col_int(WT_DBG *ds, WT_PAGE *page, uint32_t flags)
 
 	WT_INTL_FOREACH_BEGIN(session, page, ref) {
 		__dmsg(ds, "\trecno %" PRIu64 "\n", ref->key.recno);
-		WT_RET(__debug_ref(ds, ref));
+		__debug_ref(ds, ref);
 	} WT_INTL_FOREACH_END;
 
 	if (LF_ISSET(WT_DEBUG_TREE_WALK))
@@ -783,13 +813,13 @@ __debug_page_col_var(WT_DBG *ds, WT_PAGE *page)
 		    __debug_cell_data(ds, page, WT_PAGE_COL_VAR, tag, unpack));
 
 		if ((update = WT_COL_UPDATE(page, cip)) != NULL)
-			__debug_col_skip(ds, update, "update", 0);
+			__debug_col_skip(ds, update, "update", false);
 		recno += rle;
 	}
 
 	if (WT_COL_APPEND(page) != NULL) {
 		__dmsg(ds, "%s", sep);
-		__debug_col_skip(ds, WT_COL_APPEND(page), "append", 0);
+		__debug_col_skip(ds, WT_COL_APPEND(page), "append", false);
 	}
 
 	return (0);
@@ -812,7 +842,7 @@ __debug_page_row_int(WT_DBG *ds, WT_PAGE *page, uint32_t flags)
 	WT_INTL_FOREACH_BEGIN(session, page, ref) {
 		__wt_ref_key(page, ref, &p, &len);
 		__debug_item(ds, "K", p, len);
-		WT_RET(__debug_ref(ds, ref));
+		__debug_ref(ds, ref);
 	} WT_INTL_FOREACH_END;
 
 	if (LF_ISSET(WT_DEBUG_TREE_WALK))
@@ -855,7 +885,7 @@ __debug_page_row_leaf(WT_DBG *ds, WT_PAGE *page)
 
 	/* Dump the page's K/V pairs. */
 	WT_ROW_FOREACH(page, rip, i) {
-		WT_RET(__wt_row_leaf_key(session, page, rip, key, 0));
+		WT_RET(__wt_row_leaf_key(session, page, rip, key, false));
 		__debug_item(ds, "K", key->data, key->size);
 
 		if ((cell = __wt_row_leaf_value_cell(page, rip, NULL)) == NULL)
@@ -867,7 +897,7 @@ __debug_page_row_leaf(WT_DBG *ds, WT_PAGE *page)
 		}
 
 		if ((upd = WT_ROW_UPDATE(page, rip)) != NULL)
-			__debug_update(ds, upd, 0);
+			__debug_update(ds, upd, false);
 
 		if ((insert = WT_ROW_INSERT(page, rip)) != NULL)
 			__debug_row_skip(ds, insert);
@@ -882,7 +912,8 @@ err:	__wt_scr_free(session, &key);
  *	Dump a column-store skiplist.
  */
 static void
-__debug_col_skip(WT_DBG *ds, WT_INSERT_HEAD *head, const char *tag, int hexbyte)
+__debug_col_skip(
+    WT_DBG *ds, WT_INSERT_HEAD *head, const char *tag, bool hexbyte)
 {
 	WT_INSERT *ins;
 
@@ -905,7 +936,7 @@ __debug_row_skip(WT_DBG *ds, WT_INSERT_HEAD *head)
 	WT_SKIP_FOREACH(ins, head) {
 		__debug_item(ds,
 		    "insert", WT_INSERT_KEY(ins), WT_INSERT_KEY_SIZE(ins));
-		__debug_update(ds, ins->upd, 0);
+		__debug_update(ds, ins->upd, false);
 	}
 }
 
@@ -914,7 +945,7 @@ __debug_row_skip(WT_DBG *ds, WT_INSERT_HEAD *head)
  *	Dump an update list.
  */
 static void
-__debug_update(WT_DBG *ds, WT_UPDATE *upd, int hexbyte)
+__debug_update(WT_DBG *ds, WT_UPDATE *upd, bool hexbyte)
 {
 	for (; upd != NULL; upd = upd->next)
 		if (WT_UPDATE_DELETED_ISSET(upd))
@@ -933,7 +964,7 @@ __debug_update(WT_DBG *ds, WT_UPDATE *upd, int hexbyte)
  * __debug_ref --
  *	Dump a WT_REF structure.
  */
-static int
+static void
 __debug_ref(WT_DBG *ds, WT_REF *ref)
 {
 	WT_SESSION_IMPL *session;
@@ -962,14 +993,14 @@ __debug_ref(WT_DBG *ds, WT_REF *ref)
 	case WT_REF_SPLIT:
 		__dmsg(ds, "split");
 		break;
-	WT_ILLEGAL_VALUE(session);
+	default:
+		__dmsg(ds, "INVALID");
+		break;
 	}
 
-	WT_RET(__wt_ref_info(session, ref, &addr, &addr_size, NULL));
+	__wt_ref_info(ref, &addr, &addr_size, NULL);
 	__dmsg(ds, " %s\n",
 	    __wt_addr_string(session, addr, addr_size, ds->tmp));
-
-	return (0);
 }
 
 /*

@@ -31,6 +31,7 @@
 #include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/rpc/metadata.h"
 
 namespace mongo {
@@ -45,22 +46,31 @@ namespace {
 const char kLastOpCommittedFieldName[] = "lastOpCommitted";
 const char kLastOpVisibleFieldName[] = "lastOpVisible";
 const char kConfigVersionFieldName[] = "configVersion";
+const char kReplicaSetIdFieldName[] = "replicaSetId";
 const char kPrimaryIndexFieldName[] = "primaryIndex";
-const char kTimestampFieldName[] = "ts";
+const char kSyncSourceIndexFieldName[] = "syncSourceIndex";
 const char kTermFieldName[] = "term";
 
 }  // unnamed namespace
+
+#ifndef _MSC_EXTENSIONS
+const int ReplSetMetadata::kNoPrimary;
+#endif  // _MSC_EXTENSIONS
 
 ReplSetMetadata::ReplSetMetadata(long long term,
                                  OpTime committedOpTime,
                                  OpTime visibleOpTime,
                                  long long configVersion,
-                                 int currentPrimaryIndex)
+                                 OID id,
+                                 int currentPrimaryIndex,
+                                 int currentSyncSourceIndex)
     : _lastOpCommitted(std::move(committedOpTime)),
       _lastOpVisible(std::move(visibleOpTime)),
       _currentTerm(term),
       _configVersion(configVersion),
-      _currentPrimaryIndex(currentPrimaryIndex) {}
+      _replicaSetId(id),
+      _currentPrimaryIndex(currentPrimaryIndex),
+      _currentSyncSourceIndex(currentSyncSourceIndex) {}
 
 StatusWith<ReplSetMetadata> ReplSetMetadata::readFromMetadata(const BSONObj& metadataObj) {
     BSONElement replMetadataElement;
@@ -76,8 +86,18 @@ StatusWith<ReplSetMetadata> ReplSetMetadata::readFromMetadata(const BSONObj& met
     if (!status.isOK())
         return status;
 
+    OID id;
+    status = bsonExtractOIDFieldWithDefault(replMetadataObj, kReplicaSetIdFieldName, OID(), &id);
+    if (!status.isOK())
+        return status;
+
     long long primaryIndex;
     status = bsonExtractIntegerField(replMetadataObj, kPrimaryIndexFieldName, &primaryIndex);
+    if (!status.isOK())
+        return status;
+
+    long long syncSourceIndex;
+    status = bsonExtractIntegerField(replMetadataObj, kSyncSourceIndexFieldName, &syncSourceIndex);
     if (!status.isOK())
         return status;
 
@@ -96,26 +116,19 @@ StatusWith<ReplSetMetadata> ReplSetMetadata::readFromMetadata(const BSONObj& met
     if (!status.isOK())
         return status;
 
-    return ReplSetMetadata(term, lastOpCommitted, lastOpVisible, configVersion, primaryIndex);
+    return ReplSetMetadata(
+        term, lastOpCommitted, lastOpVisible, configVersion, id, primaryIndex, syncSourceIndex);
 }
 
 Status ReplSetMetadata::writeToMetadata(BSONObjBuilder* builder) const {
     BSONObjBuilder replMetadataBuilder(builder->subobjStart(kReplSetMetadataFieldName));
     replMetadataBuilder.append(kTermFieldName, _currentTerm);
-
-    BSONObjBuilder lastOpCommittedBuilder(
-        replMetadataBuilder.subobjStart(kLastOpCommittedFieldName));
-    lastOpCommittedBuilder.append(kTimestampFieldName, _lastOpCommitted.getTimestamp());
-    lastOpCommittedBuilder.append(kTermFieldName, _lastOpCommitted.getTerm());
-    lastOpCommittedBuilder.doneFast();
-
-    BSONObjBuilder lastOpVisibleBuilder(replMetadataBuilder.subobjStart(kLastOpVisibleFieldName));
-    lastOpVisibleBuilder.append(kTimestampFieldName, _lastOpVisible.getTimestamp());
-    lastOpVisibleBuilder.append(kTermFieldName, _lastOpVisible.getTerm());
-    lastOpVisibleBuilder.doneFast();
-
+    _lastOpCommitted.append(&replMetadataBuilder, kLastOpCommittedFieldName);
+    _lastOpVisible.append(&replMetadataBuilder, kLastOpVisibleFieldName);
     replMetadataBuilder.append(kConfigVersionFieldName, _configVersion);
+    replMetadataBuilder.append(kReplicaSetIdFieldName, _replicaSetId);
     replMetadataBuilder.append(kPrimaryIndexFieldName, _currentPrimaryIndex);
+    replMetadataBuilder.append(kSyncSourceIndexFieldName, _currentSyncSourceIndex);
     replMetadataBuilder.doneFast();
 
     return Status::OK();

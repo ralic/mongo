@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -11,13 +11,13 @@
  *	Search a column-store insert list for the next larger record.
  */
 static inline WT_INSERT *
-__col_insert_search_gt(WT_INSERT_HEAD *inshead, uint64_t recno)
+__col_insert_search_gt(WT_INSERT_HEAD *ins_head, uint64_t recno)
 {
 	WT_INSERT *ins, **insp;
 	int i;
 
 	/* If there's no insert chain to search, we're done. */
-	if ((ins = WT_SKIP_LAST(inshead)) == NULL)
+	if ((ins = WT_SKIP_LAST(ins_head)) == NULL)
 		return (NULL);
 
 	/* Fast path check for targets past the end of the skiplist. */
@@ -29,7 +29,7 @@ __col_insert_search_gt(WT_INSERT_HEAD *inshead, uint64_t recno)
 	 * go as far as possible at each level before stepping down to the next.
 	 */
 	ins = NULL;
-	for (i = WT_SKIP_MAXDEPTH - 1, insp = &inshead->head[i]; i >= 0;)
+	for (i = WT_SKIP_MAXDEPTH - 1, insp = &ins_head->head[i]; i >= 0;)
 		if (*insp != NULL && recno >= WT_INSERT_RECNO(*insp)) {
 			ins = *insp;	/* GTE: keep going at this level */
 			insp = &(*insp)->next[i];
@@ -50,7 +50,7 @@ __col_insert_search_gt(WT_INSERT_HEAD *inshead, uint64_t recno)
 	 * such a record exists before searching.
 	 */
 	if (ins == NULL)
-		ins = WT_SKIP_FIRST(inshead);
+		ins = WT_SKIP_FIRST(ins_head);
 	while (recno >= WT_INSERT_RECNO(ins))
 		ins = WT_SKIP_NEXT(ins);
 	return (ins);
@@ -61,13 +61,13 @@ __col_insert_search_gt(WT_INSERT_HEAD *inshead, uint64_t recno)
  *	Search a column-store insert list for the next smaller record.
  */
 static inline WT_INSERT *
-__col_insert_search_lt(WT_INSERT_HEAD *inshead, uint64_t recno)
+__col_insert_search_lt(WT_INSERT_HEAD *ins_head, uint64_t recno)
 {
 	WT_INSERT *ins, **insp;
 	int i;
 
 	/* If there's no insert chain to search, we're done. */
-	if ((ins = WT_SKIP_FIRST(inshead)) == NULL)
+	if ((ins = WT_SKIP_FIRST(ins_head)) == NULL)
 		return (NULL);
 
 	/* Fast path check for targets before the skiplist. */
@@ -78,7 +78,7 @@ __col_insert_search_lt(WT_INSERT_HEAD *inshead, uint64_t recno)
 	 * The insert list is a skip list: start at the highest skip level, then
 	 * go as far as possible at each level before stepping down to the next.
 	 */
-	for (i = WT_SKIP_MAXDEPTH - 1, insp = &inshead->head[i]; i >= 0;)
+	for (i = WT_SKIP_MAXDEPTH - 1, insp = &ins_head->head[i]; i >= 0;)
 		if (*insp != NULL && recno > WT_INSERT_RECNO(*insp)) {
 			ins = *insp;	/* GT: keep going at this level */
 			insp = &(*insp)->next[i];
@@ -95,14 +95,14 @@ __col_insert_search_lt(WT_INSERT_HEAD *inshead, uint64_t recno)
  *	Search a column-store insert list for an exact match.
  */
 static inline WT_INSERT *
-__col_insert_search_match(WT_INSERT_HEAD *inshead, uint64_t recno)
+__col_insert_search_match(WT_INSERT_HEAD *ins_head, uint64_t recno)
 {
 	WT_INSERT **insp, *ret_ins;
 	uint64_t ins_recno;
 	int cmp, i;
 
 	/* If there's no insert chain to search, we're done. */
-	if ((ret_ins = WT_SKIP_LAST(inshead)) == NULL)
+	if ((ret_ins = WT_SKIP_LAST(ins_head)) == NULL)
 		return (NULL);
 
 	/* Fast path the check for values at the end of the skiplist. */
@@ -115,7 +115,7 @@ __col_insert_search_match(WT_INSERT_HEAD *inshead, uint64_t recno)
 	 * The insert list is a skip list: start at the highest skip level, then
 	 * go as far as possible at each level before stepping down to the next.
 	 */
-	for (i = WT_SKIP_MAXDEPTH - 1, insp = &inshead->head[i]; i >= 0; ) {
+	for (i = WT_SKIP_MAXDEPTH - 1, insp = &ins_head->head[i]; i >= 0; ) {
 		if (*insp == NULL) {
 			--i;
 			--insp;
@@ -143,7 +143,7 @@ __col_insert_search_match(WT_INSERT_HEAD *inshead, uint64_t recno)
  *	Search a column-store insert list, creating a skiplist stack as we go.
  */
 static inline WT_INSERT *
-__col_insert_search(WT_INSERT_HEAD *inshead,
+__col_insert_search(WT_INSERT_HEAD *ins_head,
     WT_INSERT ***ins_stack, WT_INSERT **next_stack, uint64_t recno)
 {
 	WT_INSERT **insp, *ret_ins;
@@ -151,15 +151,15 @@ __col_insert_search(WT_INSERT_HEAD *inshead,
 	int cmp, i;
 
 	/* If there's no insert chain to search, we're done. */
-	if ((ret_ins = WT_SKIP_LAST(inshead)) == NULL)
+	if ((ret_ins = WT_SKIP_LAST(ins_head)) == NULL)
 		return (NULL);
 
 	/* Fast path appends. */
 	if (recno >= WT_INSERT_RECNO(ret_ins)) {
 		for (i = 0; i < WT_SKIP_MAXDEPTH; i++) {
 			ins_stack[i] = (i == 0) ? &ret_ins->next[0] :
-			    (inshead->tail[i] != NULL) ?
-			    &inshead->tail[i]->next[i] : &inshead->head[i];
+			    (ins_head->tail[i] != NULL) ?
+			    &ins_head->tail[i]->next[i] : &ins_head->head[i];
 			next_stack[i] = NULL;
 		}
 		return (ret_ins);
@@ -169,13 +169,23 @@ __col_insert_search(WT_INSERT_HEAD *inshead,
 	 * The insert list is a skip list: start at the highest skip level, then
 	 * go as far as possible at each level before stepping down to the next.
 	 */
-	for (i = WT_SKIP_MAXDEPTH - 1, insp = &inshead->head[i]; i >= 0; ) {
+	for (i = WT_SKIP_MAXDEPTH - 1, insp = &ins_head->head[i]; i >= 0; ) {
 		if ((ret_ins = *insp) == NULL) {
 			next_stack[i] = NULL;
 			ins_stack[i--] = insp--;
 			continue;
 		}
 
+		/*
+		 * When no exact match is found, the search returns the smallest
+		 * key larger than the searched-for key, or the largest key
+		 * smaller than the searched-for key, if there is no larger key.
+		 * Our callers depend on that: specifically, the fixed-length
+		 * column store cursor code interprets returning a key smaller
+		 * than the searched-for key to mean the searched-for key is
+		 * larger than any key on the page. Don't change that behavior,
+		 * things will break.
+		 */
 		ins_recno = WT_INSERT_RECNO(ret_ins);
 		cmp = (recno == ins_recno) ? 0 : (recno < ins_recno) ? -1 : 1;
 
@@ -204,9 +214,9 @@ __col_var_last_recno(WT_PAGE *page)
 	WT_COL_RLE *repeat;
 
 	/*
-	 * If there's an append list (the last page), then there may be more
-	 * records on the page.  This function ignores those records, so our
-	 * callers have to handle that explicitly, if they care.
+	 * If there's an append list, there may be more records on the page.
+	 * This function ignores those records, our callers must handle that
+	 * explicitly, if they care.
 	 */
 	if (page->pg_var_nrepeats == 0)
 		return (page->pg_var_entries == 0 ? 0 :
@@ -225,9 +235,9 @@ static inline uint64_t
 __col_fix_last_recno(WT_PAGE *page)
 {
 	/*
-	 * If there's an append list (the last page), then there may be more
-	 * records on the page.  This function ignores those records, so our
-	 * callers have to handle that explicitly, if they care.
+	 * If there's an append list, there may be more records on the page.
+	 * This function ignores those records, our callers must handle that
+	 * explicitly, if they care.
 	 */
 	return (page->pg_fix_entries == 0 ? 0 :
 	    page->pg_fix_recno + (page->pg_fix_entries - 1));
@@ -282,7 +292,17 @@ __col_var_search(WT_PAGE *page, uint64_t recno, uint64_t *start_recnop)
 		start_recno = repeat->recno + repeat->rle;
 	}
 
-	if (recno >= start_recno + (page->pg_var_entries - start_indx))
+	/*
+	 * !!!
+	 * The test could be written more simply as:
+	 *
+	 * 	(recno >= start_recno + (page->pg_var_entries - start_indx))
+	 *
+	 * It's split into two parts because the simpler test will overflow if
+	 * searching for large record numbers.
+	 */
+	if (recno >= start_recno &&
+	    recno - start_recno >= page->pg_var_entries - start_indx)
 		return (NULL);
 
 	return (page->pg_var_d + start_indx + (uint32_t)(recno - start_recno));

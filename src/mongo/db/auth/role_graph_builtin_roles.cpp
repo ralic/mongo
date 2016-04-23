@@ -61,6 +61,7 @@ const std::string BUILTIN_ROLE_HOST_MANAGEMENT = "hostManager";
 const std::string BUILTIN_ROLE_CLUSTER_MANAGEMENT = "clusterManager";
 const std::string BUILTIN_ROLE_BACKUP = "backup";
 const std::string BUILTIN_ROLE_RESTORE = "restore";
+const std::string BUILTIN_ROLE_ENABLE_SHARDING = "enableSharding";
 
 /// Actions that the "read" role may perform on a normal resources of a specific database, and
 /// that the "readAnyDatabase" role may perform on normal resources of any database.
@@ -160,7 +161,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
     // clusterMonitor role actions that target a database (or collection) resource
     clusterMonitorRoleDatabaseActions << ActionType::collStats  // dbAdmin gets this also
                                       << ActionType::dbStats    // dbAdmin gets this also
-                                      << ActionType::getShardVersion;
+                                      << ActionType::getShardVersion << ActionType::indexStats;
 
     // hostManager role actions that target the cluster resource
     hostManagerRoleClusterActions
@@ -199,9 +200,6 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
 void addReadOnlyDbPrivileges(PrivilegeVector* privileges, StringData dbName) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forDatabaseName(dbName), readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::listCollections));
-
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.indexes")),
@@ -259,6 +257,12 @@ void addDbOwnerPrivileges(PrivilegeVector* privileges, StringData dbName) {
     addUserAdminDbPrivileges(privileges, dbName);
 }
 
+void addEnableShardingPrivileges(PrivilegeVector* privileges) {
+    ActionSet enableShardingActions;
+    enableShardingActions.addAction(ActionType::enableSharding);
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnyNormalResource(), enableShardingActions));
+}
 
 void addReadOnlyAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
@@ -289,6 +293,9 @@ void addUserAdminAnyDbPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), userAdminRoleActions));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forClusterResource(), ActionType::authSchemaUpgrade));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forClusterResource(), ActionType::invalidateUserCache));
@@ -439,6 +446,10 @@ void addBackupPrivileges(PrivilegeVector* privileges) {
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
+        Privilege(ResourcePattern::forCollectionName("system.profile"), ActionType::find));
+
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
         Privilege(
             ResourcePattern::forExactNamespace(AuthorizationManager::usersAltCollectionNamespace),
             ActionType::find));
@@ -569,6 +580,8 @@ bool RoleGraph::addPrivilegesForBuiltinRole(const RoleName& roleName, PrivilegeV
         addDbAdminDbPrivileges(result, roleName.getDB());
     } else if (roleName.getRole() == BUILTIN_ROLE_DB_OWNER) {
         addDbOwnerPrivileges(result, roleName.getDB());
+    } else if (roleName.getRole() == BUILTIN_ROLE_ENABLE_SHARDING) {
+        addEnableShardingPrivileges(result);
     } else if (isAdminDB && roleName.getRole() == BUILTIN_ROLE_READ_ANY_DB) {
         addReadOnlyAnyDbPrivileges(result);
     } else if (isAdminDB && roleName.getRole() == BUILTIN_ROLE_READ_WRITE_ANY_DB) {
@@ -606,7 +619,9 @@ void RoleGraph::generateUniversalPrivileges(PrivilegeVector* privileges) {
 }
 
 bool RoleGraph::isBuiltinRole(const RoleName& role) {
-    if (!NamespaceString::validDBName(role.getDB()) || role.getDB() == "$external") {
+    if (!NamespaceString::validDBName(role.getDB(),
+                                      NamespaceString::DollarInDbNameBehavior::Allow) ||
+        role.getDB() == "$external") {
         return false;
     }
 
@@ -621,6 +636,8 @@ bool RoleGraph::isBuiltinRole(const RoleName& role) {
     } else if (role.getRole() == BUILTIN_ROLE_DB_ADMIN) {
         return true;
     } else if (role.getRole() == BUILTIN_ROLE_DB_OWNER) {
+        return true;
+    } else if (role.getRole() == BUILTIN_ROLE_ENABLE_SHARDING) {
         return true;
     } else if (isAdminDB && role.getRole() == BUILTIN_ROLE_READ_ANY_DB) {
         return true;
@@ -656,6 +673,7 @@ void RoleGraph::_createBuiltinRolesForDBIfNeeded(const std::string& dbname) {
     _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_USER_ADMIN, dbname));
     _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_DB_ADMIN, dbname));
     _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_DB_OWNER, dbname));
+    _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_ENABLE_SHARDING, dbname));
 
     if (dbname == "admin") {
         _createBuiltinRoleIfNeeded(RoleName(BUILTIN_ROLE_READ_ANY_DB, dbname));

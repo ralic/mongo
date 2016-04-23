@@ -40,9 +40,9 @@
 #include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/client/dbclient_multi_command.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_explain.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/cluster_write.h"
+#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/dbclient_shard_resolver.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batch_upconvert.h"
@@ -73,8 +73,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
@@ -97,6 +98,7 @@ public:
                            const std::string& dbname,
                            const BSONObj& cmdObj,
                            ExplainCommon::Verbosity verbosity,
+                           const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                            BSONObjBuilder* out) const {
         BatchedCommandRequest request(_writeType);
 
@@ -111,7 +113,9 @@ public:
         }
 
         BSONObjBuilder explainCmdBob;
-        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+        int options = 0;
+        ClusterExplain::wrapAsExplain(
+            cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
 
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
@@ -190,9 +194,8 @@ public:
         }
 
         // Save the last opTimes written on each shard for this client, to allow GLE to work
-        if (haveClient() && writer.getStats().hasShardStats()) {
-            ClusterLastErrorInfo::get(cc())
-                .addHostOpTimes(writer.getStats().getShardStats().getWriteOpTimes());
+        if (haveClient()) {
+            ClusterLastErrorInfo::get(cc()).addHostOpTimes(writer.getStats().getWriteOpTimes());
         }
 
         // TODO
@@ -229,9 +232,9 @@ private:
                                   std::vector<Strategy::CommandResult>* results) {
         // Note that this implementation will not handle targeting retries and does not completely
         // emulate write behavior
-
+        TargeterStats stats;
         ChunkManagerTargeter targeter(
-            NamespaceString(targetingBatchItem.getRequest()->getTargetingNS()));
+            NamespaceString(targetingBatchItem.getRequest()->getTargetingNS()), &stats);
         Status status = targeter.init(txn);
         if (!status.isOK())
             return status;

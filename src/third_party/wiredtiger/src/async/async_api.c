@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -52,8 +52,8 @@ __async_get_format(WT_CONNECTION_IMPL *conn, const char *uri,
 	 * Insert it at the head expecting LRU usage.  We need a real session
 	 * for the cursor.
 	 */
-	WT_RET(
-	    __wt_open_internal_session(conn, "async-cursor", 1, 1, &session));
+	WT_RET(__wt_open_internal_session(
+	    conn, "async-cursor", true, 0, &session));
 	__wt_spin_lock(session, &async->ops_lock);
 	WT_ERR(__wt_calloc_one(session, &af));
 	WT_ERR(__wt_strdup(session, uri, &af->uri));
@@ -171,7 +171,7 @@ retry:
  */
 static int
 __async_config(WT_SESSION_IMPL *session,
-    WT_CONNECTION_IMPL *conn, const char **cfg, int *runp)
+    WT_CONNECTION_IMPL *conn, const char **cfg, bool *runp)
 {
 	WT_CONFIG_ITEM cval;
 
@@ -229,7 +229,7 @@ __async_start(WT_SESSION_IMPL *session)
 {
 	WT_ASYNC *async;
 	WT_CONNECTION_IMPL *conn;
-	uint32_t i;
+	uint32_t i, session_flags;
 
 	conn = S2C(session);
 	conn->async_cfg = 1;
@@ -240,7 +240,8 @@ __async_start(WT_SESSION_IMPL *session)
 	async = conn->async;
 	TAILQ_INIT(&async->formatqh);
 	WT_RET(__wt_spin_init(session, &async->ops_lock, "ops"));
-	WT_RET(__wt_cond_alloc(session, "async flush", 0, &async->flush_cond));
+	WT_RET(__wt_cond_alloc(
+	    session, "async flush", false, &async->flush_cond));
 	WT_RET(__wt_async_op_init(session));
 
 	/*
@@ -255,9 +256,9 @@ __async_start(WT_SESSION_IMPL *session)
 		 * workers and we may want to selectively stop some workers
 		 * while leaving the rest running.
 		 */
-		WT_RET(__wt_open_internal_session(
-		    conn, "async-worker", 1, 1, &async->worker_sessions[i]));
-		F_SET(async->worker_sessions[i], WT_SESSION_SERVER_ASYNC);
+		session_flags = WT_SESSION_SERVER_ASYNC;
+		WT_RET(__wt_open_internal_session(conn, "async-worker",
+		    true, session_flags, &async->worker_sessions[i]));
 	}
 	for (i = 0; i < conn->async_workers; i++) {
 		/*
@@ -278,12 +279,12 @@ int
 __wt_async_create(WT_SESSION_IMPL *session, const char *cfg[])
 {
 	WT_CONNECTION_IMPL *conn;
-	int run;
+	bool run;
 
 	conn = S2C(session);
 
 	/* Handle configuration. */
-	run = 0;
+	run = false;
 	WT_RET(__async_config(session, conn, cfg, &run));
 
 	/* If async is not configured, we're done. */
@@ -303,8 +304,8 @@ __wt_async_reconfig(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_CONNECTION_IMPL *conn, tmp_conn;
 	WT_DECL_RET;
 	WT_SESSION *wt_session;
-	int run;
-	uint32_t i;
+	bool run;
+	uint32_t i, session_flags;
 
 	conn = S2C(session);
 	async = conn->async;
@@ -370,10 +371,9 @@ __wt_async_reconfig(WT_SESSION_IMPL *session, const char *cfg[])
 			/*
 			 * Each worker has its own session.
 			 */
-			WT_RET(__wt_open_internal_session(conn,
-			    "async-worker", 1, 1, &async->worker_sessions[i]));
-			F_SET(async->worker_sessions[i],
-			    WT_SESSION_SERVER_ASYNC);
+			session_flags = WT_SESSION_SERVER_ASYNC;
+			WT_RET(__wt_open_internal_session(conn, "async-worker",
+			    true, session_flags, &async->worker_sessions[i]));
 		}
 		for (i = conn->async_workers; i < tmp_conn.async_workers; i++) {
 			/*

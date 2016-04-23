@@ -5,11 +5,17 @@ selector:
 
 executor:
   js_test:
+    config:
+      shell_options:
+        readMode: commands
+    hooks:
+    - class: ValidateCollections
     fixture:
       class: MongoDFixture
       mongod_options:
-        nopreallocj: ''
+        noprealloc: ''
         set_parameters:
           enableTestCommands: 1
+        smallfiles: ''
         verbose: ''
 

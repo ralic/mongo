@@ -66,6 +66,7 @@
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/quick_exit.h"
 
 namespace fs = boost::filesystem;
@@ -89,10 +90,6 @@ void launchSignal(int sig) {
     }
 }
 
-static void setupLaunchSignals() {
-    verify(signal(SIGUSR2, launchSignal) != SIG_ERR);
-}
-
 void signalForkSuccess() {
     if (serverGlobalParams.doFork) {
         // killing leader will propagate to parent
@@ -112,8 +109,12 @@ static bool forkServer() {
 
         serverGlobalParams.parentProc = ProcessId::getCurrent();
 
+        // clear signal mask so that SIGUSR2 will always be caught and we can clean up the original
+        // parent process
+        clearSignalMask();
+
         // facilitate clean exit when child starts successfully
-        setupLaunchSignals();
+        verify(signal(SIGUSR2, launchSignal) != SIG_ERR);
 
         cout << "about to fork child process, waiting until server is ready for connections."
              << endl;
@@ -348,9 +349,10 @@ bool initializeServerGlobalState() {
         }
     }
 
-    // Auto-enable auth except if clusterAuthMode is not set.
-    // clusterAuthMode is automatically set if a --keyFile parameter is provided.
-    if (clusterAuthMode != ServerGlobalParams::ClusterAuthMode_undefined) {
+    // Auto-enable auth unless we are in mixed auth/no-auth or clusterAuthMode was not provided.
+    // clusterAuthMode defaults to "keyFile" if a --keyFile parameter is provided.
+    if (clusterAuthMode != ServerGlobalParams::ClusterAuthMode_undefined &&
+        !serverGlobalParams.transitionToAuth) {
         getGlobalAuthorizationManager()->setAuthEnabled(true);
     }
 

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -7,6 +7,11 @@
  */
 
 #include "wt_internal.h"
+
+/* Cookie passed to __txn_printlog. */
+typedef struct {
+	uint32_t flags;
+} WT_TXN_PRINTLOG_ARGS;
 
 /*
  * __txn_op_log --
@@ -33,18 +38,7 @@ __txn_op_log(WT_SESSION_IMPL *session,
 	 * 3) row store remove; or
 	 * 4) row store insert/update.
 	 */
-	if (cbt->btree->type != BTREE_ROW) {
-		WT_ASSERT(session, cbt->ins != NULL);
-		recno = WT_INSERT_RECNO(cbt->ins);
-		WT_ASSERT(session, recno != 0);
-
-		if (WT_UPDATE_DELETED_ISSET(upd))
-			WT_ERR(__wt_logop_col_remove_pack(session, logrec,
-			    op->fileid, recno));
-		else
-			WT_ERR(__wt_logop_col_put_pack(session, logrec,
-			    op->fileid, recno, &value));
-	} else {
+	if (cbt->btree->type == BTREE_ROW) {
 		WT_ERR(__wt_cursor_row_leaf_key(cbt, &key));
 
 		if (WT_UPDATE_DELETED_ISSET(upd))
@@ -53,6 +47,16 @@ __txn_op_log(WT_SESSION_IMPL *session,
 		else
 			WT_ERR(__wt_logop_row_put_pack(session, logrec,
 			    op->fileid, &key, &value));
+	} else {
+		recno = WT_INSERT_RECNO(cbt->ins);
+		WT_ASSERT(session, recno != WT_RECNO_OOB);
+
+		if (WT_UPDATE_DELETED_ISSET(upd))
+			WT_ERR(__wt_logop_col_remove_pack(session, logrec,
+			    op->fileid, recno));
+		else
+			WT_ERR(__wt_logop_col_put_pack(session, logrec,
+			    op->fileid, recno, &value));
 	}
 
 err:	__wt_buf_free(session, &key);
@@ -64,27 +68,28 @@ err:	__wt_buf_free(session, &key);
  *	Print a commit log record.
  */
 static int
-__txn_commit_printlog(
-    WT_SESSION_IMPL *session, const uint8_t **pp, const uint8_t *end, FILE *out)
+__txn_commit_printlog(WT_SESSION_IMPL *session,
+    const uint8_t **pp, const uint8_t *end, uint32_t flags)
 {
-	int firstrecord;
+	bool firstrecord;
 
-	firstrecord = 1;
-	WT_RET(__wt_fprintf(out, "    \"ops\": [\n"));
+	firstrecord = true;
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session), "    \"ops\": [\n"));
 
 	/* The logging subsystem zero-pads records. */
 	while (*pp < end && **pp) {
 		if (!firstrecord)
-			WT_RET(__wt_fprintf(out, ",\n"));
-		WT_RET(__wt_fprintf(out, "      {"));
+			WT_RET(__wt_fprintf(
+			    session, WT_STDOUT(session), ",\n"));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session), "      {"));
 
-		firstrecord = 0;
+		firstrecord = false;
 
-		WT_RET(__wt_txn_op_printlog(session, pp, end, out));
-		WT_RET(__wt_fprintf(out, "\n      }"));
+		WT_RET(__wt_txn_op_printlog(session, pp, end, flags));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session), "\n      }"));
 	}
 
-	WT_RET(__wt_fprintf(out, "\n    ]\n"));
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session), "\n    ]\n"));
 
 	return (0);
 }
@@ -227,7 +232,8 @@ __txn_log_file_sync(WT_SESSION_IMPL *session, uint32_t flags, WT_LSN *lsnp)
 	WT_DECL_RET;
 	size_t header_size;
 	uint32_t rectype = WT_LOGREC_FILE_SYNC;
-	int start, need_sync;
+	int start;
+	bool need_sync;
 	const char *fmt = WT_UNCHECKED_STRING(III);
 
 	btree = S2BT(session);
@@ -259,14 +265,16 @@ __wt_txn_checkpoint_logread(
     WT_LSN *ckpt_lsn)
 {
 	WT_ITEM ckpt_snapshot;
+	uint32_t ckpt_file, ckpt_offset;
 	u_int ckpt_nsnapshot;
-	const char *fmt = WT_UNCHECKED_STRING(IQIU);
+	const char *fmt = WT_UNCHECKED_STRING(IIIU);
 
 	WT_RET(__wt_struct_unpack(session, *pp, WT_PTRDIFF(end, *pp), fmt,
-	    &ckpt_lsn->file, &ckpt_lsn->offset,
+	    &ckpt_file, &ckpt_offset,
 	    &ckpt_nsnapshot, &ckpt_snapshot));
 	WT_UNUSED(ckpt_nsnapshot);
 	WT_UNUSED(ckpt_snapshot);
+	WT_SET_LSN(ckpt_lsn, ckpt_file, ckpt_offset);
 	*pp = end;
 	return (0);
 }
@@ -277,7 +285,7 @@ __wt_txn_checkpoint_logread(
  */
 int
 __wt_txn_checkpoint_log(
-    WT_SESSION_IMPL *session, int full, uint32_t flags, WT_LSN *lsnp)
+    WT_SESSION_IMPL *session, bool full, uint32_t flags, WT_LSN *lsnp)
 {
 	WT_DECL_ITEM(logrec);
 	WT_DECL_RET;
@@ -287,7 +295,7 @@ __wt_txn_checkpoint_log(
 	uint8_t *end, *p;
 	size_t recsize;
 	uint32_t i, rectype = WT_LOGREC_CHECKPOINT;
-	const char *fmt = WT_UNCHECKED_STRING(IIQIU);
+	const char *fmt = WT_UNCHECKED_STRING(IIIIU);
 
 	txn = &session->txn;
 	ckpt_lsn = &txn->ckpt_lsn;
@@ -307,8 +315,8 @@ __wt_txn_checkpoint_log(
 
 	switch (flags) {
 	case WT_TXN_LOG_CKPT_PREPARE:
-		txn->full_ckpt = 1;
-		*ckpt_lsn = S2C(session)->log->write_start_lsn;
+		txn->full_ckpt = true;
+		WT_ERR(__wt_log_flush_lsn(session, ckpt_lsn, true));
 		/*
 		 * We need to make sure that the log records in the checkpoint
 		 * LSN are on disk.  In particular to make sure that the
@@ -337,19 +345,19 @@ __wt_txn_checkpoint_log(
 			txn->ckpt_nsnapshot = 0;
 			WT_CLEAR(empty);
 			ckpt_snapshot = &empty;
-			*ckpt_lsn = S2C(session)->log->write_start_lsn;
+			WT_ERR(__wt_log_flush_lsn(session, ckpt_lsn, true));
 		} else
 			ckpt_snapshot = txn->ckpt_snapshot;
 
 		/* Write the checkpoint log record. */
 		WT_ERR(__wt_struct_size(session, &recsize, fmt,
-		    rectype, ckpt_lsn->file, ckpt_lsn->offset,
+		    rectype, ckpt_lsn->l.file, ckpt_lsn->l.offset,
 		    txn->ckpt_nsnapshot, ckpt_snapshot));
 		WT_ERR(__wt_logrec_alloc(session, recsize, &logrec));
 
 		WT_ERR(__wt_struct_pack(session,
 		    (uint8_t *)logrec->data + logrec->size, recsize, fmt,
-		    rectype, ckpt_lsn->file, ckpt_lsn->offset,
+		    rectype, ckpt_lsn->l.file, ckpt_lsn->l.offset,
 		    txn->ckpt_nsnapshot, ckpt_snapshot));
 		logrec->size += (uint32_t)recsize;
 		WT_ERR(__wt_log_write(session, logrec, lsnp,
@@ -359,9 +367,13 @@ __wt_txn_checkpoint_log(
 		/*
 		 * If this full checkpoint completed successfully and there is
 		 * no hot backup in progress, tell the logging subsystem the
-		 * checkpoint LSN so that it can archive.
+		 * checkpoint LSN so that it can archive.  Do not update the
+		 * logging checkpoint LSN if this is during a clean connection
+		 * close, only during a full checkpoint.  A clean close may not
+		 * update any metadata LSN and we do not want to archive in
+		 * that case.
 		 */
-		if (!S2C(session)->hot_backup)
+		if (!S2C(session)->hot_backup && txn->full_ckpt)
 			WT_ERR(__wt_log_ckpt(session, ckpt_lsn));
 
 		/* FALLTHROUGH */
@@ -370,7 +382,7 @@ __wt_txn_checkpoint_log(
 		WT_INIT_LSN(ckpt_lsn);
 		txn->ckpt_nsnapshot = 0;
 		__wt_scr_free(session, &txn->ckpt_snapshot);
-		txn->full_ckpt = 0;
+		txn->full_ckpt = false;
 		break;
 	WT_ILLEGAL_VALUE_ERR(session);
 	}
@@ -419,9 +431,9 @@ __wt_txn_truncate_log(
 	} else {
 		op->type = WT_TXN_OP_TRUNCATE_COL;
 		op->u.truncate_col.start =
-		    (start == NULL) ? 0 : start->recno;
+		    (start == NULL) ? WT_RECNO_OOB : start->recno;
 		op->u.truncate_col.stop =
-		    (stop == NULL) ? 0 : stop->recno;
+		    (stop == NULL) ? WT_RECNO_OOB : stop->recno;
 	}
 
 	/* Write that operation into the in-memory log. */
@@ -452,18 +464,17 @@ __txn_printlog(WT_SESSION_IMPL *session,
     WT_ITEM *rawrec, WT_LSN *lsnp, WT_LSN *next_lsnp,
     void *cookie, int firstrecord)
 {
-	FILE *out;
 	WT_LOG_RECORD *logrec;
-	WT_LSN ckpt_lsn;
-	int compressed;
-	uint64_t txnid;
-	uint32_t fileid, rectype;
-	int32_t start;
+	WT_TXN_PRINTLOG_ARGS *args;
 	const uint8_t *end, *p;
 	const char *msg;
+	uint64_t txnid;
+	uint32_t fileid, lsnfile, lsnoffset, rectype;
+	int32_t start;
+	bool compressed;
 
 	WT_UNUSED(next_lsnp);
-	out = cookie;
+	args = cookie;
 
 	p = WT_LOG_SKIP_HEADER(rawrec->data);
 	end = (const uint8_t *)rawrec->data + rawrec->size;
@@ -474,56 +485,61 @@ __txn_printlog(WT_SESSION_IMPL *session,
 	WT_RET(__wt_logrec_read(session, &p, end, &rectype));
 
 	if (!firstrecord)
-		WT_RET(__wt_fprintf(out, ",\n"));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session), ",\n"));
 
-	WT_RET(__wt_fprintf(out,
-	    "  { \"lsn\" : [%" PRIu32 ",%" PRId64 "],\n",
-	    lsnp->file, lsnp->offset));
-	WT_RET(__wt_fprintf(out,
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session),
+	    "  { \"lsn\" : [%" PRIu32 ",%" PRIu32 "],\n",
+	    lsnp->l.file, lsnp->l.offset));
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session),
 	    "    \"hdr_flags\" : \"%s\",\n", compressed ? "compressed" : ""));
-	WT_RET(__wt_fprintf(out,
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session),
 	    "    \"rec_len\" : %" PRIu32 ",\n", logrec->len));
-	WT_RET(__wt_fprintf(out,
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session),
 	    "    \"mem_len\" : %" PRIu32 ",\n",
 	    compressed ? logrec->mem_len : logrec->len));
 
 	switch (rectype) {
 	case WT_LOGREC_CHECKPOINT:
 		WT_RET(__wt_struct_unpack(session, p, WT_PTRDIFF(end, p),
-		    WT_UNCHECKED_STRING(IQ), &ckpt_lsn.file, &ckpt_lsn.offset));
-		WT_RET(__wt_fprintf(out, "    \"type\" : \"checkpoint\",\n"));
-		WT_RET(__wt_fprintf(out,
-		    "    \"ckpt_lsn\" : [%" PRIu32 ",%" PRId64 "]\n",
-		    ckpt_lsn.file, ckpt_lsn.offset));
+		    WT_UNCHECKED_STRING(II), &lsnfile, &lsnoffset));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
+		    "    \"type\" : \"checkpoint\",\n"));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
+		    "    \"ckpt_lsn\" : [%" PRIu32 ",%" PRIu32 "]\n",
+		    lsnfile, lsnoffset));
 		break;
 
 	case WT_LOGREC_COMMIT:
 		WT_RET(__wt_vunpack_uint(&p, WT_PTRDIFF(end, p), &txnid));
-		WT_RET(__wt_fprintf(out, "    \"type\" : \"commit\",\n"));
-		WT_RET(__wt_fprintf(out,
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
+		    "    \"type\" : \"commit\",\n"));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
 		    "    \"txnid\" : %" PRIu64 ",\n", txnid));
-		WT_RET(__txn_commit_printlog(session, &p, end, out));
+		WT_RET(__txn_commit_printlog(session, &p, end, args->flags));
 		break;
 
 	case WT_LOGREC_FILE_SYNC:
 		WT_RET(__wt_struct_unpack(session, p, WT_PTRDIFF(end, p),
 		    WT_UNCHECKED_STRING(Ii), &fileid, &start));
-		WT_RET(__wt_fprintf(out, "    \"type\" : \"file_sync\",\n"));
-		WT_RET(__wt_fprintf(out,
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
+		    "    \"type\" : \"file_sync\",\n"));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
 		    "    \"fileid\" : %" PRIu32 ",\n", fileid));
-		WT_RET(__wt_fprintf(out,
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
 		    "    \"start\" : %" PRId32 "\n", start));
 		break;
 
 	case WT_LOGREC_MESSAGE:
 		WT_RET(__wt_struct_unpack(session, p, WT_PTRDIFF(end, p),
 		    WT_UNCHECKED_STRING(S), &msg));
-		WT_RET(__wt_fprintf(out, "    \"type\" : \"message\",\n"));
-		WT_RET(__wt_fprintf(out, "    \"message\" : \"%s\"\n", msg));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
+		    "    \"type\" : \"message\",\n"));
+		WT_RET(__wt_fprintf(session, WT_STDOUT(session),
+		    "    \"message\" : \"%s\"\n", msg));
 		break;
 	}
 
-	WT_RET(__wt_fprintf(out, "  }"));
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session), "  }"));
 
 	return (0);
 }
@@ -533,16 +549,18 @@ __txn_printlog(WT_SESSION_IMPL *session,
  *	Print the log in a human-readable format.
  */
 int
-__wt_txn_printlog(WT_SESSION *wt_session, FILE *out)
+__wt_txn_printlog(WT_SESSION *wt_session, uint32_t flags)
 {
 	WT_SESSION_IMPL *session;
+	WT_TXN_PRINTLOG_ARGS args;
 
 	session = (WT_SESSION_IMPL *)wt_session;
+	args.flags = flags;
 
-	WT_RET(__wt_fprintf(out, "[\n"));
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session), "[\n"));
 	WT_RET(__wt_log_scan(
-	    session, NULL, WT_LOGSCAN_FIRST, __txn_printlog, out));
-	WT_RET(__wt_fprintf(out, "\n]\n"));
+	    session, NULL, WT_LOGSCAN_FIRST, __txn_printlog, &args));
+	WT_RET(__wt_fprintf(session, WT_STDOUT(session), "\n]\n"));
 
 	return (0);
 }

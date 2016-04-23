@@ -28,7 +28,7 @@
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 
 #include "mongo/dbtests/mock/mock_dbclient_cursor.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/time_support.h"
 
 using mongo::BSONObj;
@@ -169,21 +169,12 @@ void MockDBClientConnection::insert(const string& ns, const vector<BSONObj>& obj
     }
 }
 
-void MockDBClientConnection::remove(const string& ns, Query query, bool justOne) {
-    remove(ns, query, (justOne ? RemoveOption_JustOne : 0));
-}
-
 void MockDBClientConnection::remove(const string& ns, Query query, int flags) {
     _remoteServer->remove(ns, query, flags);
 }
 
 void MockDBClientConnection::killCursor(long long cursorID) {
     verify(false);  // unimplemented
-}
-
-bool MockDBClientConnection::callRead(mongo::Message& toSend, mongo::Message& response) {
-    verify(false);  // unimplemented
-    return false;
 }
 
 bool MockDBClientConnection::call(mongo::Message& toSend,

@@ -32,6 +32,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/sync_source_selector.h"
@@ -50,6 +51,10 @@ class SnapshotName;
 class Timestamp;
 struct WriteConcernOptions;
 
+namespace executor {
+struct ConnectionPoolStats;
+}  // namespace executor
+
 namespace rpc {
 
 class ReplSetMetadata;
@@ -63,19 +68,19 @@ namespace repl {
 class BackgroundSync;
 class HandshakeArgs;
 class IsMasterResponse;
+class OldUpdatePositionArgs;
 class OplogReader;
 class OpTime;
 class ReadConcernArgs;
 class ReadConcernResponse;
-class ReplSetDeclareElectionWinnerArgs;
-class ReplSetDeclareElectionWinnerResponse;
+class ReplicaSetConfig;
+class ReplicationExecutor;
 class ReplSetHeartbeatArgs;
 class ReplSetHeartbeatArgsV1;
 class ReplSetHeartbeatResponse;
 class ReplSetHtmlSummary;
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
-class ReplicaSetConfig;
 class UpdatePositionArgs;
 
 /**
@@ -120,7 +125,7 @@ public:
      * components of the replication system to start up whatever threads and do whatever
      * initialization they need.
      */
-    virtual void startReplication(OperationContext* txn) = 0;
+    virtual void startup(OperationContext* txn) = 0;
 
     /**
      * Does whatever cleanup is required to stop replication, including instructing the other
@@ -128,6 +133,11 @@ public:
      * blocking until all replication-related shutdown tasks are complete.
      */
     virtual void shutdown() = 0;
+
+    /**
+     * Returns a pointer to the ReplicationExecutor.
+     */
+    virtual ReplicationExecutor* getExecutor() = 0;
 
     /**
      * Returns a reference to the parsed command line arguments that are related to replication.
@@ -155,6 +165,14 @@ public:
     virtual MemberState getMemberState() const = 0;
 
     /**
+     * Waits for 'timeout' ms for member state to become 'state'.
+     * Returns OK if member state is 'state'.
+     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the state change.
+     * Returns ErrorCodes::BadValue if timeout is negative.
+     */
+    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) = 0;
+
+    /**
      * Returns true if this node is in state PRIMARY or SECONDARY.
      *
      * It is invalid to call this unless getReplicationMode() == modeReplSet.
@@ -166,10 +184,8 @@ public:
 
 
     /**
-     * Returns how slave delayed this node is configured to be.
-     *
-     * Raises a DBException if this node is not a member of the current replica set
-     * configuration.
+     * Returns how slave delayed this node is configured to be, or 0 seconds if this node is not a
+     * member of the current replica set configuration.
      */
     virtual Seconds getSlaveDelaySecs() const = 0;
 
@@ -277,11 +293,22 @@ public:
      *
      * The new value of "opTime" must be no less than any prior value passed to this method, and
      * it is the caller's job to properly synchronize this behavior.  The exception to this rule
-     * is that after calls to resetLastOpTimeFromOplog(), the minimum acceptable value for
+     * is that after calls to resetLastOpTimesFromOplog(), the minimum acceptable value for
      * "opTime" is reset based on the contents of the oplog, and may go backwards due to
      * rollback.
      */
-    virtual void setMyLastOptime(const OpTime& opTime) = 0;
+    virtual void setMyLastAppliedOpTime(const OpTime& opTime) = 0;
+
+    /**
+     * Updates our internal tracking of the last OpTime durable to this node.
+     *
+     * The new value of "opTime" must be no less than any prior value passed to this method, and
+     * it is the caller's job to properly synchronize this behavior.  The exception to this rule
+     * is that after calls to resetLastOpTimesFromOplog(), the minimum acceptable value for
+     * "opTime" is reset based on the contents of the oplog, and may go backwards due to
+     * rollback.
+     */
+    virtual void setMyLastDurableOpTime(const OpTime& opTime) = 0;
 
     /**
      * Updates our internal tracking of the last OpTime applied to this node, but only
@@ -291,12 +318,22 @@ public:
      * This function is used by logOp() on a primary, since the ops in the oplog do not
      * necessarily commit in sequential order.
      */
-    virtual void setMyLastOptimeForward(const OpTime& opTime) = 0;
+    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime) = 0;
+
+    /**
+     * Updates our internal tracking of the last OpTime durable to this node, but only
+     * if the supplied optime is later than the current last OpTime known to the replication
+     * coordinator.
+     *
+     * This function is used by logOp() on a primary, since the ops in the oplog do not
+     * necessarily commit in sequential order.
+     */
+    virtual void setMyLastDurableOpTimeForward(const OpTime& opTime) = 0;
 
     /**
      * Same as above, but used during places we need to zero our last optime.
      */
-    virtual void resetMyLastOptime() = 0;
+    virtual void resetMyLastOpTimes() = 0;
 
     /**
      * Updates our the message we include in heartbeat responses.
@@ -304,9 +341,14 @@ public:
     virtual void setMyHeartbeatMessage(const std::string& msg) = 0;
 
     /**
-     * Returns the last optime recorded by setMyLastOptime.
+     * Returns the last optime recorded by setMyLastAppliedOpTime.
      */
-    virtual OpTime getMyLastOptime() const = 0;
+    virtual OpTime getMyLastAppliedOpTime() const = 0;
+
+    /**
+     * Returns the last optime recorded by setMyLastDurableOpTime.
+     */
+    virtual OpTime getMyLastDurableOpTime() const = 0;
 
     /**
      * Waits until the optime of the current node is at least the opTime specified in
@@ -372,18 +414,31 @@ public:
     virtual void signalDrainComplete(OperationContext* txn) = 0;
 
     /**
+     * Waits duration of 'timeout' for applier to finish draining its buffer of operations.
+     * Returns OK if isWaitingForApplierToDrain() returns false.
+     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the applier to drain its
+     * buffer.
+     * Returns ErrorCodes::BadValue if timeout is negative.
+     */
+    virtual Status waitForDrainFinish(Milliseconds timeout) = 0;
+
+    /**
      * Signals the sync source feedback thread to wake up and send a handshake and
      * replSetUpdatePosition command to our sync source.
      */
     virtual void signalUpstreamUpdater() = 0;
 
+    enum class ReplSetUpdatePositionCommandStyle {
+        kNewStyle,
+        kOldStyle  // Pre-3.2.4 servers.
+    };
+
     /**
      * Prepares a BSONObj describing an invocation of the replSetUpdatePosition command that can
      * be sent to this node's sync source to update it about our progress in replication.
-     *
-     * The returned bool indicates whether or not the command was created.
      */
-    virtual bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) = 0;
+    virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
+        ReplSetUpdatePositionCommandStyle commandStyle) const = 0;
 
     /**
      * Handles an incoming replSetGetStatus command. Adds BSON to 'result'.
@@ -421,6 +476,16 @@ public:
      * to process the find and getmore metadata responses from the DataReplicator.
      */
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) = 0;
+
+    /**
+     * Elections under protocol version 1 are triggered by a timer.
+     * When a node is informed of the primary's liveness (either through heartbeats or
+     * while reading a sync source's oplog), it calls this function to postpone the
+     * election timer by a duration of at least 'electionTimeoutMillis' (see getConfig()).
+     * If the current node is not electable (secondary with priority > 0), this function
+     * cancels the existing timer but will not schedule a new one.
+     */
+    virtual void cancelAndRescheduleElectionTimeout() = 0;
 
     /**
      * Toggles maintenanceMode to the value expressed by 'activate'
@@ -532,13 +597,18 @@ public:
      * Returns Status::OK() if all updates are processed correctly, NodeNotFound
      * if any updating node cannot be found in the config, InvalidReplicaSetConfig if the
      * "configVersion" sent in any of the updates doesn't match our config version, or
-     * NotMasterOrSecondaryCode if we are in state REMOVED or otherwise don't have a valid
+     * NotMasterOrSecondary if we are in state REMOVED or otherwise don't have a valid
      * replica set config.
      * If a non-OK status is returned, it is unspecified whether none or some of the updates
      * were applied.
      * "configVersion" will be populated with our config version if and only if we return
      * InvalidReplicaSetConfig.
+     *
+     * The OldUpdatePositionArgs version provides support for the pre-3.2.4 format of
+     * UpdatePositionArgs.
      */
+    virtual Status processReplSetUpdatePosition(const OldUpdatePositionArgs& updates,
+                                                long long* configVersion) = 0;
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion) = 0;
 
@@ -559,8 +629,9 @@ public:
 
     /**
      * Returns a vector of members that have applied the operation with OpTime 'op'.
+     * "durablyWritten" indicates whether the operation has to be durably applied.
      */
-    virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op) = 0;
+    virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten) = 0;
 
     /**
      * Returns a vector of the members other than ourself in the replica set, as specified in
@@ -585,10 +656,10 @@ public:
     virtual Status checkReplEnabledForCommand(BSONObjBuilder* result) = 0;
 
     /**
-     * Loads the optime from the last op in the oplog into the coordinator's lastOpApplied
-     * value.
+     * Loads the optime from the last op in the oplog into the coordinator's lastAppliedOpTime and
+     * lastDurableOpTime values.
      */
-    virtual void resetLastOpTimeFromOplog(OperationContext* txn) = 0;
+    virtual void resetLastOpTimesFromOplog(OperationContext* txn) = 0;
 
     /**
      * Returns the OpTime of the latest replica set-committed op known to this server.
@@ -605,26 +676,23 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) = 0;
 
-    /*
-    * Handles an incoming replSetDeclareElectionWinner command.
-    * Returns a Status with either OK or an error message.
-    * Populates responseTerm with the current term from our perspective.
-    */
-    virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                                       long long* responseTerm) = 0;
-
     /**
      * Prepares a metadata object describing the current term, primary, and lastOp information.
      */
     virtual void prepareReplResponseMetadata(const rpc::RequestInterface& request,
                                              const OpTime& lastOpTimeFromClient,
-                                             const ReadConcernArgs& readConcern,
                                              BSONObjBuilder* builder) = 0;
 
     /**
      * Returns true if the V1 election protocol is being used and false otherwise.
      */
-    virtual bool isV1ElectionProtocol() = 0;
+    virtual bool isV1ElectionProtocol() const = 0;
+
+    /**
+     * Returns whether or not majority write concerns should implicitly journal, if j has not been
+     * explicitly set.
+     */
+    virtual bool getWriteConcernMajorityShouldJournal() = 0;
 
     /**
      * Writes into 'output' all the information needed to generate a summary of the current
@@ -644,7 +712,7 @@ public:
      * the rest of the work, because the term is still the same).
      * Returns StaleTerm if the supplied term was higher than the current term.
      */
-    virtual Status updateTerm(long long term) = 0;
+    virtual Status updateTerm(OperationContext* txn, long long term) = 0;
 
     /**
      * Reserves a unique SnapshotName.
@@ -676,10 +744,12 @@ public:
     virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) = 0;
 
     /**
-     * Called by threads that wish to be alerted of the creation of a new snapshot. "txn" is used
-     * to checkForInterrupt and enforce maxTimeMS.
+     * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',
+     * or we are interrupted for any reason, including shutdown or maxTimeMs expiration.
+     * 'txn' is used to checkForInterrupt and enforce maxTimeMS.
      */
-    virtual void waitForNewSnapshot(OperationContext* txn) = 0;
+    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+                                            const SnapshotName& untilSnapshot) = 0;
 
     /**
      * Resets all information related to snapshotting.
@@ -690,6 +760,25 @@ public:
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
     virtual OpTime getCurrentCommittedSnapshotOpTime() = 0;
+
+    /**
+     * Appends connection information to the provided BSONObjBuilder.
+     */
+    virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) const = 0;
+
+    /**
+     * Gets the number of uncommitted snapshots currently held.
+     * Warning: This value can change at any time and may not even be accurate at the time of
+     * return. It should not be used when an exact amount is needed.
+     */
+    virtual size_t getNumUncommittedSnapshots() = 0;
+
+    /**
+     * Returns a new WriteConcernOptions based on "wc" but with UNSET syncMode reset to JOURNAL or
+     * NONE based on our rsConfig.
+     */
+    virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
+        WriteConcernOptions wc) = 0;
 
 protected:
     ReplicationCoordinator();

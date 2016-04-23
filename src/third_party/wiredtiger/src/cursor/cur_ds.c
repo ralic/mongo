@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -384,7 +384,7 @@ __curds_remove(WT_CURSOR *cursor)
 
 	source = ((WT_CURSOR_DATA_SOURCE *)cursor)->source;
 
-	CURSOR_UPDATE_API_CALL(cursor, session, remove, NULL);
+	CURSOR_REMOVE_API_CALL(cursor, session, NULL);
 
 	WT_STAT_FAST_CONN_INCR(session, cursor_remove);     
 	WT_STAT_FAST_DATA_INCR(session, cursor_remove);
@@ -449,22 +449,22 @@ __wt_curds_open(
     const char *cfg[], WT_DATA_SOURCE *dsrc, WT_CURSOR **cursorp)
 {
 	WT_CURSOR_STATIC_INIT(iface,
-	    __wt_cursor_get_key,	/* get-key */
-	    __wt_cursor_get_value,	/* get-value */
-	    __wt_cursor_set_key,	/* set-key */
-	    __wt_cursor_set_value,	/* set-value */
-	    __curds_compare,		/* compare */
-	    __wt_cursor_equals,		/* equals */
-	    __curds_next,		/* next */
-	    __curds_prev,		/* prev */
-	    __curds_reset,		/* reset */
-	    __curds_search,		/* search */
-	    __curds_search_near,	/* search-near */
-	    __curds_insert,		/* insert */
-	    __curds_update,		/* update */
-	    __curds_remove,		/* remove */
-	    __wt_cursor_notsup,		/* reconfigure */
-	    __curds_close);		/* close */
+	    __wt_cursor_get_key,		/* get-key */
+	    __wt_cursor_get_value,		/* get-value */
+	    __wt_cursor_set_key,		/* set-key */
+	    __wt_cursor_set_value,		/* set-value */
+	    __curds_compare,			/* compare */
+	    __wt_cursor_equals,			/* equals */
+	    __curds_next,			/* next */
+	    __curds_prev,			/* prev */
+	    __curds_reset,			/* reset */
+	    __curds_search,			/* search */
+	    __curds_search_near,		/* search-near */
+	    __curds_insert,			/* insert */
+	    __curds_update,			/* update */
+	    __curds_remove,			/* remove */
+	    __wt_cursor_reconfigure_notsup,	/* reconfigure */
+	    __curds_close);			/* close */
 	WT_CONFIG_ITEM cval, metadata;
 	WT_CURSOR *cursor, *source;
 	WT_CURSOR_DATA_SOURCE *data_source;
@@ -510,7 +510,7 @@ __wt_curds_open(
 	source = data_source->source;
 	source->session = (WT_SESSION *)session;
 	memset(&source->q, 0, sizeof(source->q));
-	source->recno = 0;
+	source->recno = WT_RECNO_OOB;
 	memset(source->raw_recno_buf, 0, sizeof(source->raw_recno_buf));
 	memset(&source->key, 0, sizeof(source->key));
 	memset(&source->value, 0, sizeof(source->value));

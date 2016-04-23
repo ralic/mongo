@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -51,7 +51,8 @@ restart:
 		if (cbt->btree->type == BTREE_ROW) {
 			key.data = WT_INSERT_KEY(current);
 			key.size = WT_INSERT_KEY_SIZE(current);
-			WT_RET(__wt_search_insert(session, cbt, &key));
+			WT_RET(__wt_search_insert(
+			    session, cbt, cbt->ins_head, &key));
 		} else
 			cbt->ins = __col_insert_search(cbt->ins_head,
 			    cbt->ins_stack, cbt->next_stack,
@@ -124,7 +125,7 @@ restart:
  *	Return the previous fixed-length entry on the append list.
  */
 static inline int
-__cursor_fix_append_prev(WT_CURSOR_BTREE *cbt, int newpage)
+__cursor_fix_append_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 {
 	WT_ITEM *val;
 	WT_PAGE *page;
@@ -139,10 +140,20 @@ __cursor_fix_append_prev(WT_CURSOR_BTREE *cbt, int newpage)
 		if ((cbt->ins = WT_SKIP_LAST(cbt->ins_head)) == NULL)
 			return (WT_NOTFOUND);
 	} else {
+		/* Move to the previous record in the append list, if any. */
+		if (cbt->ins != NULL &&
+		    cbt->recno <= WT_INSERT_RECNO(cbt->ins))
+			WT_RET(__cursor_skip_prev(cbt));
+
 		/*
 		 * Handle the special case of leading implicit records, that is,
-		 * there aren't any records in the tree not on the append list,
-		 * and the first record on the append list isn't record 1.
+		 * there aren't any records in the page not on the append list,
+		 * and the append list's first record isn't the first record on
+		 * the page. (Although implemented as a test of the page values,
+		 * this is really a test for a tree where the first inserted
+		 * record wasn't record 1, any other page with only an append
+		 * list will have a first page record number matching the first
+		 * record in the append list.)
 		 *
 		 * The "right" place to handle this is probably in our caller.
 		 * The high-level cursor-previous routine would:
@@ -156,27 +167,26 @@ __cursor_fix_append_prev(WT_CURSOR_BTREE *cbt, int newpage)
 		 * into our caller.  Anyway, if this code breaks for any reason,
 		 * that's the way I'd go.
 		 *
-		 * If we're not pointing to a WT_INSERT entry, or we can't find
-		 * a WT_INSERT record that precedes our record name-space, check
-		 * if there are any records on the page.  If there aren't, then
-		 * we're in the magic zone, keep going until we get to a record
-		 * number of 1.
+		 * If we're not pointing to a WT_INSERT entry (we didn't find a
+		 * WT_INSERT record preceding our record name-space), check if
+		 * we've reached the beginning of this page, a possibility if a
+		 * page had a large number of items appended, and then split.
+		 * If not, check if there are any records on the page. If there
+		 * aren't, then we're in the magic zone, keep going until we get
+		 * to a record number matching the first record on the page.
 		 */
-		if (cbt->ins != NULL &&
-		    cbt->recno <= WT_INSERT_RECNO(cbt->ins))
-			WT_RET(__cursor_skip_prev(cbt));
 		if (cbt->ins == NULL &&
-		    (cbt->recno == 1 || __col_fix_last_recno(page) != 0))
+		    (cbt->recno == page->pg_fix_recno ||
+		    __col_fix_last_recno(page) != 0))
 			return (WT_NOTFOUND);
 	}
 
 	/*
-	 * This code looks different from the cursor-next code.  The append
-	 * list appears on the last page of the tree and contains the last
-	 * records in the tree.  If we're iterating through the tree, starting
-	 * at the last record in the tree, by definition we're starting a new
-	 * iteration and we set the record number to the last record found in
-	 * the tree.  Otherwise, decrement the record.
+	 * This code looks different from the cursor-next code. The append list
+	 * may be preceded by other rows. If we're iterating through the tree,
+	 * starting at the last record in the tree, by definition we're starting
+	 * a new iteration and we set the record number to the last record found
+	 * on the page. Otherwise, decrement the record.
 	 */
 	if (newpage)
 		__cursor_set_recno(cbt, WT_INSERT_RECNO(cbt->ins));
@@ -209,7 +219,7 @@ __cursor_fix_append_prev(WT_CURSOR_BTREE *cbt, int newpage)
  *	Move to the previous, fixed-length column-store item.
  */
 static inline int
-__cursor_fix_prev(WT_CURSOR_BTREE *cbt, int newpage)
+__cursor_fix_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 {
 	WT_BTREE *btree;
 	WT_ITEM *val;
@@ -258,7 +268,7 @@ new_page:
  *	Return the previous variable-length entry on the append list.
  */
 static inline int
-__cursor_var_append_prev(WT_CURSOR_BTREE *cbt, int newpage)
+__cursor_var_append_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 {
 	WT_ITEM *val;
 	WT_SESSION_IMPL *session;
@@ -281,7 +291,8 @@ new_page:	if (cbt->ins == NULL)
 		if ((upd = __wt_txn_read(session, cbt->ins->upd)) == NULL)
 			continue;
 		if (WT_UPDATE_DELETED_ISSET(upd)) {
-			++cbt->page_deleted_count;
+			if (__wt_txn_visible_all(session, upd->txnid))
+				++cbt->page_deleted_count;
 			continue;
 		}
 		val->data = WT_UPDATE_DATA(upd);
@@ -296,7 +307,7 @@ new_page:	if (cbt->ins == NULL)
  *	Move to the previous, variable-length column-store item.
  */
 static inline int
-__cursor_var_prev(WT_CURSOR_BTREE *cbt, int newpage)
+__cursor_var_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 {
 	WT_CELL *cell;
 	WT_CELL_UNPACK unpack;
@@ -343,7 +354,8 @@ new_page:	if (cbt->recno < page->pg_var_recno)
 		    NULL : __wt_txn_read(session, cbt->ins->upd);
 		if (upd != NULL) {
 			if (WT_UPDATE_DELETED_ISSET(upd)) {
-				++cbt->page_deleted_count;
+				if (__wt_txn_visible_all(session, upd->txnid))
+					++cbt->page_deleted_count;
 				continue;
 			}
 
@@ -414,7 +426,7 @@ new_page:	if (cbt->recno < page->pg_var_recno)
  *	Move to the previous row-store item.
  */
 static inline int
-__cursor_row_prev(WT_CURSOR_BTREE *cbt, int newpage)
+__cursor_row_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 {
 	WT_INSERT *ins;
 	WT_ITEM *key, *val;
@@ -471,7 +483,8 @@ new_insert:	if ((ins = cbt->ins) != NULL) {
 			if ((upd = __wt_txn_read(session, ins->upd)) == NULL)
 				continue;
 			if (WT_UPDATE_DELETED_ISSET(upd)) {
-				++cbt->page_deleted_count;
+				if (__wt_txn_visible_all(session, upd->txnid))
+					++cbt->page_deleted_count;
 				continue;
 			}
 			key->data = WT_INSERT_KEY(ins);
@@ -505,7 +518,8 @@ new_insert:	if ((ins = cbt->ins) != NULL) {
 		rip = &page->pg_row_d[cbt->slot];
 		upd = __wt_txn_read(session, WT_ROW_UPDATE(page, rip));
 		if (upd != NULL && WT_UPDATE_DELETED_ISSET(upd)) {
-			++cbt->page_deleted_count;
+			if (__wt_txn_visible_all(session, upd->txnid))
+				++cbt->page_deleted_count;
 			continue;
 		}
 
@@ -519,13 +533,13 @@ new_insert:	if ((ins = cbt->ins) != NULL) {
  *	Move to the previous record in the tree.
  */
 int
-__wt_btcur_prev(WT_CURSOR_BTREE *cbt, int truncating)
+__wt_btcur_prev(WT_CURSOR_BTREE *cbt, bool truncating)
 {
 	WT_DECL_RET;
 	WT_PAGE *page;
 	WT_SESSION_IMPL *session;
 	uint32_t flags;
-	int newpage;
+	bool newpage;
 
 	session = (WT_SESSION_IMPL *)cbt->iface.session;
 
@@ -536,28 +550,27 @@ __wt_btcur_prev(WT_CURSOR_BTREE *cbt, int truncating)
 	if (truncating)
 		LF_SET(WT_READ_TRUNCATE);
 
-	WT_RET(__cursor_func_init(cbt, 0));
+	WT_RET(__cursor_func_init(cbt, false));
 
 	/*
 	 * If we aren't already iterating in the right direction, there's
 	 * some setup to do.
 	 */
 	if (!F_ISSET(cbt, WT_CBT_ITERATE_PREV))
-		__wt_btcur_iterate_setup(cbt, 0);
+		__wt_btcur_iterate_setup(cbt);
 
 	/*
 	 * Walk any page we're holding until the underlying call returns not-
 	 * found.  Then, move to the previous page, until we reach the start
 	 * of the file.
 	 */
-	for (newpage = 0;; newpage = 1) {
+	for (newpage = false;; newpage = true) {
 		page = cbt->ref == NULL ? NULL : cbt->ref->page;
-		WT_ASSERT(session, page == NULL || !WT_PAGE_IS_INTERNAL(page));
 
 		/*
-		 * The last page in a column-store has appended entries.
-		 * We handle it separately from the usual cursor code:
-		 * it's only that one page and it's in a simple format.
+		 * Column-store pages may have appended entries. Handle it
+		 * separately from the usual cursor code, it's in a simple
+		 * format.
 		 */
 		if (newpage && page != NULL && page->type != WT_PAGE_ROW_LEAF &&
 		    (cbt->ins_head = WT_COL_APPEND(page)) != NULL)
@@ -578,7 +591,7 @@ __wt_btcur_prev(WT_CURSOR_BTREE *cbt, int truncating)
 			F_CLR(cbt, WT_CBT_ITERATE_APPEND);
 			if (ret != WT_NOTFOUND)
 				break;
-			newpage = 1;
+			newpage = true;
 		}
 		if (page != NULL) {
 			switch (page->type) {
@@ -611,9 +624,13 @@ __wt_btcur_prev(WT_CURSOR_BTREE *cbt, int truncating)
 			__wt_page_evict_soon(page);
 		cbt->page_deleted_count = 0;
 
-		WT_ERR(__wt_tree_walk(session, &cbt->ref, NULL, flags));
+		WT_ERR(__wt_tree_walk(session, &cbt->ref, flags));
 		WT_ERR_TEST(cbt->ref == NULL, WT_NOTFOUND);
 	}
+#ifdef HAVE_DIAGNOSTIC
+	if (ret == 0)
+		WT_ERR(__wt_cursor_key_order_check(session, cbt, false));
+#endif
 
 err:	if (ret != 0)
 		WT_TRET(__cursor_reset(cbt));

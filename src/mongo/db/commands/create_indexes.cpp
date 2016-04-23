@@ -1,32 +1,30 @@
-// create_indexes.cpp
-
 /**
-*    Copyright (C) 2013 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2013-2016 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
@@ -43,7 +41,6 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -51,6 +48,7 @@
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -63,8 +61,8 @@ class CmdCreateIndex : public Command {
 public:
     CmdCreateIndex() : Command("createIndexes") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     virtual bool slaveOk() const {
         return false;
@@ -95,9 +93,8 @@ public:
                      int options,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        // ---  parse
+        const NamespaceString ns(parseNs(dbname, cmdObj));
 
-        NamespaceString ns(dbname, cmdObj[name].String());
         Status status = userAllowedWriteNS(ns);
         if (!status.isOK())
             return appendCommandStatus(result, status);
@@ -136,12 +133,21 @@ public:
             }
 
             if (spec["ns"].type() != String) {
-                errmsg = "spec has no ns";
+                errmsg = "ns field must be a string";
                 result.append("spec", spec);
                 return false;
             }
-            if (ns != spec["ns"].String()) {
-                errmsg = "namespace mismatch";
+
+            std::string nsFromUser = spec["ns"].String();
+            if (nsFromUser.empty()) {
+                errmsg = "ns field cannot be an empty string";
+                result.append("spec", spec);
+                return false;
+            }
+
+            if (ns != nsFromUser) {
+                errmsg = str::stream() << "value of ns field '" << nsFromUser
+                                       << "' doesn't match namespace " << ns.ns();
                 result.append("spec", spec);
                 return false;
             }
@@ -164,8 +170,9 @@ public:
         }
 
         Collection* collection = db->getCollection(ns.ns());
-        result.appendBool("createdCollectionAutomatically", collection == NULL);
-        if (!collection) {
+        if (collection) {
+            result.appendBool("createdCollectionAutomatically", false);
+        } else {
             MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
                 WriteUnitOfWork wunit(txn);
                 collection = db->createCollection(txn, ns.ns(), CollectionOptions());
@@ -173,10 +180,17 @@ public:
                 wunit.commit();
             }
             MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
+            result.appendBool("createdCollectionAutomatically", true);
         }
 
         const int numIndexesBefore = collection->getIndexCatalog()->numIndexesTotal(txn);
         result.append("numIndexesBefore", numIndexesBefore);
+
+        auto client = txn->getClient();
+        ScopeGuard lastOpSetterGuard =
+            MakeObjGuard(repl::ReplClientInfo::forClient(client),
+                         &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
+                         txn);
 
         MultiIndexBlock indexer(txn, collection);
         indexer.allowBackgroundBuilding();
@@ -188,8 +202,6 @@ public:
         if (specs.size() == 0) {
             result.append("numIndexesAfter", numIndexesBefore);
             result.append("note", "all indexes already exist");
-            // No-ops need to reset lastOp in the client, for write concern.
-            repl::ReplClientInfo::forClient(txn->getClient()).setLastOpToSystemLastOpTime(txn);
             return true;
         }
 
@@ -203,9 +215,15 @@ public:
                 status = checkUniqueIndexConstraints(txn, ns.ns(), spec["key"].Obj());
 
                 if (!status.isOK()) {
-                    appendCommandStatus(result, status);
-                    return false;
+                    return appendCommandStatus(result, status);
                 }
+            }
+            if (spec["v"].isNumber() && spec["v"].numberInt() == 0) {
+                return appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::CannotCreateIndex,
+                           str::stream() << "illegal index specification: " << spec << ". "
+                                         << "The option v:0 cannot be passed explicitly"));
             }
         }
 
@@ -276,8 +294,9 @@ public:
 
             for (size_t i = 0; i < specs.size(); i++) {
                 std::string systemIndexes = ns.getSystemIndexesCollection();
-                getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-                    txn, systemIndexes, specs[i]);
+                auto opObserver = getGlobalServiceContext()->getOpObserver();
+                if (opObserver)
+                    opObserver->onCreateIndex(txn, systemIndexes, specs[i]);
             }
 
             wunit.commit();
@@ -285,6 +304,8 @@ public:
         MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
 
         result.append("numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal(txn));
+
+        lastOpSetterGuard.Dismiss();
 
         return true;
     }
@@ -295,10 +316,11 @@ private:
                                               const BSONObj& newIdxKey) {
         invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
 
-        if (ShardingState::get(getGlobalServiceContext())->enabled()) {
+        ShardingState* const shardingState = ShardingState::get(txn);
+
+        if (shardingState->enabled()) {
             std::shared_ptr<CollectionMetadata> metadata(
-                ShardingState::get(getGlobalServiceContext())
-                    ->getCollectionMetadata(ns.toString()));
+                shardingState->getCollectionMetadata(ns.toString()));
             if (metadata) {
                 ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
                 if (!shardKeyPattern.isUniqueIndexCompatible(newIdxKey)) {

@@ -31,6 +31,7 @@
 
 #include <malloc.h>
 #include <iostream>
+#include <sched.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -43,6 +44,8 @@
 
 #include "processinfo.h"
 #include "boost/filesystem.hpp"
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
 #include <mongo/util/file.h>
 #include "mongo/util/log.h"
 
@@ -269,7 +272,7 @@ public:
         while (fgets(fstr, 1023, f) != NULL && !feof(f)) {
             // until the end of the file
             fstr[strlen(fstr) < 1 ? 0 : strlen(fstr) - 1] = '\0';
-            if (strncmp(fstr, "processor\t:", 11) == 0)
+            if (strncmp(fstr, "processor ", 10) == 0 || strncmp(fstr, "processor\t:", 11) == 0)
                 ++procCount;
             if (strncmp(fstr, "cpu MHz\t\t:", 10) == 0)
                 freq = fstr + 11;
@@ -407,6 +410,26 @@ ProcessInfo::~ProcessInfo() {}
 
 bool ProcessInfo::supported() {
     return true;
+}
+
+// get the number of CPUs available to the current process
+boost::optional<unsigned long> ProcessInfo::getNumAvailableCores() {
+    cpu_set_t set;
+
+    if (sched_getaffinity(0, sizeof(cpu_set_t), &set) == 0) {
+#ifdef CPU_COUNT  // glibc >= 2.6 has CPU_COUNT defined
+        return CPU_COUNT(&set);
+#else
+        unsigned long count = 0;
+        for (size_t i = 0; i < CPU_SETSIZE; i++)
+            if (CPU_ISSET(i, &set))
+                count++;
+        if (count > 0)
+            return count;
+#endif
+    }
+
+    return boost::none;
 }
 
 int ProcessInfo::getVirtualMemorySize() {

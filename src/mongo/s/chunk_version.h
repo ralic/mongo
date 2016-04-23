@@ -29,7 +29,6 @@
 #pragma once
 
 #include "mongo/db/jsobj.h"
-#include "mongo/s/optime_pair.h"
 
 namespace mongo {
 
@@ -52,10 +51,17 @@ class StatusWith;
  */
 struct ChunkVersion {
 public:
-    ChunkVersion() : _minor(0), _major(0), _epoch(OID()) {}
+    /**
+     * The name for the shard version information field, which shard-aware commands should include
+     * if they want to convey shard version.
+     */
+    static const char kShardVersionField[];
+
+    ChunkVersion() : _combined(0), _epoch(OID()) {}
 
     ChunkVersion(int major, int minor, const OID& epoch)
-        : _minor(minor), _major(major), _epoch(epoch) {}
+        : _combined(static_cast<uint64_t>(minor) | (static_cast<uint64_t>(major) << 32)),
+          _epoch(epoch) {}
 
     /**
      * Interprets the specified BSON content as the format for commands, which is in the form:
@@ -103,19 +109,11 @@ public:
     }
 
     void incMajor() {
-        _major++;
-        _minor = 0;
+        _combined = static_cast<uint64_t>(majorVersion() + 1) << 32;
     }
 
     void incMinor() {
-        _minor++;
-    }
-
-    // Incrementing an epoch creates a new, randomly generated identifier
-    void incEpoch() {
-        _epoch = OID::gen();
-        _major = 0;
-        _minor = 0;
+        _combined++;
     }
 
     // Note: this shouldn't be used as a substitute for version except in specific cases -
@@ -128,24 +126,14 @@ public:
         return _combined > 0;
     }
 
-    bool isEpochSet() const {
-        return _epoch.isSet();
-    }
-
-    std::string toString() const {
-        std::stringstream ss;
-        // Similar to month/day/year.  For the most part when debugging, we care about major
-        // so it's first
-        ss << _major << "|" << _minor << "||" << _epoch;
-        return ss.str();
-    }
-
     int majorVersion() const {
-        return _major;
+        return _combined >> 32;
     }
+
     int minorVersion() const {
-        return _minor;
+        return _combined & 0xFFFF;
     }
+
     OID epoch() const {
         return _epoch;
     }
@@ -155,6 +143,10 @@ public:
     // > < operators do not check epoch cases.  Generally if using == we need to handle
     // more complex cases.
     //
+
+    bool operator==(const ChunkVersion& otherVersion) const {
+        return equals(otherVersion);
+    }
 
     bool operator>(const ChunkVersion& otherVersion) const {
         return this->_combined > otherVersion._combined;
@@ -180,7 +172,7 @@ public:
     bool isWriteCompatibleWith(const ChunkVersion& otherVersion) const {
         if (!hasEqualEpoch(otherVersion))
             return false;
-        return otherVersion._major == _major;
+        return otherVersion.majorVersion() == majorVersion();
     }
 
     // Is this the same version?
@@ -209,10 +201,10 @@ public:
         if (otherVersion._epoch != _epoch)
             return false;
 
-        if (_major != otherVersion._major)
-            return _major < otherVersion._major;
+        if (majorVersion() != otherVersion.majorVersion())
+            return majorVersion() < otherVersion.majorVersion();
 
-        return _minor < otherVersion._minor;
+        return minorVersion() < otherVersion.minorVersion();
     }
 
     // Is this in the same epoch?
@@ -236,17 +228,6 @@ public:
     //
     // { version : <TS> } and { version : [<TS>,<OID>] } format
     //
-
-    static bool canParseBSON(const BSONElement& el, const std::string& prefix = "") {
-        bool canParse;
-        fromBSON(el, prefix, &canParse);
-        return canParse;
-    }
-
-    static ChunkVersion fromBSON(const BSONElement& el, const std::string& prefix = "") {
-        bool canParse;
-        return fromBSON(el, prefix, &canParse);
-    }
 
     static ChunkVersion fromBSON(const BSONElement& el, const std::string& prefix, bool* canParse) {
         *canParse = true;
@@ -314,17 +295,6 @@ public:
     // { version : [<TS>, <OID>] } format
     //
 
-    static bool canParseBSON(const BSONArray& arr) {
-        bool canParse;
-        fromBSON(arr, &canParse);
-        return canParse;
-    }
-
-    static ChunkVersion fromBSON(const BSONArray& arr) {
-        bool canParse;
-        return fromBSON(arr, &canParse);
-    }
-
     static ChunkVersion fromBSON(const BSONArray& arr, bool* canParse) {
         *canParse = false;
 
@@ -356,85 +326,18 @@ public:
     // versions that know nothing about epochs.
     //
 
-    BSONObj toBSONWithPrefix(const std::string& prefixIn) const {
+    BSONObj toBSONWithPrefix(const std::string& prefix) const {
+        invariant(!prefix.empty());
+
         BSONObjBuilder b;
-
-        std::string prefix = prefixIn;
-        if (prefix == "")
-            prefix = "version";
-
         b.appendTimestamp(prefix, _combined);
         b.append(prefix + "Epoch", _epoch);
         return b.obj();
     }
 
-    void addToBSON(BSONObjBuilder& b, const std::string& prefix = "") const {
+    void addToBSON(BSONObjBuilder& b, const std::string& prefix) const {
         b.appendElements(toBSONWithPrefix(prefix));
     }
-
-    BSONObj toBSON() const {
-        // ChunkVersion wants to be an array.
-        BSONArrayBuilder b;
-        b.appendTimestamp(_combined);
-        b.append(_epoch);
-        return b.arr();
-    }
-
-    void clear() {
-        _minor = 0;
-        _major = 0;
-        _epoch = OID();
-    }
-
-private:
-    union {
-        struct {
-            int _minor;
-            int _major;
-        };
-
-        uint64_t _combined;
-    };
-
-    OID _epoch;
-};
-
-inline std::ostream& operator<<(std::ostream& s, const ChunkVersion& v) {
-    s << v.toString();
-    return s;
-}
-
-
-/**
- * Represents a chunk version along with the optime from when it was retrieved. Provides logic to
- * serialize and deserialize the combo to BSON.
- */
-class ChunkVersionAndOpTime {
-public:
-    ChunkVersionAndOpTime(ChunkVersion chunkVersion);
-    ChunkVersionAndOpTime(ChunkVersion chunkVersion, repl::OpTime ts);
-
-    const ChunkVersion& getVersion() const {
-        return _verAndOpT.value;
-    }
-
-    const repl::OpTime& getOpTime() const {
-        return _verAndOpT.opTime;
-    }
-
-    /**
-     * Interprets the contents of the BSON documents as having been constructed in the format for
-     * write commands. The optime component is optional for backwards compatibility and if not
-     * present, the optime will be default initialized.
-     */
-    static StatusWith<ChunkVersionAndOpTime> parseFromBSONForCommands(const BSONObj& obj);
-
-    /**
-     * Interprets the contents of the BSON document as having been constructed in the format for the
-     * setShardVersion command. The optime component is optional for backwards compatibility and if
-     * not present, the optime will be default initialized.
-     */
-    static StatusWith<ChunkVersionAndOpTime> parseFromBSONForSetShardVersion(const BSONObj& obj);
 
     /**
      * Appends the contents to the specified builder in the format expected by the setShardVersion
@@ -447,8 +350,23 @@ public:
      */
     void appendForCommands(BSONObjBuilder* builder) const;
 
+    std::string toString() const {
+        StringBuilder sb;
+        sb << majorVersion() << "|" << minorVersion() << "||" << _epoch;
+        return sb.str();
+    }
+
+    BSONObj toBSON() const;
+
 private:
-    OpTimePair<ChunkVersion> _verAndOpT;
+    uint64_t _combined;
+
+    OID _epoch;
 };
+
+inline std::ostream& operator<<(std::ostream& s, const ChunkVersion& v) {
+    s << v.toString();
+    return s;
+}
 
 }  // namespace mongo

@@ -3,13 +3,22 @@ Import("env")
 env.SConscript(
     dirs=[
         'devnull',
-        'in_memory',
+        'ephemeral_for_test',
         'kv',
         'mmap_v1',
         'wiredtiger',
     ],
 )
 
+
+env.Library(
+    target='journal_listener',
+    source=[
+        'journal_listener.cpp',
+        ],
+    LIBDEPS=[
+        ],
+    )
 
 env.Library(
     target='index_entry_comparison',
@@ -64,6 +73,16 @@ env.Library(
 )
 
 env.Library(
+    target='storage_options',
+    source=[
+        'storage_options.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/server_parameters',
+    ],
+)
+
+env.Library(
     target='sorted_data_interface_test_harness',
     source=[
         'sorted_data_interface_test_bulkbuilder.cpp',
@@ -78,12 +97,14 @@ env.Library(
         'sorted_data_interface_test_harness.cpp',
         'sorted_data_interface_test_insert.cpp',
         'sorted_data_interface_test_isempty.cpp',
+        'sorted_data_interface_test_rand_cursor.cpp',
         'sorted_data_interface_test_rollback.cpp',
         'sorted_data_interface_test_spaceused.cpp',
         'sorted_data_interface_test_touch.cpp',
         'sorted_data_interface_test_unindex.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/unittest/unittest',
         'index_entry_comparison',
@@ -117,8 +138,9 @@ env.Library(
         'record_store_test_validate.cpp',
         ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/unittest/unittest',
         ],
     LIBDEPS_TAGS=[
         # Depends on newHarnessHelper, which does not have a unique definition

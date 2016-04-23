@@ -39,8 +39,8 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authz_session_external_state_s.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/memory.h"
@@ -73,7 +73,7 @@ Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(OperationC
                         ->runUserManagementReadCommand(txn, "admin", getParameterCmd, &builder);
     BSONObj cmdResult = builder.obj();
     if (!ok) {
-        return Command::getStatusFromCommandResult(cmdResult);
+        return getStatusFromCommandResult(cmdResult);
     }
 
     BSONElement versionElement = cmdResult[authSchemaVersionServerParameter];
@@ -99,7 +99,7 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* txn
                         ->runUserManagementReadCommand(txn, "admin", usersInfoCmd, &builder);
     BSONObj cmdResult = builder.obj();
     if (!ok) {
-        return Command::getStatusFromCommandResult(cmdResult);
+        return getStatusFromCommandResult(cmdResult);
     }
 
     std::vector<BSONElement> foundUsers = cmdResult["users"].Array();
@@ -130,7 +130,7 @@ Status AuthzManagerExternalStateMongos::getRoleDescription(OperationContext* txn
                         ->runUserManagementReadCommand(txn, "admin", rolesInfoCmd, &builder);
     BSONObj cmdResult = builder.obj();
     if (!ok) {
-        return Command::getStatusFromCommandResult(cmdResult);
+        return getStatusFromCommandResult(cmdResult);
     }
 
     std::vector<BSONElement> foundRoles = cmdResult["roles"].Array();
@@ -159,7 +159,7 @@ Status AuthzManagerExternalStateMongos::getRoleDescriptionsForDB(OperationContex
         grid.catalogManager(txn)->runUserManagementReadCommand(txn, dbname, rolesInfoCmd, &builder);
     BSONObj cmdResult = builder.obj();
     if (!ok) {
-        return Command::getStatusFromCommandResult(cmdResult);
+        return getStatusFromCommandResult(cmdResult);
     }
     for (BSONObjIterator it(cmdResult["roles"].Obj()); it.more(); it.next()) {
         result->push_back((*it).Obj().getOwned());
@@ -169,9 +169,9 @@ Status AuthzManagerExternalStateMongos::getRoleDescriptionsForDB(OperationContex
 
 bool AuthzManagerExternalStateMongos::hasAnyPrivilegeDocuments(OperationContext* txn) {
     BSONObj usersInfoCmd = BSON("usersInfo" << 1);
-    BSONObjBuilder builder;
-    const bool ok = grid.catalogManager(txn)
-                        ->runUserManagementReadCommand(txn, "admin", usersInfoCmd, &builder);
+    BSONObjBuilder userBuilder;
+    bool ok = grid.catalogManager(txn)
+                  ->runUserManagementReadCommand(txn, "admin", usersInfoCmd, &userBuilder);
     if (!ok) {
         // If we were unable to complete the query,
         // it's best to assume that there _are_ privilege documents.  This might happen
@@ -180,9 +180,22 @@ bool AuthzManagerExternalStateMongos::hasAnyPrivilegeDocuments(OperationContext*
         return true;
     }
 
-    BSONObj cmdResult = builder.obj();
+    BSONObj cmdResult = userBuilder.obj();
     std::vector<BSONElement> foundUsers = cmdResult["users"].Array();
-    return foundUsers.size() > 0;
+    if (foundUsers.size() > 0) {
+        return true;
+    }
+
+    BSONObj rolesInfoCmd = BSON("rolesInfo" << 1);
+    BSONObjBuilder roleBuilder;
+    ok = grid.catalogManager(txn)
+             ->runUserManagementReadCommand(txn, "admin", rolesInfoCmd, &roleBuilder);
+    if (!ok) {
+        return true;
+    }
+    cmdResult = roleBuilder.obj();
+    std::vector<BSONElement> foundRoles = cmdResult["roles"].Array();
+    return foundRoles.size() > 0;
 }
 
 }  // namespace mongo

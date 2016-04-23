@@ -32,24 +32,23 @@
 
 #include "mongo/client/fetcher.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/repl/replication_executor.h"
-#include "mongo/db/repl/replication_executor_test_fixture.h"
+#include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/rpc/metadata.h"
 
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
 using namespace mongo;
-using namespace mongo::repl;
 using executor::NetworkInterfaceMock;
 using executor::TaskExecutor;
 
-const HostAndPort target("localhost", -1);
+const HostAndPort source("localhost", -1);
 const BSONObj findCmdObj = BSON("find"
                                 << "coll");
 
-class FetcherTest : public ReplicationExecutorTest {
+class FetcherTest : public executor::ThreadPoolExecutorTest {
 public:
     FetcherTest();
     void clear();
@@ -57,6 +56,8 @@ public:
     void scheduleNetworkResponse(const BSONObj& obj, Milliseconds millis);
     void scheduleNetworkResponse(ErrorCodes::Error code, const std::string& reason);
     void scheduleNetworkResponseFor(const BSONObj& filter, const BSONObj& obj);
+    void scheduleNetworkResponseFor(NetworkInterfaceMock::NetworkOperationIterator noi,
+                                    const BSONObj& obj);
 
     // Calls scheduleNetworkResponse + finishProcessingNetworkResponse
     void processNetworkResponse(const BSONObj& obj);
@@ -90,22 +91,22 @@ FetcherTest::FetcherTest()
     : status(getDetectableErrorStatus()), cursorId(-1), nextAction(Fetcher::NextAction::kInvalid) {}
 
 void FetcherTest::setUp() {
-    ReplicationExecutorTest::setUp();
+    executor::ThreadPoolExecutorTest::setUp();
     clear();
-    fetcher.reset(new Fetcher(&getExecutor(),
-                              target,
-                              "db",
-                              findCmdObj,
-                              stdx::bind(&FetcherTest::_callback,
-                                         this,
-                                         stdx::placeholders::_1,
-                                         stdx::placeholders::_2,
-                                         stdx::placeholders::_3)));
+    fetcher = stdx::make_unique<Fetcher>(&getExecutor(),
+                                         source,
+                                         "db",
+                                         findCmdObj,
+                                         stdx::bind(&FetcherTest::_callback,
+                                                    this,
+                                                    stdx::placeholders::_1,
+                                                    stdx::placeholders::_2,
+                                                    stdx::placeholders::_3));
     launchExecutorThread();
 }
 
 void FetcherTest::tearDown() {
-    ReplicationExecutorTest::tearDown();
+    executor::ThreadPoolExecutorTest::tearDown();
     // Executor may still invoke fetcher's callback before shutting down.
     fetcher.reset();
 }
@@ -144,6 +145,15 @@ void FetcherTest::scheduleNetworkResponseFor(const BSONObj& filter, const BSONOb
     net->scheduleResponse(req, net->now(), responseStatus);
 }
 
+void FetcherTest::scheduleNetworkResponseFor(NetworkInterfaceMock::NetworkOperationIterator noi,
+                                             const BSONObj& obj) {
+    NetworkInterfaceMock* net = getNet();
+    Milliseconds millis(0);
+    executor::RemoteCommandResponse response(obj, BSONObj(), millis);
+    TaskExecutor::ResponseStatus responseStatus(response);
+    net->scheduleResponse(noi, net->now(), responseStatus);
+}
+
 void FetcherTest::scheduleNetworkResponse(ErrorCodes::Error code, const std::string& reason) {
     NetworkInterfaceMock* net = getNet();
     ASSERT_TRUE(net->hasReadyRequests());
@@ -152,13 +162,19 @@ void FetcherTest::scheduleNetworkResponse(ErrorCodes::Error code, const std::str
 }
 
 void FetcherTest::processNetworkResponse(const BSONObj& obj) {
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(obj);
     finishProcessingNetworkResponse();
+    net->exitNetwork();
 }
 
 void FetcherTest::processNetworkResponse(ErrorCodes::Error code, const std::string& reason) {
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(code, reason);
     finishProcessingNetworkResponse();
+    net->exitNetwork();
 }
 
 void FetcherTest::finishProcessingNetworkResponse() {
@@ -191,28 +207,42 @@ void FetcherTest::_callback(const StatusWith<Fetcher::QueryResponse>& result,
     }
 }
 
-void unusedFetcherCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
-                           Fetcher::NextAction* nextAction,
-                           BSONObjBuilder* getMoreBob) {
+void unreachableCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
+                         Fetcher::NextAction* nextAction,
+                         BSONObjBuilder* getMoreBob) {
     FAIL("should not reach here");
 }
+
+void doNothingCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
+                       Fetcher::NextAction* nextAction,
+                       BSONObjBuilder* getMoreBob) {}
 
 TEST_F(FetcherTest, InvalidConstruction) {
     TaskExecutor& executor = getExecutor();
 
     // Null executor.
-    ASSERT_THROWS(Fetcher(nullptr, target, "db", findCmdObj, unusedFetcherCallback), UserException);
+    ASSERT_THROWS_CODE_AND_WHAT(Fetcher(nullptr, source, "db", findCmdObj, unreachableCallback),
+                                UserException,
+                                ErrorCodes::BadValue,
+                                "null task executor");
 
     // Empty database name.
-    ASSERT_THROWS(Fetcher(&executor, target, "", findCmdObj, unusedFetcherCallback), UserException);
+    ASSERT_THROWS_CODE_AND_WHAT(Fetcher(&executor, source, "", findCmdObj, unreachableCallback),
+                                UserException,
+                                ErrorCodes::BadValue,
+                                "database name cannot be empty");
 
     // Empty command object.
-    ASSERT_THROWS(Fetcher(&executor, target, "db", BSONObj(), unusedFetcherCallback),
-                  UserException);
+    ASSERT_THROWS_CODE_AND_WHAT(Fetcher(&executor, source, "db", BSONObj(), unreachableCallback),
+                                UserException,
+                                ErrorCodes::BadValue,
+                                "command object cannot be empty");
 
     // Callback function cannot be null.
-    ASSERT_THROWS(Fetcher(&executor, target, "db", findCmdObj, Fetcher::CallbackFn()),
-                  UserException);
+    ASSERT_THROWS_CODE_AND_WHAT(Fetcher(&executor, source, "db", findCmdObj, Fetcher::CallbackFn()),
+                                UserException,
+                                ErrorCodes::BadValue,
+                                "callback function cannot be null");
 }
 
 // Command object can refer to any command that returns a cursor. This
@@ -221,18 +251,44 @@ TEST_F(FetcherTest, NonFindCommand) {
     TaskExecutor& executor = getExecutor();
 
     Fetcher(&executor,
-            target,
+            source,
             "db",
             BSON("listIndexes"
                  << "coll"),
-            unusedFetcherCallback);
-    Fetcher(&executor, target, "db", BSON("listCollections" << 1), unusedFetcherCallback);
-    Fetcher(&executor, target, "db", BSON("a" << 1), unusedFetcherCallback);
+            unreachableCallback);
+    Fetcher(&executor, source, "db", BSON("listCollections" << 1), unreachableCallback);
+    Fetcher(&executor, source, "db", BSON("a" << 1), unreachableCallback);
+}
+
+TEST_F(FetcherTest, RemoteCommandRequestShouldContainCommandParametersPassedToConstructor) {
+    auto metadataObj = BSON("x" << 1);
+    Milliseconds timeout(8000);
+
+    fetcher = stdx::make_unique<Fetcher>(
+        &getExecutor(), source, "db", findCmdObj, doNothingCallback, metadataObj, timeout);
+
+    ASSERT_EQUALS(source, fetcher->getSource());
+    ASSERT_EQUALS(findCmdObj, fetcher->getCommandObject());
+    ASSERT_EQUALS(metadataObj, fetcher->getMetadataObject());
+    ASSERT_EQUALS(timeout, fetcher->getTimeout());
+
+    ASSERT_OK(fetcher->schedule());
+
+    auto net = getNet();
+    net->enterNetwork();
+    ASSERT_TRUE(net->hasReadyRequests());
+    auto noi = net->getNextReadyRequest();
+    auto request = noi->getRequest();
+    net->exitNetwork();
+
+    ASSERT_EQUALS(source, request.target);
+    ASSERT_EQUALS(findCmdObj, request.cmdObj);
+    ASSERT_EQUALS(metadataObj, request.metadata);
+    ASSERT_EQUALS(timeout, request.timeout);
 }
 
 TEST_F(FetcherTest, GetDiagnosticString) {
-    Fetcher fetcher(&getExecutor(), target, "db", findCmdObj, unusedFetcherCallback);
-    ASSERT_FALSE(fetcher.getDiagnosticString().empty());
+    ASSERT_FALSE(fetcher->getDiagnosticString().empty());
 }
 
 TEST_F(FetcherTest, IsActiveAfterSchedule) {
@@ -265,21 +321,38 @@ TEST_F(FetcherTest, ShutdownBeforeSchedule) {
 
 TEST_F(FetcherTest, ScheduleAndCancel) {
     ASSERT_OK(fetcher->schedule());
+
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(BSON("ok" << 1));
+    net->exitNetwork();
 
     fetcher->cancel();
+
+    net->enterNetwork();
     finishProcessingNetworkResponse();
+    net->exitNetwork();
 
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status.code());
 }
 
 TEST_F(FetcherTest, ScheduleButShutdown) {
     ASSERT_OK(fetcher->schedule());
-    scheduleNetworkResponse(BSON("ok" << 1));
 
+    auto net = getNet();
+    net->enterNetwork();
+    scheduleNetworkResponse(BSON("ok" << 1));
+    // Network interface should not deliver mock response to callback
+    // until runReadyNetworkOperations() is called.
+    net->exitNetwork();
+
+    ASSERT_TRUE(fetcher->isActive());
     getExecutor().shutdown();
-    // Network interface should not deliver mock response to callback.
-    finishProcessingNetworkResponse();
+
+    net->enterNetwork();
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+    ASSERT_FALSE(fetcher->isActive());
 
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status.code());
 }
@@ -431,7 +504,7 @@ TEST_F(FetcherTest, SetNextActionToContinueWhenNextBatchIsNotAvailable) {
                       Fetcher::NextAction* nextAction,
                       BSONObjBuilder* getMoreBob) {
         ASSERT_OK(fetchResult.getStatus());
-        Fetcher::QueryResponse batchData{fetchResult.getValue()};
+        Fetcher::QueryResponse batchData = fetchResult.getValue();
 
         ASSERT(nextAction);
         *nextAction = Fetcher::NextAction::kGetMore;
@@ -463,13 +536,19 @@ TEST_F(FetcherTest, FetchMultipleBatches) {
     callbackHook = appendGetMoreRequest;
 
     ASSERT_OK(fetcher->schedule());
+
     const BSONObj doc = BSON("_id" << 1);
+
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "firstBatch" << BSON_ARRAY(doc)) << "ok" << 1),
         Milliseconds(100));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -480,14 +559,18 @@ TEST_F(FetcherTest, FetchMultipleBatches) {
     ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
     ASSERT_TRUE(fetcher->isActive());
 
-    ASSERT_TRUE(getNet()->hasReadyRequests());
     const BSONObj doc2 = BSON("_id" << 2);
+
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "nextBatch" << BSON_ARRAY(doc2)) << "ok" << 1),
         Milliseconds(200));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -498,14 +581,18 @@ TEST_F(FetcherTest, FetchMultipleBatches) {
     ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
     ASSERT_TRUE(fetcher->isActive());
 
-    ASSERT_TRUE(getNet()->hasReadyRequests());
     const BSONObj doc3 = BSON("_id" << 3);
+
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 0LL << "ns"
                                    << "db.coll"
                                    << "nextBatch" << BSON_ARRAY(doc3)) << "ok" << 1),
         Milliseconds(300));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(0, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -516,19 +603,27 @@ TEST_F(FetcherTest, FetchMultipleBatches) {
     ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     ASSERT_FALSE(fetcher->isActive());
 
+    net->enterNetwork();
     ASSERT_FALSE(getNet()->hasReadyRequests());
+    net->exitNetwork();
 }
 
 TEST_F(FetcherTest, ScheduleGetMoreAndCancel) {
     callbackHook = appendGetMoreRequest;
 
     ASSERT_OK(fetcher->schedule());
+
     const BSONObj doc = BSON("_id" << 1);
+
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "firstBatch" << BSON_ARRAY(doc)) << "ok" << 1));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -537,13 +632,16 @@ TEST_F(FetcherTest, ScheduleGetMoreAndCancel) {
     ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
     ASSERT_TRUE(fetcher->isActive());
 
-    ASSERT_TRUE(getNet()->hasReadyRequests());
     const BSONObj doc2 = BSON("_id" << 2);
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "nextBatch" << BSON_ARRAY(doc2)) << "ok" << 1));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -553,7 +651,11 @@ TEST_F(FetcherTest, ScheduleGetMoreAndCancel) {
     ASSERT_TRUE(fetcher->isActive());
 
     fetcher->cancel();
+
+    net->enterNetwork();
     finishProcessingNetworkResponse();
+    net->exitNetwork();
+
     ASSERT_NOT_OK(status);
 }
 
@@ -561,12 +663,18 @@ TEST_F(FetcherTest, ScheduleGetMoreButShutdown) {
     callbackHook = appendGetMoreRequest;
 
     ASSERT_OK(fetcher->schedule());
+
     const BSONObj doc = BSON("_id" << 1);
+
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "firstBatch" << BSON_ARRAY(doc)) << "ok" << 1));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -575,13 +683,17 @@ TEST_F(FetcherTest, ScheduleGetMoreButShutdown) {
     ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
     ASSERT_TRUE(fetcher->isActive());
 
-    ASSERT_TRUE(getNet()->hasReadyRequests());
     const BSONObj doc2 = BSON("_id" << 2);
+
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "nextBatch" << BSON_ARRAY(doc2)) << "ok" << 1));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -591,8 +703,64 @@ TEST_F(FetcherTest, ScheduleGetMoreButShutdown) {
     ASSERT_TRUE(fetcher->isActive());
 
     getExecutor().shutdown();
-    finishProcessingNetworkResponse();
+
+    net->enterNetwork();
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_NOT_OK(status);
+}
+
+
+TEST_F(FetcherTest, EmptyGetMoreRequestAfterFirstBatchMakesFetcherInactiveAndKillsCursor) {
+    startCapturingLogMessages();
+
+    callbackHook = [](const StatusWith<Fetcher::QueryResponse>& fetchResult,
+                      Fetcher::NextAction* nextAction,
+                      BSONObjBuilder* getMoreBob) {};
+
+    ASSERT_OK(fetcher->schedule());
+
+    const BSONObj doc = BSON("_id" << 1);
+
+    auto net = getNet();
+    net->enterNetwork();
+    scheduleNetworkResponse(
+        BSON("cursor" << BSON("id" << 1LL << "ns"
+                                   << "db.coll"
+                                   << "firstBatch" << BSON_ARRAY(doc)) << "ok" << 1));
+    getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    ASSERT_OK(status);
+    ASSERT_EQUALS(1LL, cursorId);
+    ASSERT_EQUALS("db.coll", nss.ns());
+    ASSERT_EQUALS(1U, documents.size());
+    ASSERT_EQUALS(doc, documents.front());
+    ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
+    ASSERT_FALSE(fetcher->isActive());
+
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    auto noi = getNet()->getNextReadyRequest();
+    auto request = noi->getRequest();
+    net->exitNetwork();
+
+    ASSERT_EQUALS(nss.db(), request.dbname);
+    auto&& cmdObj = request.cmdObj;
+    auto firstElement = cmdObj.firstElement();
+    ASSERT_EQUALS("killCursors", firstElement.fieldNameStringData());
+    ASSERT_EQUALS(nss.coll(), firstElement.String());
+    ASSERT_EQUALS(mongo::BSONType::Array, cmdObj["cursors"].type());
+    auto cursors = cmdObj["cursors"].Array();
+    ASSERT_EQUALS(1U, cursors.size());
+    ASSERT_EQUALS(cursorId, cursors.front().numberLong());
+
+    // killCursors command request will be canceled by executor on shutdown.
+    tearDown();
+    ASSERT_EQUALS(1,
+                  countLogLinesContaining(
+                      "killCursors command task failed: CallbackCanceled: Callback canceled"));
 }
 
 void setNextActionToNoAction(const StatusWith<Fetcher::QueryResponse>& fetchResult,
@@ -602,15 +770,23 @@ void setNextActionToNoAction(const StatusWith<Fetcher::QueryResponse>& fetchResu
 }
 
 TEST_F(FetcherTest, UpdateNextActionAfterSecondBatch) {
+    startCapturingLogMessages();
+
     callbackHook = appendGetMoreRequest;
 
     ASSERT_OK(fetcher->schedule());
+
     const BSONObj doc = BSON("_id" << 1);
+
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "firstBatch" << BSON_ARRAY(doc)) << "ok" << 1));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -619,18 +795,19 @@ TEST_F(FetcherTest, UpdateNextActionAfterSecondBatch) {
     ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
     ASSERT_TRUE(fetcher->isActive());
 
-    ASSERT_TRUE(getNet()->hasReadyRequests());
     const BSONObj doc2 = BSON("_id" << 2);
+
+    callbackHook = setNextActionToNoAction;
+
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "nextBatch" << BSON_ARRAY(doc2)) << "ok" << 1));
-
-    callbackHook = setNextActionToNoAction;
-
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
 
-    scheduleNetworkResponseFor(BSON("killCursors" << nss.coll()), BSON("ok" << false));
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -638,10 +815,34 @@ TEST_F(FetcherTest, UpdateNextActionAfterSecondBatch) {
     ASSERT_EQUALS(doc2, documents.front());
     ASSERT_TRUE(Fetcher::NextAction::kNoAction == nextAction);
     ASSERT_FALSE(fetcher->isActive());
+
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    auto noi = getNet()->getNextReadyRequest();
+    auto request = noi->getRequest();
+    net->exitNetwork();
+
+    ASSERT_EQUALS(nss.db(), request.dbname);
+    auto&& cmdObj = request.cmdObj;
+    auto firstElement = cmdObj.firstElement();
+    ASSERT_EQUALS("killCursors", firstElement.fieldNameStringData());
+    ASSERT_EQUALS(nss.coll(), firstElement.String());
+    ASSERT_EQUALS(mongo::BSONType::Array, cmdObj["cursors"].type());
+    auto cursors = cmdObj["cursors"].Array();
+    ASSERT_EQUALS(1U, cursors.size());
+    ASSERT_EQUALS(cursorId, cursors.front().numberLong());
+
+    // Failed killCursors command response should be logged.
+    net->enterNetwork();
+    scheduleNetworkResponseFor(noi, BSON("ok" << false));
+    getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    ASSERT_EQUALS(1, countLogLinesContaining("killCursors command failed: UnknownError"));
 }
 
 /**
- * This will be invoked twice before the fetcher returns control to the replication executor.
+ * This will be invoked twice before the fetcher returns control to the task executor.
  */
 void shutdownDuringSecondBatch(const StatusWith<Fetcher::QueryResponse>& fetchResult,
                                Fetcher::NextAction* nextAction,
@@ -655,7 +856,7 @@ void shutdownDuringSecondBatch(const StatusWith<Fetcher::QueryResponse>& fetchRe
 
     // First time during second batch
     ASSERT_OK(fetchResult.getStatus());
-    Fetcher::QueryResponse batchData{fetchResult.getValue()};
+    Fetcher::QueryResponse batchData = fetchResult.getValue();
     ASSERT_EQUALS(1U, batchData.documents.size());
     ASSERT_EQUALS(doc2, batchData.documents.front());
     ASSERT_TRUE(Fetcher::NextAction::kGetMore == *nextAction);
@@ -668,15 +869,23 @@ void shutdownDuringSecondBatch(const StatusWith<Fetcher::QueryResponse>& fetchRe
 }
 
 TEST_F(FetcherTest, ShutdownDuringSecondBatch) {
+    startCapturingLogMessages();
+
     callbackHook = appendGetMoreRequest;
 
     ASSERT_OK(fetcher->schedule());
+
     const BSONObj doc = BSON("_id" << 1);
+
+    auto net = getNet();
+    net->enterNetwork();
     scheduleNetworkResponse(
         BSON("cursor" << BSON("id" << 1LL << "ns"
                                    << "db.coll"
                                    << "firstBatch" << BSON_ARRAY(doc)) << "ok" << 1));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
     ASSERT_OK(status);
     ASSERT_EQUALS(1LL, cursorId);
     ASSERT_EQUALS("db.coll", nss.ns());
@@ -685,12 +894,7 @@ TEST_F(FetcherTest, ShutdownDuringSecondBatch) {
     ASSERT_TRUE(Fetcher::NextAction::kGetMore == nextAction);
     ASSERT_TRUE(fetcher->isActive());
 
-    ASSERT_TRUE(getNet()->hasReadyRequests());
     const BSONObj doc2 = BSON("_id" << 2);
-    scheduleNetworkResponse(
-        BSON("cursor" << BSON("id" << 1LL << "ns"
-                                   << "db.coll"
-                                   << "nextBatch" << BSON_ARRAY(doc2)) << "ok" << 1));
 
     bool isShutdownCalled = false;
     callbackHook = stdx::bind(shutdownDuringSecondBatch,
@@ -701,7 +905,21 @@ TEST_F(FetcherTest, ShutdownDuringSecondBatch) {
                               &getExecutor(),
                               &isShutdownCalled);
 
+    net->enterNetwork();
+    ASSERT_TRUE(getNet()->hasReadyRequests());
+    scheduleNetworkResponse(
+        BSON("cursor" << BSON("id" << 1LL << "ns"
+                                   << "db.coll"
+                                   << "nextBatch" << BSON_ARRAY(doc2)) << "ok" << 1));
     getNet()->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    // Fetcher should attempt (unsuccessfully) to schedule a killCursors command.
+    ASSERT_EQUALS(
+        1,
+        countLogLinesContaining(
+            "failed to schedule killCursors command: ShutdownInProgress: Shutdown in progress"));
+
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
     ASSERT_FALSE(fetcher->isActive());
 }

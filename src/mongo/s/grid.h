@@ -28,24 +28,23 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
+#include <memory>
 
-#include "mongo/s/catalog/forwarding_catalog_manager.h"
-#include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/stdx/memory.h"
+#include "mongo/db/repl/optime.h"
 
 namespace mongo {
 
-class BSONObj;
+class BalancerConfiguration;
 class CatalogCache;
-class DBConfig;
+class CatalogManager;
+class ClusterCursorManager;
 class OperationContext;
-class SettingsType;
 class ShardRegistry;
-template <typename T>
-class StatusWith;
 
+namespace executor {
+class NetworkInterface;
+class TaskExecutorPool;
+}  // namespace executor
 
 /**
  * Holds the global sharding context. Single instance exists for a running server. Exists on
@@ -54,6 +53,12 @@ class StatusWith;
 class Grid {
 public:
     Grid();
+    ~Grid();
+
+    /**
+     * Retrieves the instance of Grid associated with the current service context.
+     */
+    static Grid* get(OperationContext* operationContext);
 
     /**
      * Called at startup time so the global sharding services can be set. This method must be called
@@ -62,15 +67,13 @@ public:
      * NOTE: Unit-tests are allowed to call it more than once, provided they reset the object's
      *       state using clearForUnitTests.
      */
-    void init(std::unique_ptr<ForwardingCatalogManager> catalogManager,
+    void init(std::unique_ptr<CatalogManager> catalogManager,
+              std::unique_ptr<CatalogCache> catalogCache,
               std::unique_ptr<ShardRegistry> shardRegistry,
-              std::unique_ptr<ClusterCursorManager> cursorManager);
-
-    /**
-     * Implicitly creates the specified database as non-sharded.
-     */
-    StatusWith<std::shared_ptr<DBConfig>> implicitCreateDb(OperationContext* txn,
-                                                           const std::string& dbName);
+              std::unique_ptr<ClusterCursorManager> cursorManager,
+              std::unique_ptr<BalancerConfiguration> balancerConfig,
+              std::unique_ptr<executor::TaskExecutorPool> executorPool,
+              executor::NetworkInterface* network);
 
     /**
      * @return true if shards and config servers are allowed to use 'localhost' in address
@@ -83,44 +86,72 @@ public:
     void setAllowLocalHost(bool allow);
 
     /**
-     * Returns true if the balancer should be running. Caller is responsible
-     * for making sure settings has the balancer key.
+     * Returns a pointer to a CatalogManager to use for accessing catalog data stored on the config
+     * servers.
      */
-    bool shouldBalance(const SettingsType& balancerSettings) const;
+    CatalogManager* catalogManager(OperationContext* txn) {
+        return _catalogManager.get();
+    }
 
-    /**
-     * Returns true if the config server settings indicate that the balancer should be active.
-     */
-    bool getConfigShouldBalance(OperationContext* txn) const;
-
-    ForwardingCatalogManager* catalogManager(OperationContext* txn);  // TODO(spencer): remove
-    ForwardingCatalogManager* catalogManager();
-
-    CatalogCache* catalogCache() {
+    CatalogCache* catalogCache() const {
         return _catalogCache.get();
     }
-    ShardRegistry* shardRegistry() {
+
+    ShardRegistry* shardRegistry() const {
         return _shardRegistry.get();
     }
 
-    ClusterCursorManager* getCursorManager() {
+    ClusterCursorManager* getCursorManager() const {
         return _cursorManager.get();
     }
+
+    executor::TaskExecutorPool* getExecutorPool() {
+        return _executorPool.get();
+    }
+
+    executor::NetworkInterface* getNetwork() {
+        return _network;
+    }
+
+    BalancerConfiguration* getBalancerConfiguration() const {
+        return _balancerConfig.get();
+    }
+
+    repl::OpTime configOpTime() const;
+
+    void advanceConfigOpTime(repl::OpTime opTime);
 
     /**
      * Clears the grid object so that it can be reused between test executions. This will not
      * be necessary if grid is hanging off the global ServiceContext and each test gets its
      * own service context.
      *
+     * Note: shardRegistry()->shutdown() must be called before this method is called.
+     *
      * NOTE: Do not use this outside of unit-tests.
      */
     void clearForUnitTests();
 
 private:
-    std::unique_ptr<ForwardingCatalogManager> _catalogManager;
+    std::unique_ptr<CatalogManager> _catalogManager;
     std::unique_ptr<CatalogCache> _catalogCache;
     std::unique_ptr<ShardRegistry> _shardRegistry;
     std::unique_ptr<ClusterCursorManager> _cursorManager;
+    std::unique_ptr<BalancerConfiguration> _balancerConfig;
+
+    // Executor pool for scheduling work and remote commands to shards and config servers. Each
+    // contained executor has a connection hook set on it for sending/receiving sharding metadata.
+    std::unique_ptr<executor::TaskExecutorPool> _executorPool;
+
+    // Network interface being used by the fixed executor in _executorPool.  Used for asking
+    // questions about the network configuration, such as getting the current server's hostname.
+    executor::NetworkInterface* _network;
+
+    // Protects _configOpTime.
+    mutable stdx::mutex _mutex;
+
+    // Last known highest opTime from the config server that should be used when doing reads.
+    repl::OpTime _configOpTime;
 
     // can 'localhost' be used in shard addresses?
     bool _allowLocalShard;

@@ -181,6 +181,8 @@ public:
 
     /*
      * Returns a system clock time_point representing the same point in time as this Date_t.
+     * Warning: careful when using with Date_t::max() as it can have a value that is bigger than
+     * time_point can store.
      */
     stdx::chrono::system_clock::time_point toSystemTimePoint() const;
 
@@ -195,6 +197,8 @@ public:
     /**
      * Implicit conversion operator to system clock time point.  Enables use of Date_t with
      * condition_variable::wait_until.
+     * Warning: careful when using with Date_t::max() as it can have a value that is bigger than
+     * time_point can store.
      */
     operator stdx::chrono::system_clock::time_point() const {
         return toSystemTimePoint();
@@ -264,6 +268,11 @@ private:
 std::string terseCurrentTime(bool colonsOk = true);
 
 /**
+ * Produces a short UTC date + time approriate for file names with Z appended.
+ */
+std::string terseUTCCurrentTime();
+
+/**
  * Formats "date" according to the ISO 8601 extended form standard, including date,
  * and time with milliseconds decimal component, in the UTC timezone.
  *
@@ -319,7 +328,11 @@ bool toPointInTime(const std::string& str, boost::posix_time::ptime* timeOfDay);
 void sleepsecs(int s);
 void sleepmillis(long long ms);
 void sleepmicros(long long micros);
-void sleepFor(const Milliseconds& time);
+
+template <typename DurationType>
+void sleepFor(DurationType time) {
+    sleepmicros(durationCount<Microseconds>(time));
+}
 
 class Backoff {
 public:

@@ -37,16 +37,25 @@ namespace mongo {
 
 class BSONArrayBuilder;
 class BSONElement;
+class BSONElementCmpWithoutField;
 class BSONObj;
 class BSONObjBuilder;
 class BSONObjBuilderValueStream;
 class BSONObjIterator;
 class Ordering;
 struct BSONArray;  // empty subclass of BSONObj useful for overloading
-struct BSONElementCmpWithoutField;
 
-extern const BSONObj maxKey;
-extern const BSONObj minKey;
+extern const BSONObj kMaxBSONKey;
+extern const BSONObj kMinBSONKey;
+
+/**
+    determines BSON types considered valid by validate
+*/
+enum class BSONVersion { kV1_0, kV1_1, kLatest = kV1_1 };
+
+// Flag that determines whether we should accept decimal types in object validation, and default
+// to KeyString V1 indexes on non-MMAP storage engines. Set by enableBSON1_1 server parameter.
+extern bool enableBSON1_1;
 
 /**
     the complete list of valid BSON types
@@ -105,6 +114,11 @@ enum BSONType {
  * returns the name of the argument's type
  */
 const char* typeName(BSONType type);
+
+/**
+ * Returns whether or not 'type' can be converted to a valid BSONType.
+ */
+bool isValidBSONType(int type);
 
 /* subtypes of BinData.
    bdtCustom and above are ones that the JS compiler understands, but are

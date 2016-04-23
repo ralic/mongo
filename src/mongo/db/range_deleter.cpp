@@ -259,34 +259,21 @@ const int kWTimeoutMillis = 60 * 60 * 1000;
 
 bool _waitForMajority(OperationContext* txn, std::string* errMsg) {
     const WriteConcernOptions writeConcern(
-        WriteConcernOptions::kMajority, WriteConcernOptions::NONE, kWTimeoutMillis);
+        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, kWTimeoutMillis);
 
     repl::ReplicationCoordinator::StatusAndDuration replStatus =
         repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOpForClient(txn,
                                                                                    writeConcern);
-    Milliseconds elapsedTime = replStatus.duration;
-    if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
-        *errMsg = str::stream() << "rangeDeleter timed out after "
-                                << durationCount<Seconds>(elapsedTime)
-                                << " seconds while waiting"
-                                   " for deletions to be replicated to majority nodes";
+    if (!replStatus.status.isOK()) {
+        *errMsg = str::stream() << "rangeDeleter failed while waiting for replication after "
+                                << durationCount<Seconds>(replStatus.duration) << " seconds due to "
+                                << replStatus.status.toString();
         log() << *errMsg;
-    } else if (replStatus.status.code() == ErrorCodes::NotMaster) {
-        *errMsg = str::stream() << "rangeDeleter no longer PRIMARY after "
-                                << durationCount<Seconds>(elapsedTime)
-                                << " seconds while waiting"
-                                   " for deletions to be replicated to majority nodes";
-    } else {
-        LOG(elapsedTime < Seconds(30) ? 1 : 0)
-            << "rangeDeleter took " << durationCount<Seconds>(elapsedTime) << " seconds "
-            << " waiting for deletes to be replicated to majority nodes";
-
-        fassert(18512, replStatus.status);
     }
 
     return replStatus.status.isOK();
 }
-}
+}  // namespace
 
 bool RangeDeleter::deleteNow(OperationContext* txn,
                              const RangeDeleterOptions& options,
@@ -319,30 +306,30 @@ bool RangeDeleter::deleteNow(OperationContext* txn,
         _deletesInProgress++;
     }
 
-    set<CursorId> cursorsToWait;
+    RangeDeleteEntry taskDetails(options);
     if (options.waitForOpenCursors) {
-        _env->getCursorIds(txn, ns, &cursorsToWait);
+        _env->getCursorIds(txn, ns, &taskDetails.cursorsToWait);
     }
 
     long long checkIntervalMillis = 5;
 
-    RangeDeleteEntry taskDetails(options);
+
     taskDetails.stats.queueStartTS = jsTime();
 
-    for (; !cursorsToWait.empty(); sleepmillis(checkIntervalMillis)) {
+    for (; !taskDetails.cursorsToWait.empty(); sleepmillis(checkIntervalMillis)) {
         logCursorsWaiting(&taskDetails);
 
         set<CursorId> cursorsNow;
         _env->getCursorIds(txn, ns, &cursorsNow);
 
         set<CursorId> cursorsLeft;
-        std::set_intersection(cursorsToWait.begin(),
-                              cursorsToWait.end(),
+        std::set_intersection(taskDetails.cursorsToWait.begin(),
+                              taskDetails.cursorsToWait.end(),
                               cursorsNow.begin(),
                               cursorsNow.end(),
                               std::inserter(cursorsLeft, cursorsLeft.end()));
 
-        cursorsToWait.swap(cursorsLeft);
+        taskDetails.cursorsToWait.swap(cursorsLeft);
 
         if (stopRequested()) {
             *errMsg = "deleter was stopped.";

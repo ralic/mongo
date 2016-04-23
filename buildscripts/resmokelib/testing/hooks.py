@@ -8,6 +8,7 @@ from __future__ import absolute_import
 import os
 import sys
 
+import bson
 import pymongo
 
 from . import fixtures
@@ -188,6 +189,8 @@ class CheckReplDBHash(CustomBehavior):
                 success = all_matched and success
 
             if not success:
+                CheckReplDBHash._dump_oplog(primary_conn, secondary_conn, sb)
+
                 # Adding failures to a TestReport requires traceback information, so we raise
                 # a 'self.test_case.failureException' that we will catch ourselves.
                 self.test_case.logger.info("\n    ".join(sb))
@@ -197,7 +200,7 @@ class CheckReplDBHash(CustomBehavior):
             self.test_case.return_code = 1
             test_report.addFailure(self.test_case, sys.exc_info())
             test_report.stopTest(self.test_case)
-            raise errors.ServerFailure(err.message)
+            raise errors.ServerFailure(err.args[0])
         except pymongo.errors.WTimeoutError:
             self.test_case.logger.exception("Awaiting replication timed out.")
             self.test_case.return_code = 2
@@ -212,13 +215,27 @@ class CheckReplDBHash(CustomBehavior):
         """
 
         if self.started:
-            self.test_case.logger.exception("The dbhashes matched for all tests.")
+            self.test_case.logger.info("The dbhashes matched for all tests.")
             self.test_case.return_code = 0
             test_report.addSuccess(self.test_case)
             # TestReport.stopTest() has already been called if there was a failure.
             test_report.stopTest(self.test_case)
 
         self.started = False
+
+    @staticmethod
+    def _dump_oplog(primary_conn, secondary_conn, sb):
+
+        def dump_latest_docs(coll, limit=0):
+            docs = (doc for doc in coll.find().sort("$natural", pymongo.DESCENDING).limit(limit))
+            for doc in docs:
+                sb.append("    %s" % (doc))
+
+        LIMIT = 100
+        sb.append("Dumping the latest %d documents from the primary's oplog" % (LIMIT))
+        dump_latest_docs(primary_conn.local.oplog.rs, LIMIT)
+        sb.append("Dumping the latest %d documents from the secondary's oplog" % (LIMIT))
+        dump_latest_docs(secondary_conn.local.oplog.rs, LIMIT)
 
     @staticmethod
     def _check_all_db_hashes(primary_conn, secondary_conn, sb):
@@ -275,8 +292,11 @@ class CheckReplDBHash(CustomBehavior):
         list_db_output = secondary_conn.admin.command("listDatabases")
         secondary_dbs = [db["name"] for db in list_db_output["databases"]]
 
+        # There may be a difference in databases which is not considered an error, when
+        # the database only contains system collections. This difference is only logged
+        # when others are encountered, i.e., success = False.
         missing_on_primary, missing_on_secondary = CheckReplDBHash._check_difference(
-            set(primary_dbs), set(secondary_dbs), "database", sb)
+            set(primary_dbs), set(secondary_dbs), "database")
 
         for missing_db in missing_on_secondary:
             db = primary_conn[missing_db]
@@ -303,6 +323,7 @@ class CheckReplDBHash(CustomBehavior):
             # It is only an error if there are any non-system collections in the database,
             # otherwise it's not well defined if it should exist or not.
             if non_system_colls:
+                sb.append("Database %s present on secondary but not on primary." % (missing_db))
                 CheckReplDBHash._dump_all_collections(db, non_system_colls, sb)
                 success = False
 
@@ -357,15 +378,15 @@ class CheckReplDBHash(CustomBehavior):
         secondary_coll_names = set(secondary_coll_hashes.keys())
 
         missing_on_primary, missing_on_secondary = CheckReplDBHash._check_difference(
-            primary_coll_names, secondary_coll_names, "collection", sb)
+            primary_coll_names, secondary_coll_names, "collection", sb=sb)
 
         if missing_on_primary or missing_on_secondary:
 
             # 'sb' already describes which collections are missing where.
             for coll_name in missing_on_primary:
-                CheckReplDBHash._dump_all_documents(primary_db, coll_name, sb)
-            for coll_name in missing_on_secondary:
                 CheckReplDBHash._dump_all_documents(secondary_db, coll_name, sb)
+            for coll_name in missing_on_secondary:
+                CheckReplDBHash._dump_all_documents(primary_db, coll_name, sb)
             return
 
         for coll_name in primary_coll_names & secondary_coll_names:
@@ -409,8 +430,10 @@ class CheckReplDBHash(CustomBehavior):
         collection on the secondary, if any.
         """
 
-        primary_coll = primary_db[coll_name]
-        secondary_coll = secondary_db[coll_name]
+        codec_options = bson.CodecOptions(document_class=TypeSensitiveSON)
+
+        primary_coll = primary_db.get_collection(coll_name, codec_options=codec_options)
+        secondary_coll = secondary_db.get_collection(coll_name, codec_options=codec_options)
 
         primary_docs = CheckReplDBHash._extract_documents(primary_coll)
         secondary_docs = CheckReplDBHash._extract_documents(secondary_coll)
@@ -460,6 +483,8 @@ class CheckReplDBHash(CustomBehavior):
                 sb.append("Mismatching document:")
                 sb.append("    primary:   %s" % (primary_doc))
                 sb.append("    secondary: %s" % (secondary_doc))
+                p_idx += 1
+                s_idx += 1
 
             # One node was missing a document. Since the documents are sorted by _id, the doc with
             # the smaller _id was the one that was skipped.
@@ -492,7 +517,7 @@ class CheckReplDBHash(CustomBehavior):
             sb.append("All documents matched.")
 
     @staticmethod
-    def _check_difference(primary_set, secondary_set, item_type_name, sb):
+    def _check_difference(primary_set, secondary_set, item_type_name, sb=None):
         """
         Returns true if the contents of 'primary_set' and
         'secondary_set' are identical, and false otherwise. The sets
@@ -511,8 +536,9 @@ class CheckReplDBHash(CustomBehavior):
         for item in secondary_set - primary_set:
             missing_on_primary.add(item)
 
-        CheckReplDBHash._append_differences(
-            missing_on_primary, missing_on_secondary, item_type_name, sb)
+        if sb is not None:
+            CheckReplDBHash._append_differences(
+                missing_on_primary, missing_on_secondary, item_type_name, sb)
 
         return (missing_on_primary, missing_on_secondary)
 
@@ -528,13 +554,13 @@ class CheckReplDBHash(CustomBehavior):
             sb.append("The following %ss were present on the secondary, but not on the"
                       " primary:" % (item_type_name))
             for item in missing_on_primary:
-                sb.append(item)
+                sb.append(str(item))
 
         if missing_on_secondary:
             sb.append("The following %ss were present on the primary, but not on the"
                       " secondary:" % (item_type_name))
             for item in missing_on_secondary:
-                sb.append(item)
+                sb.append(str(item))
 
     @staticmethod
     def _dump_all_collections(database, coll_names, sb):
@@ -565,8 +591,130 @@ class CheckReplDBHash(CustomBehavior):
         else:
             sb.append("No documents in %s.%s." % (database.name, coll_name))
 
+class TypeSensitiveSON(bson.SON):
+    """
+    Extends bson.SON to perform additional type-checking of document values
+    to differentiate BSON types.
+    """
+
+    def items_with_types(self):
+        """
+        Returns a list of triples. Each triple consists of a field name, a
+        field value, and a field type for each field in the document.
+        """
+
+        return [(key, self[key], type(self[key])) for key in self]
+
+    def __eq__(self, other):
+        """
+        Comparison to another TypeSensitiveSON is order-sensitive and
+        type-sensitive while comparison to a regular dictionary ignores order
+        and type mismatches.
+        """
+
+        if isinstance(other, TypeSensitiveSON):
+            return (len(self) == len(other) and
+                    self.items_with_types() == other.items_with_types())
+
+        raise TypeError("TypeSensitiveSON objects cannot be compared to other types")
+
+class ValidateCollections(CustomBehavior):
+    """
+    Runs full validation (db.collection.validate(true)) on all collections
+    in all databases on every standalone, or primary mongod. If validation
+    fails (validate.valid), then the validate return object is logged.
+
+    Compatible with all subclasses.
+    """
+    DEFAULT_FULL = True
+    DEFAULT_SCANDATA = True
+
+    def __init__(self, logger, fixture, full=DEFAULT_FULL, scandata=DEFAULT_SCANDATA):
+        CustomBehavior.__init__(self, logger, fixture)
+
+        if not isinstance(full, bool):
+            raise TypeError("Fixture option full is not specified as type bool")
+
+        if not isinstance(scandata, bool):
+            raise TypeError("Fixture option scandata is not specified as type bool")
+
+        self.test_case = testcases.TestCase(self.logger, "Hook", "#validate#")
+        self.started = False
+        self.full = full
+        self.scandata = scandata
+
+    def after_test(self, test_report):
+        """
+        After each test, run a full validation on all collections.
+        """
+
+        try:
+            if not self.started:
+                CustomBehavior.start_dynamic_test(self.test_case, test_report)
+                self.started = True
+
+            sb = []  # String builder.
+
+            # The self.fixture.port can be used for client connection to a
+            # standalone mongod, a replica-set primary, or mongos.
+            # TODO: Run collection validation on all nodes in a replica-set.
+            port = self.fixture.port
+            conn = utils.new_mongo_client(port=port)
+
+            success = ValidateCollections._check_all_collections(
+                conn, sb, self.full, self.scandata)
+
+            if not success:
+                # Adding failures to a TestReport requires traceback information, so we raise
+                # a 'self.test_case.failureException' that we will catch ourselves.
+                self.test_case.logger.info("\n    ".join(sb))
+                raise self.test_case.failureException("Collection validation failed")
+        except self.test_case.failureException as err:
+            self.test_case.logger.exception("Collection validation failed")
+            self.test_case.return_code = 1
+            test_report.addFailure(self.test_case, sys.exc_info())
+            test_report.stopTest(self.test_case)
+            raise errors.ServerFailure(err.args[0])
+
+    def after_suite(self, test_report):
+        """
+        If we get to this point, the #validate# test must have been
+        successful, so add it to the test report.
+        """
+
+        if self.started:
+            self.test_case.logger.info("Collection validation passed for all tests.")
+            self.test_case.return_code = 0
+            test_report.addSuccess(self.test_case)
+            # TestReport.stopTest() has already been called if there was a failure.
+            test_report.stopTest(self.test_case)
+
+        self.started = False
+
+    @staticmethod
+    def _check_all_collections(conn, sb, full, scandata):
+        """
+        Returns true if for all databases and collections validate_collection
+        succeeds. Returns false otherwise.
+
+        Logs a message if any database's collection fails validate_collection.
+        """
+
+        success = True
+
+        for db_name in conn.database_names():
+            for coll_name in conn[db_name].collection_names():
+                try:
+                    conn[db_name].validate_collection(coll_name, full=full, scandata=scandata)
+                except pymongo.errors.CollectionInvalid as err:
+                    sb.append("Database %s, collection %s failed to validate:\n%s"
+                              % (db_name, coll_name, err.args[0]))
+                    success = False
+        return success
+
 
 _CUSTOM_BEHAVIORS = {
     "CleanEveryN": CleanEveryN,
     "CheckReplDBHash": CheckReplDBHash,
+    "ValidateCollections": ValidateCollections,
 }

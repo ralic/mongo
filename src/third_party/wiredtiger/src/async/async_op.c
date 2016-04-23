@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -31,18 +31,16 @@ static void
 __async_set_key(WT_ASYNC_OP *asyncop, ...)
 {
 	WT_CURSOR *c;
-	WT_DECL_RET;
 	va_list ap;
 
 	c = &asyncop->c;
 	va_start(ap, asyncop);
 	__wt_cursor_set_keyv(c, c->flags, ap);
 	if (!WT_DATA_IN_ITEM(&c->key) && !WT_CURSOR_RECNO(c))
-		WT_ERR(__wt_buf_set(O2S((WT_ASYNC_OP_IMPL *)asyncop), &c->key,
-		    c->key.data, c->key.size));
+		c->saved_err = __wt_buf_set(
+		    O2S((WT_ASYNC_OP_IMPL *)asyncop),
+		    &c->key, c->key.data, c->key.size);
 	va_end(ap);
-	if (0)
-err:		c->saved_err = ret;
 }
 
 /*
@@ -69,7 +67,6 @@ static void
 __async_set_value(WT_ASYNC_OP *asyncop, ...)
 {
 	WT_CURSOR *c;
-	WT_DECL_RET;
 	va_list ap;
 
 	c = &asyncop->c;
@@ -77,11 +74,10 @@ __async_set_value(WT_ASYNC_OP *asyncop, ...)
 	__wt_cursor_set_valuev(c, ap);
 	/* Copy the data, if it is pointing at data elsewhere. */
 	if (!WT_DATA_IN_ITEM(&c->value))
-		WT_ERR(__wt_buf_set(O2S((WT_ASYNC_OP_IMPL *)asyncop),
-		    &c->value, c->value.data, c->value.size));
+		c->saved_err = __wt_buf_set(
+		    O2S((WT_ASYNC_OP_IMPL *)asyncop),
+		    &c->value, c->value.data, c->value.size);
 	va_end(ap);
-	if (0)
-err:		c->saved_err = ret;
 }
 
 /*
@@ -237,7 +233,7 @@ __async_op_init(WT_CONNECTION_IMPL *conn, WT_ASYNC_OP_IMPL *op, uint32_t id)
 	asyncop->c.set_key = __wt_cursor_set_key;
 	asyncop->c.get_value = __wt_cursor_get_value;
 	asyncop->c.set_value = __wt_cursor_set_value;
-	asyncop->c.recno = 0;
+	asyncop->c.recno = WT_RECNO_OOB;
 	memset(asyncop->c.raw_recno_buf, 0, sizeof(asyncop->c.raw_recno_buf));
 	memset(&asyncop->c.key, 0, sizeof(asyncop->c.key));
 	memset(&asyncop->c.value, 0, sizeof(asyncop->c.value));
@@ -353,14 +349,8 @@ __wt_async_op_init(WT_SESSION_IMPL *session)
 		WT_ERR(__async_op_init(conn, op, i));
 	}
 	return (0);
-err:
-	if (async->async_ops != NULL) {
-		__wt_free(session, async->async_ops);
-		async->async_ops = NULL;
-	}
-	if (async->async_queue != NULL) {
-		__wt_free(session, async->async_queue);
-		async->async_queue = NULL;
-	}
+
+err:	__wt_free(session, async->async_ops);
+	__wt_free(session, async->async_queue);
 	return (ret);
 }

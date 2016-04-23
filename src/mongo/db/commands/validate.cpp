@@ -33,10 +33,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -44,6 +45,8 @@ namespace mongo {
 using std::endl;
 using std::string;
 using std::stringstream;
+
+MONGO_FP_DECLARE(validateCmdCollectionNotValid);
 
 class ValidateCmd : public Command {
 public:
@@ -59,7 +62,7 @@ public:
              "Add full:true option to do a more thorough check";
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -77,6 +80,12 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
+        if (MONGO_FAIL_POINT(validateCmdCollectionNotValid)) {
+            errmsg = "validateCmdCollectionNotValid fail point was triggered";
+            result.appendBool("valid", false);
+            return true;
+        }
+
         string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
 
         NamespaceString ns_string(ns);
@@ -107,17 +116,19 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
-        result.appendBool("valid", results.valid);
-        result.append("errors", results.errors);
-
         if (!full) {
-            result.append(
-                "warning",
+            results.warnings.push_back(
                 "Some checks omitted for speed. use {full:true} option to do more thorough scan.");
         }
 
+        result.appendBool("valid", results.valid);
+        result.append("warnings", results.warnings);
+        result.append("errors", results.errors);
+
         if (!results.valid) {
-            result.append("advice", "ns corrupt. See http://dochub.mongodb.org/core/data-recovery");
+            result.append("advice",
+                          "A corrupt namespace has been detected. See "
+                          "http://dochub.mongodb.org/core/data-recovery for recovery steps.");
         }
 
         return true;

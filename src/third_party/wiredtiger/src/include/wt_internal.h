@@ -1,10 +1,13 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
+
+#ifndef __WT_INTERNAL_H
+#define	__WT_INTERNAL_H
 
 #if defined(__cplusplus)
 extern "C" {
@@ -41,6 +44,7 @@ extern "C" {
 #else
 #include <pthread.h>
 #endif
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -135,6 +139,14 @@ struct __wt_cursor_dump;
     typedef struct __wt_cursor_dump WT_CURSOR_DUMP;
 struct __wt_cursor_index;
     typedef struct __wt_cursor_index WT_CURSOR_INDEX;
+struct __wt_cursor_join;
+    typedef struct __wt_cursor_join WT_CURSOR_JOIN;
+struct __wt_cursor_join_endpoint;
+    typedef struct __wt_cursor_join_endpoint WT_CURSOR_JOIN_ENDPOINT;
+struct __wt_cursor_join_entry;
+    typedef struct __wt_cursor_join_entry WT_CURSOR_JOIN_ENTRY;
+struct __wt_cursor_join_iter;
+    typedef struct __wt_cursor_join_iter WT_CURSOR_JOIN_ITER;
 struct __wt_cursor_json;
     typedef struct __wt_cursor_json WT_CURSOR_JSON;
 struct __wt_cursor_log;
@@ -163,6 +175,8 @@ struct __wt_ext;
     typedef struct __wt_ext WT_EXT;
 struct __wt_extlist;
     typedef struct __wt_extlist WT_EXTLIST;
+struct __wt_fair_lock;
+    typedef struct __wt_fair_lock WT_FAIR_LOCK;
 struct __wt_fh;
     typedef struct __wt_fh WT_FH;
 struct __wt_hazard;
@@ -175,6 +189,10 @@ struct __wt_insert;
     typedef struct __wt_insert WT_INSERT;
 struct __wt_insert_head;
     typedef struct __wt_insert_head WT_INSERT_HEAD;
+struct __wt_join_stats;
+    typedef struct __wt_join_stats WT_JOIN_STATS;
+struct __wt_join_stats_group;
+    typedef struct __wt_join_stats_group WT_JOIN_STATS_GROUP;
 struct __wt_keyed_encryptor;
     typedef struct __wt_keyed_encryptor WT_KEYED_ENCRYPTOR;
 struct __wt_log;
@@ -245,6 +263,8 @@ struct __wt_rwlock;
     typedef struct __wt_rwlock WT_RWLOCK;
 struct __wt_salvage_cookie;
     typedef struct __wt_salvage_cookie WT_SALVAGE_COOKIE;
+struct __wt_save_upd;
+    typedef struct __wt_save_upd WT_SAVE_UPD;
 struct __wt_scratch_track;
     typedef struct __wt_scratch_track WT_SCRATCH_TRACK;
 struct __wt_session_impl;
@@ -265,10 +285,10 @@ struct __wt_txn_op;
     typedef struct __wt_txn_op WT_TXN_OP;
 struct __wt_txn_state;
     typedef struct __wt_txn_state WT_TXN_STATE;
-struct __wt_upd_skipped;
-    typedef struct __wt_upd_skipped WT_UPD_SKIPPED;
 struct __wt_update;
     typedef struct __wt_update WT_UPDATE;
+union __wt_lsn;
+    typedef union __wt_lsn WT_LSN;
 union __wt_rand_state;
     typedef union __wt_rand_state WT_RAND_STATE;
 /*
@@ -287,6 +307,7 @@ union __wt_rand_state;
 #include "msvc.h"
 #endif
 #include "hardware.h"
+#include "swap.h"
 
 #include "queue.h"
 
@@ -309,8 +330,8 @@ union __wt_rand_state;
 #include "btmem.h"
 #include "btree.h"
 #include "cache.h"
-#include "config.h"
 #include "compact.h"
+#include "config.h"
 #include "cursor.h"
 #include "dlh.h"
 #include "error.h"
@@ -328,14 +349,15 @@ union __wt_rand_state;
 #include "extern.h"
 #include "verify_build.h"
 
-#include "buf.i"
-#include "misc.i"
 #include "intpack.i"			/* required by cell.i, packing.i */
-#include "packing.i"
+
+#include "buf.i"
 #include "cache.i"			/* required by txn.i */
 #include "cell.i"			/* required by btree.i */
-
+#include "log.i"
+#include "misc.i"
 #include "mutex.i"			/* required by btree.i */
+#include "packing.i"
 #include "txn.i"			/* required by btree.i */
 
 #include "btree.i"			/* required by cursor.i */
@@ -349,3 +371,4 @@ union __wt_rand_state;
 #if defined(__cplusplus)
 }
 #endif
+#endif					/* !__WT_INTERNAL_H */

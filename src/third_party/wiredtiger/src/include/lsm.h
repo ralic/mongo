@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -96,6 +96,7 @@ struct __wt_lsm_chunk {
 
 	int8_t empty;			/* 1/0: checkpoint missing */
 	int8_t evicted;			/* 1/0: in-memory chunk was evicted */
+	uint8_t flushing;		/* 1/0: chunk flush in progress */
 
 #define	WT_LSM_CHUNK_BLOOM	0x01
 #define	WT_LSM_CHUNK_MERGING	0x02
@@ -178,7 +179,7 @@ struct __wt_lsm_tree {
 	int collator_owned;
 
 	uint32_t refcnt;		/* Number of users of the tree */
-	uint8_t exclusive;		/* Tree is locked exclusively */
+	WT_SESSION_IMPL *excl_session;	/* Session has exclusive lock */
 
 #define	LSM_TREE_MAX_QUEUE	100
 	uint32_t queue_ref;
@@ -214,7 +215,7 @@ struct __wt_lsm_tree {
 	size_t chunk_alloc;		/* Space allocated for chunks */
 	uint32_t nchunks;		/* Number of active chunks */
 	uint32_t last;			/* Last allocated ID */
-	int modified;			/* Have there been updates? */
+	bool modified;			/* Have there been updates? */
 
 	WT_LSM_CHUNK **old_chunks;	/* Array of old LSM chunks */
 	size_t old_alloc;		/* Space allocated for old chunks */
@@ -241,13 +242,18 @@ struct __wt_lsm_tree {
 	int64_t lsm_lookup_no_bloom;
 	int64_t lsm_merge_throttle;
 
-#define	WT_LSM_TREE_ACTIVE		0x01	/* Workers are active */
-#define	WT_LSM_TREE_AGGRESSIVE_TIMER	0x02	/* Timer for merge aggression */
-#define	WT_LSM_TREE_COMPACTING		0x04	/* Tree being compacted */
-#define	WT_LSM_TREE_MERGES		0x08	/* Tree should run merges */
-#define	WT_LSM_TREE_NEED_SWITCH		0x10	/* New chunk needs creating */
-#define	WT_LSM_TREE_OPEN		0x20	/* The tree is open */
-#define	WT_LSM_TREE_THROTTLE		0x40	/* Throttle updates */
+	/*
+	 * The tree is open for business. This used to be a flag, but it is
+	 * susceptible to races.
+	 */
+	bool active;
+
+#define	WT_LSM_TREE_AGGRESSIVE_TIMER	0x01	/* Timer for merge aggression */
+#define	WT_LSM_TREE_COMPACTING		0x02	/* Tree being compacted */
+#define	WT_LSM_TREE_MERGES		0x04	/* Tree should run merges */
+#define	WT_LSM_TREE_NEED_SWITCH		0x08	/* New chunk needs creating */
+#define	WT_LSM_TREE_OPEN		0x10	/* The tree is open */
+#define	WT_LSM_TREE_THROTTLE		0x20	/* Throttle updates */
 	uint32_t flags;
 };
 

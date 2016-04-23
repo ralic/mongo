@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -99,7 +99,7 @@ __wt_kv_return(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_UPDATE *upd)
 			cursor->key.size = cbt->row_key->size;
 		} else
 			WT_RET(__wt_row_leaf_key(
-			    session, page, rip, &cursor->key, 0));
+			    session, page, rip, &cursor->key, false));
 
 		/* If the cursor references a WT_UPDATE item, return it. */
 		if (upd != NULL) {

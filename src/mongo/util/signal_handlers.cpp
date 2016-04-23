@@ -44,7 +44,7 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/exit_code.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
@@ -187,22 +187,18 @@ void signalProcessingThread() {
 #endif
 }  // namespace
 
-void setupSignalHandlers(bool handleControlC) {
+void setupSignalHandlers() {
     setupSynchronousSignalHandlers();
 #ifdef _WIN32
-    if (!handleControlC) {
-        massert(10297,
-                "Couldn't register Windows Ctrl-C handler",
-                SetConsoleCtrlHandler(static_cast<PHANDLER_ROUTINE>(CtrlHandler), TRUE));
-    }
+    massert(10297,
+            "Couldn't register Windows Ctrl-C handler",
+            SetConsoleCtrlHandler(static_cast<PHANDLER_ROUTINE>(CtrlHandler), TRUE));
 #else
     // asyncSignals is a global variable listing the signals that should be handled by the
     // interrupt thread, once it is started via startSignalProcessingThread().
     sigemptyset(&asyncSignals);
     sigaddset(&asyncSignals, SIGHUP);
-    if (!handleControlC) {
-        sigaddset(&asyncSignals, SIGINT);
-    }
+    sigaddset(&asyncSignals, SIGINT);
     sigaddset(&asyncSignals, SIGTERM);
     sigaddset(&asyncSignals, SIGUSR1);
     sigaddset(&asyncSignals, SIGXCPU);

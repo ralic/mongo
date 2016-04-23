@@ -199,12 +199,12 @@ public:
                                       const DocWriter* doc,
                                       bool enforceQuota);
 
-    virtual StatusWith<RecordId> updateRecord(OperationContext* txn,
-                                              const RecordId& oldLocation,
-                                              const char* data,
-                                              int len,
-                                              bool enforceQuota,
-                                              UpdateNotifier* notifier);
+    virtual Status updateRecord(OperationContext* txn,
+                                const RecordId& oldLocation,
+                                const char* data,
+                                int len,
+                                bool enforceQuota,
+                                UpdateNotifier* notifier);
 
     virtual bool updateWithDamagesSupported() const;
 
@@ -333,7 +333,7 @@ public:
         : _txn(txn), _curr(start), _rs(rs), _forward(forward) {}
 
     boost::optional<Record> next() final;
-    void invalidate(const RecordId& dl) final;
+    void invalidate(OperationContext* txn, const RecordId& dl) final;
     void save() final {}
     bool restore() final {
         return true;

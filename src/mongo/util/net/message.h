@@ -40,7 +40,7 @@
 #include "mongo/util/allocator.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/sockaddr.h"
 #include "mongo/util/print.h"
 
 namespace mongo {
@@ -53,9 +53,8 @@ const size_t MaxMessageSizeBytes = 48 * 1000 * 1000;
 class Message;
 class MessagingPort;
 
-typedef uint32_t MSGID;
-
-enum Operations {
+enum NetworkOp : int32_t {
+    opInvalid = 0,
     opReply = 1,     /* reply. responseTo is set. */
     dbMsg = 1000,    /* generic msg command followed by a std::string */
     dbUpdate = 2001, /* update object */
@@ -65,15 +64,54 @@ enum Operations {
     dbGetMore = 2005,
     dbDelete = 2006,
     dbKillCursors = 2007,
-    dbCommand = 2008,
-    dbCommandReply = 2009,
+    // dbCommand_DEPRECATED = 2008, //
+    // dbCommandReply_DEPRECATED = 2009, //
+    dbCommand = 2010,
+    dbCommandReply = 2011,
 };
+
+enum class LogicalOp {
+    opInvalid,
+    opMsg,
+    opUpdate,
+    opInsert,
+    opQuery,
+    opGetMore,
+    opDelete,
+    opKillCursors,
+    opCommand,
+};
+
+static inline LogicalOp networkOpToLogicalOp(NetworkOp networkOp) {
+    switch (networkOp) {
+        case dbMsg:
+            return LogicalOp::opMsg;
+        case dbUpdate:
+            return LogicalOp::opUpdate;
+        case dbInsert:
+            return LogicalOp::opInsert;
+        case dbQuery:
+            return LogicalOp::opQuery;
+        case dbGetMore:
+            return LogicalOp::opGetMore;
+        case dbDelete:
+            return LogicalOp::opDelete;
+        case dbKillCursors:
+            return LogicalOp::opKillCursors;
+        case dbCommand:
+            return LogicalOp::opCommand;
+        default:
+            int op = int(networkOp);
+            massert(34348, str::stream() << "cannot translate opcode " << op, !op);
+            return LogicalOp::opInvalid;
+    }
+}
 
 bool doesOpGetAResponse(int op);
 
-inline const char* opToString(int op) {
-    switch (op) {
-        case 0:
+inline const char* networkOpToString(NetworkOp networkOp) {
+    switch (networkOp) {
+        case opInvalid:
             return "none";
         case opReply:
             return "reply";
@@ -96,8 +134,34 @@ inline const char* opToString(int op) {
         case dbCommandReply:
             return "commandReply";
         default:
+            int op = static_cast<int>(networkOp);
             massert(16141, str::stream() << "cannot translate opcode " << op, !op);
             return "";
+    }
+}
+
+inline const char* logicalOpToString(LogicalOp logicalOp) {
+    switch (logicalOp) {
+        case LogicalOp::opInvalid:
+            return "none";
+        case LogicalOp::opMsg:
+            return "msg";
+        case LogicalOp::opUpdate:
+            return "update";
+        case LogicalOp::opInsert:
+            return "insert";
+        case LogicalOp::opQuery:
+            return "query";
+        case LogicalOp::opGetMore:
+            return "getmore";
+        case LogicalOp::opDelete:
+            return "remove";
+        case LogicalOp::opKillCursors:
+            return "killcursors";
+        case LogicalOp::opCommand:
+            return "command";
+        default:
+            MONGO_UNREACHABLE;
     }
 }
 
@@ -150,11 +214,11 @@ public:
         return data().read<LittleEndian<int32_t>>(offsetof(Layout, messageLength));
     }
 
-    int32_t getRequestID() const {
+    int32_t getRequestMsgId() const {
         return data().read<LittleEndian<int32_t>>(offsetof(Layout, requestID));
     }
 
-    int32_t getResponseTo() const {
+    int32_t getResponseToMsgId() const {
         return data().read<LittleEndian<int32_t>>(offsetof(Layout, responseTo));
     }
 
@@ -186,11 +250,11 @@ public:
         data().write(tagLittleEndian(value), offsetof(Layout, messageLength));
     }
 
-    void setRequestID(int32_t value) {
+    void setRequestMsgId(int32_t value) {
         data().write(tagLittleEndian(value), offsetof(Layout, requestID));
     }
 
-    void setResponseTo(int32_t value) {
+    void setResponseToMsgId(int32_t value) {
         data().write(tagLittleEndian(value), offsetof(Layout, responseTo));
     }
 
@@ -235,16 +299,16 @@ public:
         return header().getMessageLength();
     }
 
-    MSGID getId() const {
-        return header().getRequestID();
+    int32_t getId() const {
+        return header().getRequestMsgId();
     }
 
-    MSGID getResponseTo() const {
-        return header().getResponseTo();
+    int32_t getResponseToMsgId() const {
+        return header().getResponseToMsgId();
     }
 
-    int32_t getOperation() const {
-        return header().getOpCode();
+    NetworkOp getNetworkOp() const {
+        return NetworkOp(header().getOpCode());
     }
 
     const char* data() const {
@@ -254,14 +318,14 @@ public:
     bool valid() const {
         if (getLen() <= 0 || getLen() > (4 * BSONObjMaxInternalSize))
             return false;
-        if (getOperation() < 0 || getOperation() > 30000)
+        if (getNetworkOp() < 0 || getNetworkOp() > 30000)
             return false;
         return true;
     }
 
     int64_t getCursor() const {
-        verify(getResponseTo() > 0);
-        verify(getOperation() == opReply);
+        verify(getResponseToMsgId() > 0);
+        verify(getNetworkOp() == opReply);
         return ConstDataView(data() + sizeof(int32_t)).read<LittleEndian<int64_t>>();
     }
 
@@ -293,12 +357,12 @@ public:
         return header().setMessageLength(value);
     }
 
-    void setId(MSGID value) {
-        return header().setRequestID(value);
+    void setId(int32_t value) {
+        return header().setRequestMsgId(value);
     }
 
-    void setResponseTo(MSGID value) {
-        return header().setResponseTo(value);
+    void setResponseToMsgId(int32_t value) {
+        return header().setResponseToMsgId(value);
     }
 
     void setOperation(int value) {
@@ -341,13 +405,15 @@ class Message {
 public:
     // we assume here that a vector with initial size 0 does no allocation (0 is the default, but
     // wanted to make it explicit).
-    Message() : _buf(0), _data(0), _freeIt(false) {}
-    Message(void* data, bool freeIt) : _buf(0), _data(0), _freeIt(false) {
-        _setData(reinterpret_cast<char*>(data), freeIt);
-    };
-    Message(Message&& r) : _buf(0), _data(0), _freeIt(false) {
-        *this = std::move(r);
+    Message() = default;
+
+    Message(void* data, bool freeIt) : _buf(reinterpret_cast<char*>(data)), _freeIt(freeIt) {}
+
+    Message(Message&& r) : _buf(r._buf), _data(std::move(r._data)), _freeIt(r._freeIt) {
+        r._buf = nullptr;
+        r._freeIt = false;
     }
+
     ~Message() {
         reset();
     }
@@ -359,8 +425,8 @@ public:
         return _buf ? _buf : _data[0].first;
     }
 
-    int operation() const {
-        return header().getOperation();
+    NetworkOp operation() const {
+        return header().getNetworkOp();
     }
 
     MsgData::View singleData() const {
@@ -412,32 +478,38 @@ public:
         _setData(buf, true);
     }
 
-    // vector swap() so this is fast
     Message& operator=(Message&& r) {
-        verify(empty());
-        verify(r._freeIt);
-        _buf = r._buf;
-        r._buf = 0;
-        if (r._data.size() > 0) {
-            _data.swap(r._data);
+        // This implementation was originally written using an auto_ptr-style fake move. When
+        // converting to a real move assignment, checking for self-assignment was the simplest way
+        // to ensure correctness.
+        if (&r == this)
+            return *this;
+
+        if (!empty()) {
+            reset();
         }
+
+        _buf = r._buf;
+        _data = std::move(r._data);
+        _freeIt = r._freeIt;
+
+        r._buf = nullptr;
         r._freeIt = false;
-        _freeIt = true;
         return *this;
     }
 
     void reset() {
         if (_freeIt) {
             if (_buf) {
-                free(_buf);
+                std::free(_buf);
             }
             for (std::vector<std::pair<char*, int>>::const_iterator i = _data.begin();
                  i != _data.end();
                  ++i) {
-                free(i->first);
+                std::free(i->first);
             }
         }
-        _buf = 0;
+        _buf = nullptr;
         _data.clear();
         _freeIt = false;
     }
@@ -499,16 +571,16 @@ private:
         _buf = d;
     }
     // if just one buffer, keep it in _buf, otherwise keep a sequence of buffers in _data
-    char* _buf;
+    char* _buf{nullptr};
     // byte buffer(s) - the first must contain at least a full MsgData unless using _buf for storage
     // instead
     typedef std::vector<std::pair<char*, int>> MsgVec;
-    MsgVec _data;
-    bool _freeIt;
+    MsgVec _data{};
+    bool _freeIt{false};
 };
 
 
-MSGID nextMessageId();
+int32_t nextMessageId();
 
 
 }  // namespace mongo

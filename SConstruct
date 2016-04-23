@@ -1,18 +1,5 @@
 # -*- mode: python; -*-
-# build file for MongoDB
-# this requires scons
-# you can get from http://www.scons.org
-# then just type scons
-
-# some common tasks
-#   build 64-bit mac and pushing to s3
-#      scons --64 s3dist
-#      scons --distname=0.8 s3dist
-#      all s3 pushes require settings.py and simples3
-
-# This file, SConstruct, configures the build environment, and then delegates to
-# several, subordinate SConscript files, which describe specific build rules.
-
+import atexit
 import copy
 import datetime
 import errno
@@ -28,11 +15,21 @@ import uuid
 from buildscripts import utils
 from buildscripts import moduleconfig
 
-from mongo_scons_utils import default_variant_dir_generator
+from mongo_scons_utils import (
+    default_buildinfo_environment_data,
+    default_variant_dir_generator,
+    get_toolchain_ver,
+)
 
 import libdeps
 
 EnsureSConsVersion( 2, 3, 0 )
+
+def print_build_failures():
+    from SCons.Script import GetBuildFailures
+    for bf in GetBuildFailures():
+        print "%s failed: %s" % (bf.node, bf.errstr)
+atexit.register(print_build_failures)
 
 def versiontuple(v):
     return tuple(map(int, (v.split("."))))
@@ -139,26 +136,9 @@ def make_variant_dir_generator():
 #   using the nargs='const' mechanism.
 #
 
-add_option('mute',
-    help='do not display commandlines for compiling and linking, to reduce screen noise',
-    nargs=0,
-)
-
 add_option('prefix',
     default='$BUILD_ROOT/install',
     help='installation prefix',
-)
-
-add_option('distname',
-    help='dist name (0.8.0)',
-)
-
-add_option('distmod',
-    help='additional piece for full dist name',
-)
-
-add_option('distarch',
-    help='override the architecture name in dist output',
 )
 
 add_option('nostrip',
@@ -202,6 +182,14 @@ add_option('disable-minimum-compiler-version-enforcement',
 add_option('ssl',
     help='Enable SSL',
     nargs=0
+)
+
+add_option('mmapv1',
+    choices=['auto', 'on', 'off'],
+    default='auto',
+    help='Enable MMapV1',
+    nargs='?',
+    type='choice',
 )
 
 add_option('wiredtiger',
@@ -258,6 +246,15 @@ add_option('dbg',
     type='choice',
 )
 
+add_option('spider-monkey-dbg',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable SpiderMonkey debug mode',
+    nargs='?',
+    type='choice',
+)
+
 add_option('opt',
     choices=['on', 'off'],
     const='on',
@@ -281,14 +278,11 @@ add_option('durableDefaultOn',
     nargs=0,
 )
 
-if is_running_os('linux') or is_running_os('windows'):
-   defaultAllocator = 'tcmalloc'
-else:
-    defaultAllocator = 'system'
-
 add_option('allocator',
-    default=defaultAllocator,
-    help='allocator to use (tcmalloc or system)',
+    choices=["auto", "system", "tcmalloc"],
+    default="auto",
+    help='allocator to use (use "auto" for best choice for current platform)',
+    type='choice',
 )
 
 add_option('gdbserver',
@@ -330,14 +324,6 @@ add_option('use-system-wiredtiger',
     nargs=0,
 )
 
-boost_choices = ['1.56']
-add_option('internal-boost',
-    choices=boost_choices,
-    default=boost_choices[0],
-    help='Specify internal boost version to use',
-    type='choice',
-)
-
 add_option('system-boost-lib-search-suffixes',
     help='Comma delimited sequence of boost library suffixes to search',
 )
@@ -349,6 +335,11 @@ add_option('use-system-boost',
 
 add_option('use-system-snappy',
     help='use system version of snappy library',
+    nargs=0,
+)
+
+add_option('use-system-valgrind',
+    help='use system version of valgrind library',
     nargs=0,
 )
 
@@ -368,6 +359,20 @@ add_option('use-system-yaml',
 
 add_option('use-system-asio',
     help="use system version of ASIO",
+    nargs=0,
+)
+
+add_option('icu',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable ICU',
+    nargs='?',
+    type='choice',
+)
+
+add_option('use-system-icu',
+    help="use system version of ICU",
     nargs=0,
 )
 
@@ -439,12 +444,10 @@ add_option('cache-dir',
     help='Specify the directory to use for caching objects if --cache is in use',
 )
 
-add_option("experimental-decimal-support",
-    choices=['on', 'off'],
-    default='off',
-    const='on',
-    help="Enable experimental decimal128 type support",
-    nargs='?',
+add_option("cxx-std",
+    choices=["11", "14"],
+    default="11",
+    help="Select the C++ langauge standard to build with",
 )
 
 def find_mongo_custom_variables():
@@ -452,8 +455,6 @@ def find_mongo_custom_variables():
     for path in sys.path:
         probe = os.path.join(path, 'mongo_custom_variables.py')
         if os.path.isfile(probe):
-            if not has_option('mute'):
-                print "Using mongo variable customization file {0}".format(probe)
             files.append(probe)
     return files
 
@@ -572,8 +573,12 @@ def variable_distsrc_converter(val):
         return val + "/"
     return val
 
+variables_files = variable_shlex_converter(get_option('variables-files'))
+for file in variables_files:
+    print "Using variable customization file %s" % file
+
 env_vars = Variables(
-    files=variable_shlex_converter(get_option('variables-files')),
+    files=variables_files,
     args=ARGUMENTS
 )
 
@@ -633,10 +638,28 @@ env_vars.Add('LINKFLAGS',
     help='Sets flags for the linker',
     converter=variable_shlex_converter)
 
+# Note: This is only really meaningful when configured via a variables file. See the
+# default_buildinfo_environment_data() function for examples of how to use this.
+env_vars.Add('MONGO_BUILDINFO_ENVIRONMENT_DATA',
+    help='Sets the info returned from the buildInfo command and --version command-line flag',
+    default=default_buildinfo_environment_data())
+
 env_vars.Add('MONGO_DIST_SRC_PREFIX',
     help='Sets the prefix for files in the source distribution archive',
     converter=variable_distsrc_converter,
     default="mongodb-src-r${MONGO_VERSION}")
+
+env_vars.Add('MONGO_DISTARCH',
+    help='Adds a string representing the target processor architecture to the dist archive',
+    default='$TARGET_ARCH')
+
+env_vars.Add('MONGO_DISTMOD',
+    help='Adds a string that will be embedded in the dist archive naming',
+    default='')
+
+env_vars.Add('MONGO_DISTNAME',
+    help='Sets the version string to be used in dist archive naming',
+    default='$MONGO_VERSION')
 
 env_vars.Add('MONGO_VERSION',
     help='Sets the version string for MongoDB',
@@ -693,6 +716,11 @@ env_vars.Add('TOOLS',
 env_vars.Add('VARIANT_DIR',
     help='Sets the name (or generator function) for the variant directory',
     default=default_variant_dir_generator,
+)
+
+env_vars.Add('VERBOSE',
+    help='Control build verbosity (auto, on/off true/false 1/0)',
+    default='auto',
 )
 
 # don't run configure if user calls --help
@@ -753,7 +781,7 @@ def printLocalInfo():
 
 printLocalInfo()
 
-boostLibs = [ "thread" , "filesystem" , "program_options", "system" ]
+boostLibs = [ "thread" , "filesystem" , "program_options", "system", "regex", "chrono" ]
 
 onlyServer = len( COMMAND_LINE_TARGETS ) == 0 or ( len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) in [ "mongod" , "mongos" , "test" ] )
 
@@ -797,6 +825,7 @@ if not serverJs and not usemozjs:
 envDict = dict(BUILD_ROOT=buildDir,
                BUILD_DIR=make_variant_dir_generator(),
                DIST_ARCHIVE_SUFFIX='.tgz',
+               DIST_BINARIES=[],
                MODULE_BANNERS=[],
                ARCHIVE_ADDITION_DIR_MAP={},
                ARCHIVE_ADDITIONS=[],
@@ -833,6 +862,18 @@ def conf_error(env, msg, *args):
 
 env.AddMethod(fatal_error, 'FatalError')
 env.AddMethod(conf_error, 'ConfError')
+
+# Normalize the VERBOSE Option, and make its value available as a
+# function.
+if env['VERBOSE'] == "auto":
+    env['VERBOSE'] = not sys.stdout.isatty()
+elif env['VERBOSE'] in ('1', "ON", "on", "True", "true", True):
+    env['VERBOSE'] = True
+elif env['VERBOSE'] in ('0', "OFF", "off", "False", "false", False):
+    env['VERBOSE'] = False
+else:
+    env.FatalError("Invalid value {0} for VERBOSE Variable", env['VERBOSE'])
+env.AddMethod(lambda env: env['VERBOSE'], 'Verbose')
 
 if has_option('variables-help'):
     print env_vars.GenerateHelpText(env)
@@ -877,23 +918,38 @@ def CheckForToolchain(context, toolchain, lang_name, compiler_var, source_suffix
     context.Result(result)
     return result
 
+endian = get_option( "endian" )
+
+if endian == "auto":
+    endian = sys.byteorder
+
+if endian == "little":
+    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "1234")
+elif endian == "big":
+    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "4321")
+
 # These preprocessor macros came from
 # http://nadeausoftware.com/articles/2012/02/c_c_tip_how_detect_processor_type_using_compiler_predefined_macros
 #
 # NOTE: Remember to add a trailing comma to form any required one
 # element tuples, or your configure checks will fail in strange ways.
 processor_macros = {
-    'x86_64': ('__x86_64', '_M_AMD64'),
-    'i386': ('__i386', '_M_IX86'),
-    'sparc': ('__sparc',),
-    'PowerPC': ('__powerpc__', '__PPC'),
-    'arm' : ('__arm__',),
-    'arm64' : ('__arm64__', '__aarch64__'),
+    'arm'    : { 'endian': 'little', 'defines': ('__arm__',) },
+    'arm64'  : { 'endian': 'little', 'defines': ('__arm64__', '__aarch64__')},
+    'i386'   : { 'endian': 'little', 'defines': ('__i386', '_M_IX86')},
+    'ppc64le': { 'endian': 'little', 'defines': ('__powerpc64__',)},
+    's390x'  : { 'endian': 'big',    'defines': ('__s390x__',)},
+    'sparc'  : { 'endian': 'big',    'defines': ('__sparc',)},
+    'x86_64' : { 'endian': 'little', 'defines': ('__x86_64', '_M_AMD64')},
 }
 
 def CheckForProcessor(context, which_arch):
     def run_compile_check(arch):
-        full_macros = " || ".join([ "defined(%s)" % (v) for v in processor_macros[arch]])
+        full_macros = " || ".join([ "defined(%s)" % (v) for v in processor_macros[arch]['defines']])
+
+        if not endian == processor_macros[arch]['endian']:
+            return False
+
         test_body = """
         #if {0}
         /* Detected {1} */
@@ -998,6 +1054,9 @@ elif not detectConf.CheckForOS(env['TARGET_OS']):
 
 detectConf.Finish()
 
+env['CC_VERSION'] = get_toolchain_ver(env, 'CC')
+env['CXX_VERSION'] = get_toolchain_ver(env, 'CXX')
+
 if not env['HOST_ARCH']:
     env['HOST_ARCH'] = env['TARGET_ARCH']
 
@@ -1005,6 +1064,22 @@ if not env['HOST_ARCH']:
 # env variable to interpolate their names in child sconscripts
 
 env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetOSName()
+
+# Currently we only use tcmalloc on windows and linux x86_64. Other
+# linux targets (power, s390x, arm) do not currently support tcmalloc.
+#
+# Normalize the allocator option and store it in the Environment. It
+# would be nicer to use SetOption here, but you can't reset user
+# options for some strange reason in SCons. Instead, we store this
+# option as a new variable in the environment.
+if get_option('allocator') == "auto":
+    if env.TargetOSIs('windows') or \
+       env.TargetOSIs('linux'):
+        env['MONGO_ALLOCATOR'] = "tcmalloc"
+    else:
+        env['MONGO_ALLOCATOR'] = "system"
+else:
+    env['MONGO_ALLOCATOR'] = get_option('allocator')
 
 if has_option("cache"):
     if has_option("release"):
@@ -1115,17 +1190,21 @@ if link_model.startswith("dynamic"):
             env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
     else:
         env.AppendUnique(SHLINKFLAGS=["-Wl,--no-as-needed"])
-        if link_model == "dynamic-strict":
-            env.AppendUnique(SHLINKFLAGS=["-Wl,-z,defs"])
-        else:
-            # On BFD/gold linker environments, which are not strict by
-            # default, we need to add a flag when libraries are not
-            # tagged incomplete.
-            def libdeps_tags_expand_incomplete(source, target, env, for_signature):
-                if 'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", []):
-                    return ["-Wl,-z,defs"]
-                return []
-            env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
+
+        # Using zdefs doesn't work at all with the sanitizers
+        if not has_option('sanitize'):
+
+            if link_model == "dynamic-strict":
+                env.AppendUnique(SHLINKFLAGS=["-Wl,-z,defs"])
+            else:
+                # On BFD/gold linker environments, which are not strict by
+                # default, we need to add a flag when libraries are not
+                # tagged incomplete.
+                def libdeps_tags_expand_incomplete(source, target, env, for_signature):
+                    if 'incomplete' not in target[0].get_env().get("LIBDEPS_TAGS", []):
+                        return ["-Wl,-z,defs"]
+                    return []
+                env['LIBDEPS_TAG_EXPANSIONS'].append(libdeps_tags_expand_incomplete)
 
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
@@ -1138,7 +1217,7 @@ if get_option('build-fast-and-loose') == "on" and \
     env.Decider('MD5-timestamp')
     env.SetOption('max_drift', 1)
 
-if has_option('mute'):
+if not env.Verbose():
     env.Append( CCCOMSTR = "Compiling $TARGET" )
     env.Append( CXXCOMSTR = env["CCCOMSTR"] )
     env.Append( SHCCCOMSTR = "Compiling $TARGET" )
@@ -1146,16 +1225,6 @@ if has_option('mute'):
     env.Append( LINKCOMSTR = "Linking $TARGET" )
     env.Append( SHLINKCOMSTR = env["LINKCOMSTR"] )
     env.Append( ARCOMSTR = "Generating library $TARGET" )
-
-endian = get_option( "endian" )
-
-if endian == "auto":
-    endian = sys.byteorder
-
-if endian == "little":
-    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "1234")
-elif endian == "big":
-    env.SetConfigHeaderDefine("MONGO_CONFIG_BYTE_ORDER", "4321")
 
 if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
     # The libraries we build in LIBDEPS_OBJS mode are just placeholders for tracking dependencies.
@@ -1194,6 +1263,8 @@ elif env.TargetOSIs('solaris'):
 # ---- other build setup -----
 if debugBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_DEBUG_BUILD")
+else:
+    env.AppendUnique( CPPDEFINES=[ 'NDEBUG' ] )
 
 if env.TargetOSIs('linux'):
     env.Append( LIBS=['m'] )
@@ -1328,21 +1399,27 @@ elif env.TargetOSIs('windows'):
         # without having been initialized (implies /Od: no optimizations)
         env.Append( CCFLAGS=["/RTC1"] )
 
-        # Support large object files since some unit-test sources contain a lot of code
-        env.Append( CCFLAGS=["/bigobj"] )
+    # Support large object files since some unit-test sources contain a lot of code
+    env.Append( CCFLAGS=["/bigobj"] )
 
     # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds
     env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
 
-    env.Append(LIBS=['ws2_32.lib',
-                     'kernel32.lib',
-                     'advapi32.lib',
-                     'Psapi.lib',
-                     'DbgHelp.lib',
-                     'shell32.lib',
-                     'Iphlpapi.lib',
-                     'winmm.lib',
-                     'version.lib'])
+    env.Append(
+        LIBS=[
+            'DbgHelp.lib',
+            'Iphlpapi.lib',
+            'Psapi.lib',
+            'advapi32.lib',
+            'bcrypt.lib',
+            'crypt32.lib',
+            'kernel32.lib',
+            'shell32.lib',
+            'version.lib',
+            'winmm.lib',
+            'ws2_32.lib',
+        ],
+    )
 
 # When building on visual studio, this sets the name of the debug symbols file
 if env.ToolchainIs('msvc'):
@@ -1362,7 +1439,7 @@ if env.TargetOSIs('posix'):
                          "-Wno-unknown-pragmas",
                          "-Winvalid-pch"] )
     # env.Append( " -Wconversion" ) TODO: this doesn't really work yet
-    if env.TargetOSIs('linux', 'osx'):
+    if env.TargetOSIs('linux', 'osx', 'solaris'):
         if not has_option("disable-warnings-as-errors"):
             env.Append( CCFLAGS=["-Werror"] )
 
@@ -1392,8 +1469,8 @@ if env.TargetOSIs('posix'):
             pass
 
     if env.TargetOSIs('linux') and has_option( "gcov" ):
-        env.Append( CXXFLAGS=" -fprofile-arcs -ftest-coverage " )
-        env.Append( LINKFLAGS=" -fprofile-arcs -ftest-coverage " )
+        env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
+        env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage"] )
 
     if optBuild:
         env.Append( CCFLAGS=["-O2"] )
@@ -1406,17 +1483,14 @@ if env.TargetOSIs('posix'):
             env.Append( LINKFLAGS=["-fstack-protector"] )
             env.Append( SHLINKFLAGS=["-fstack-protector"] )
 
-if has_option( "ssl" ):
-    env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
-    env.Append( MONGO_CRYPTO=["openssl"] )
-    if env.TargetOSIs('windows'):
-        env.Append( LIBS=["libeay32"] )
-        env.Append( LIBS=["ssleay32"] )
-    else:
-        env.Append( LIBS=["ssl"] )
-        env.Append( LIBS=["crypto"] )
-else:
-    env.Append( MONGO_CRYPTO=["tom"] )
+mmapv1 = False
+if get_option('mmapv1') == 'auto':
+    # The mmapv1 storage engine is only supported on x86
+    # targets. Unless explicitly requested, disable it on all other
+    # platforms.
+    mmapv1 = (env['TARGET_ARCH'] in ['i386', 'x86_64'])
+elif get_option('mmapv1') == 'on':
+    mmapv1 = True
 
 wiredtiger = False
 if get_option('wiredtiger') == 'on':
@@ -1429,8 +1503,10 @@ if get_option('wiredtiger') == 'on':
         wiredtiger = True
         env.SetConfigHeaderDefine("MONGO_CONFIG_WIREDTIGER_ENABLED")
 
-if get_option('experimental-decimal-support') == 'on':
-    env.SetConfigHeaderDefine("MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT")
+icuEnabled = False
+if get_option('icu') == 'on':
+    icuEnabled = True
+    env.SetConfigHeaderDefine("MONGO_CONFIG_ICU_ENABLED")
 
 if env['TARGET_ARCH'] == 'i386':
     # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
@@ -1465,14 +1541,6 @@ if get_option("system-boost-lib-search-suffixes") is not None:
         boostSuffixList = []
     else:
         boostSuffixList = boostSuffixList.split(',')
-
-# boostSuffix is used when using internal boost to select which version
-# of boost is in play.
-boostSuffix = "";
-if not use_system_version_of_library("boost"):
-    # Boost release numbers are x.y.z, where z is usually 0 which we do not include in
-    # the internal-boost option
-    boostSuffix = "-%s.0" % get_option( "internal-boost")
 
 # discover modules, and load the (python) module for each module's build.py
 mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules', get_option('modules'))
@@ -1718,6 +1786,12 @@ def doConfigure(myenv):
         # than the return type.
         AddToCXXFLAGSIfSupported(myenv, "-Wredundant-move")
 
+        # Disable warning about variables that may not be initialized
+        # Failures are triggered in the case of boost::optional in GCC 4.8.x
+        # TODO: re-evaluate when we move to GCC 5.3
+        # see: http://stackoverflow.com/questions/21755206/how-to-get-around-gcc-void-b-4-may-be-used-uninitialized-in-this-funct
+        AddToCXXFLAGSIfSupported(myenv, "-Wno-maybe-uninitialized")
+
     # Check if we need to disable null-conversion warnings
     if myenv.ToolchainIs('clang'):
         def CheckNullConversion(context):
@@ -1782,13 +1856,17 @@ def doConfigure(myenv):
         conf.Finish()
 
     if not myenv.ToolchainIs('msvc'):
-        if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
-            myenv.ConfError('Compiler does not honor -std=c++11')
+        if get_option('cxx-std') == "11":
+            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++11'):
+                myenv.ConfError('Compiler does not honor -std=c++11')
+        elif get_option('cxx-std') == "14":
+            if not AddToCXXFLAGSIfSupported(myenv, '-std=c++14'):
+                myenv.ConfError('Compiler does not honor -std=c++14')
         if not AddToCFLAGSIfSupported(myenv, '-std=c99'):
             myenv.ConfError("C++11 mode selected for C++ files, but can't enable C99 for C files")
 
     if using_system_version_of_cxx_libraries():
-        print( 'WARNING: System versions of C++ libraries must be compiled with C++11 support' )
+        print( 'WARNING: System versions of C++ libraries must be compiled with C++11/14 support' )
 
     # We appear to have C++11, or at least a flag to enable it. Check that the declared C++
     # language level is not less than C++11, and that we can at least compile an 'auto'
@@ -1811,12 +1889,34 @@ def doConfigure(myenv):
         context.Result(ret)
         return ret
 
+    def CheckCxx14(context):
+        test_body = """
+        #ifndef _MSC_VER
+        #if __cplusplus < 201402L
+        #error
+        #endif
+        #endif
+        auto DeducedReturnTypesAreACXX14Feature() {
+            return 0;
+        }
+        """
+
+        context.Message('Checking for C++14... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+        context.Result(ret)
+        return ret
+
     conf = Configure(myenv, help=False, custom_tests = {
         'CheckCxx11' : CheckCxx11,
+        'CheckCxx14' : CheckCxx14,
     })
 
     if not conf.CheckCxx11():
         myenv.ConfError('C++11 support is required to build MongoDB')
+
+    if get_option('cxx-std') == "14":
+        if not conf.CheckCxx14():
+            myenv.ConfError('C++14 does not appear to work with the current toolchain')
 
     conf.Finish()
 
@@ -1976,7 +2076,7 @@ def doConfigure(myenv):
         if not myenv.ToolchainIs('clang', 'gcc'):
             env.FatalError('sanitize is only supported with clang or gcc')
 
-        if get_option('allocator') == 'tcmalloc':
+        if env['MONGO_ALLOCATOR'] == 'tcmalloc':
             # There are multiply defined symbols between the sanitizer and
             # our vendorized tcmalloc.
             env.FatalError("Cannot use --sanitize with tcmalloc")
@@ -1986,6 +2086,7 @@ def doConfigure(myenv):
         using_lsan = 'leak' in sanitizer_list
         using_asan = 'address' in sanitizer_list or using_lsan
         using_tsan = 'thread' in sanitizer_list
+        using_ubsan = 'undefined' in sanitizer_list
 
         # If the user asked for leak sanitizer, turn on the detect_leaks
         # ASAN_OPTION. If they asked for address sanitizer as well, drop
@@ -2043,6 +2144,10 @@ def doConfigure(myenv):
         if using_tsan:
             tsan_options += "suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options
+
+        if using_ubsan:
+            # By default, undefined behavior sanitizer doesn't stop on the first error. Make it so.
+            AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover")
 
     if myenv.ToolchainIs('msvc') and optBuild:
         # http://blogs.msdn.com/b/vcblog/archive/2013/09/11/introducing-gw-compiler-switch.aspx
@@ -2154,6 +2259,41 @@ def doConfigure(myenv):
 
     myenv = conf.Finish()
 
+    def CheckCXX14EnableIfT(context):
+        test_body = """
+        #include <cstdlib>
+        #include <type_traits>
+
+        template <typename = void>
+        struct scons {
+            bool hasSupport() { return false; }
+        };
+
+        template <>
+        struct scons<typename std::enable_if_t<true>> {
+            bool hasSupport() { return true; }
+        };
+
+        int main(int argc, char **argv) {
+            scons<> SCons;
+            return SCons.hasSupport() ? EXIT_SUCCESS : EXIT_FAILURE;
+        }
+        """
+        context.Message('Checking for C++14 std::enable_if_t support...')
+        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
+        context.Result(ret)
+        return ret
+
+    # Check for std::enable_if_t support without using the __cplusplus macro
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckCXX14EnableIfT' : CheckCXX14EnableIfT,
+    })
+
+    if conf.CheckCXX14EnableIfT():
+        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ENABLE_IF_T')
+
+    myenv = conf.Finish()
+
     def CheckCXX14MakeUnique(context):
         test_body = """
         #include <memory>
@@ -2177,6 +2317,32 @@ def doConfigure(myenv):
 
     myenv = conf.Finish()
 
+    def CheckCXX11Align(context):
+        test_body = """
+        #include <memory>
+        int main(int argc, char **argv) {
+            char buf[100];
+            void* ptr = static_cast<void*>(buf);
+            std::size_t size = sizeof(buf);
+            auto foo = std::align(16, 16, ptr, size);
+            return 0;
+        }
+        """
+        context.Message('Checking for C++11 std::align support... ')
+        ret = context.TryCompile(textwrap.dedent(test_body), '.cpp')
+        context.Result(ret)
+        return ret
+
+    # Check for std::align support
+    conf = Configure(myenv, help=False, custom_tests = {
+        'CheckCXX11Align': CheckCXX11Align,
+    })
+
+    if conf.CheckCXX11Align():
+        conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_STD_ALIGN')
+
+    myenv = conf.Finish()
+
     def CheckBoostMinVersion(context):
         compile_test_body = textwrap.dedent("""
         #include <boost/version.hpp>
@@ -2195,6 +2361,77 @@ def doConfigure(myenv):
         'CheckBoostMinVersion': CheckBoostMinVersion,
     })
     libdeps.setup_conftests(conf)
+
+    if has_option( "ssl" ):
+        sslLibName = "ssl"
+        cryptoLibName = "crypto"
+        if conf.env.TargetOSIs('windows'):
+            sslLibName = "ssleay32"
+            cryptoLibName = "libeay32"
+
+        # Used to import system certificate keychains
+        if conf.env.TargetOSIs('osx'):
+            conf.env.AppendUnique(FRAMEWORKS=[
+                'CoreFoundation',
+                'Security',
+            ])
+
+        if not conf.CheckLibWithHeader(
+                sslLibName,
+                ["openssl/ssl.h"],
+                "C",
+                "SSL_version(NULL);",
+                autoadd=True):
+            conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
+
+        if not conf.CheckLibWithHeader(
+                cryptoLibName,
+                ["openssl/crypto.h"],
+                "C",
+                "SSLeay_version(0);",
+                autoadd=True):
+            conf.env.ConfError("Couldn't find OpenSSL crypto.h header and library")
+
+        def CheckLinkSSL(context):
+            test_body = """
+            #include <openssl/err.h>
+            #include <openssl/ssl.h>
+            #include <stdlib.h>
+
+            int main() {
+                SSL_library_init();
+                SSL_load_error_strings();
+                ERR_load_crypto_strings();
+
+                OpenSSL_add_all_algorithms();
+                ERR_free_strings();
+
+                return EXIT_SUCCESS;
+            }
+            """
+            context.Message("Checking that linking to OpenSSL works...")
+            ret = context.TryLink(textwrap.dedent(test_body), ".c")
+            context.Result(ret)
+            return ret
+
+        conf.AddTest("CheckLinkSSL", CheckLinkSSL)
+
+        if not conf.CheckLinkSSL():
+            conf.env.ConfError("SSL is enabled, but is unavailable")
+
+        env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
+        env.Append( MONGO_CRYPTO=["openssl"] )
+
+        if conf.CheckDeclaration(
+            "FIPS_mode_set",
+            includes="""
+                #include <openssl/crypto.h>
+                #include <openssl/evp.h>
+            """):
+            conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_FIPS_MODE_SET')
+
+    else:
+        env.Append( MONGO_CRYPTO=["tom"] )
 
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])
@@ -2301,13 +2538,13 @@ def doConfigure(myenv):
 
     # 'tcmalloc' needs to be the last library linked. Please, add new libraries before this 
     # point.
-    if get_option('allocator') == 'tcmalloc':
+    if myenv['MONGO_ALLOCATOR'] == 'tcmalloc':
         if use_system_version_of_library('tcmalloc'):
             conf.FindSysLibDep("tcmalloc", ["tcmalloc"])
-    elif get_option('allocator') == 'system':
+    elif myenv['MONGO_ALLOCATOR'] == 'system':
         pass
     else:
-        myenv.ConfError("Invalid --allocator parameter: \"{0}\"", get_option('allocator'))
+        myenv.ConfError("Invalid --allocator parameter: $MONGO_ALLOCATOR")
 
     def CheckStdAtomic(context, base_type, extra_message):
         test_body = """
@@ -2353,40 +2590,6 @@ def doConfigure(myenv):
     # ask each module to configure itself and the build environment.
     moduleconfig.configure_modules(mongo_modules, conf)
 
-    def CheckLinkSSL(context):
-        test_body = """
-        #include <openssl/err.h>
-        #include <openssl/ssl.h>
-        #include <stdlib.h>
-
-        int main() {
-            SSL_library_init();
-            SSL_load_error_strings();
-            ERR_load_crypto_strings();
-
-            OpenSSL_add_all_algorithms();
-            ERR_free_strings();
-            return EXIT_SUCCESS;
-        }
-        """
-        context.Message("Checking if OpenSSL is available...")
-        ret = context.TryLink(textwrap.dedent(test_body), ".c")
-        context.Result(ret)
-        return ret
-    conf.AddTest("CheckLinkSSL", CheckLinkSSL)
-
-    if has_option("ssl"):
-        if not conf.CheckLinkSSL():
-            conf.env.ConfError("SSL is enabled, but is unavailable")
-
-        if conf.CheckDeclaration(
-            "FIPS_mode_set",
-            includes="""
-                #include <openssl/crypto.h>
-                #include <openssl/evp.h>
-            """):
-            conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_FIPS_MODE_SET')
-
     return conf.Finish()
 
 env = doConfigure( env )
@@ -2405,8 +2608,12 @@ checkErrorCodes()
 # --- lint ----
 
 def doLint( env , target , source ):
+    import buildscripts.eslint
+    if not buildscripts.eslint.lint(None, dirmode=True, glob=["jstests/", "src/mongo/"]):
+        raise Exception("ESLint errors")
+
     import buildscripts.clang_format
-    if not buildscripts.clang_format.lint(None, []):
+    if not buildscripts.clang_format.lint_all(None):
         raise Exception("clang-format lint errors")
 
     import buildscripts.lint
@@ -2420,8 +2627,7 @@ env.AlwaysBuild( "lint" )
 #  ----  INSTALL -------
 
 def getSystemInstallName():
-    dist_arch = GetOption("distarch")
-    arch_name = env['TARGET_ARCH'] if not dist_arch else dist_arch
+    arch_name = env.subst('$MONGO_DISTARCH')
 
     # We need to make sure the directory names inside dist tarballs are permanently
     # consistent, even if the target OS name used in scons is different. Any differences
@@ -2437,8 +2643,8 @@ def getSystemInstallName():
     if len(mongo_modules):
             n += "-" + "-".join(m.name for m in mongo_modules)
 
-    dn = GetOption("distmod")
-    if dn and len(dn) > 0:
+    dn = env.subst('$MONGO_DISTMOD')
+    if len(dn) > 0:
         n = n + "-" + dn
 
     return n
@@ -2464,12 +2670,7 @@ def add_version_to_distsrc(env, archive):
 
 env.AddDistSrcCallback(add_version_to_distsrc)
 
-if has_option('distname'):
-    distName = GetOption( "distname" )
-else:
-    distName = env['MONGO_VERSION']
-
-env['SERVER_DIST_BASENAME'] = 'mongodb-%s-%s' % (getSystemInstallName(), distName)
+env['SERVER_DIST_BASENAME'] = env.subst('mongodb-%s-$MONGO_DISTNAME' % (getSystemInstallName()))
 
 module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 
@@ -2486,10 +2687,12 @@ Export("get_option")
 Export("has_option use_system_version_of_library")
 Export("serverJs")
 Export("usemozjs")
-Export("boostSuffix")
 Export('module_sconscripts')
 Export("debugBuild optBuild")
 Export("wiredtiger")
+Export("mmapv1")
+Export("endian")
+Export("icuEnabled")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])
@@ -2508,3 +2711,18 @@ env.Alias("distsrc", "distsrc-tgz")
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
 
 env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
+
+# Substitute environment variables in any build targets so that we can
+# say, for instance:
+#
+# > scons --prefix=/foo/bar '$INSTALL_DIR'
+# or
+# > scons \$BUILD_DIR/mongo/base
+#
+# That way, you can reference targets under the variant dir or install
+# path via an invariant name.
+#
+# We need to replace the values in the BUILD_TARGETS object in-place
+# because SCons wants it to be a particular object.
+for i, s in enumerate(BUILD_TARGETS):
+    BUILD_TARGETS[i] = env.subst(s)

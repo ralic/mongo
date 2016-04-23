@@ -30,17 +30,21 @@
 
 #include <vector>
 #include <memory>
+#include <utility>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/data_replicator.h"
 #include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_executor.h"
-#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/sync_source_resolver.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/snapshot_name.h"
@@ -57,6 +61,10 @@ class Timer;
 template <typename T>
 class StatusWith;
 
+namespace executor {
+struct ConnectionPoolStats;
+}  // namespace executor
+
 namespace rpc {
 class ReplSetMetadata;
 }  // namespace rpc
@@ -64,13 +72,11 @@ class ReplSetMetadata;
 namespace repl {
 
 class ElectCmdRunner;
-class ElectionWinnerDeclarer;
 class FreshnessChecker;
 class HandshakeArgs;
 class HeartbeatResponseAction;
 class LastVote;
 class OplogReader;
-class ReplSetDeclareElectionWinnerArgs;
 class ReplSetRequestVotesArgs;
 class ReplicaSetConfig;
 class SyncSourceFeedback;
@@ -81,11 +87,14 @@ class ReplicationCoordinatorImpl : public ReplicationCoordinator, public KillOpL
     MONGO_DISALLOW_COPYING(ReplicationCoordinatorImpl);
 
 public:
+    // For testing only.
+    using StepDownNonBlockingResult =
+        std::pair<std::unique_ptr<mongo::Lock::GlobalLock>, ReplicationExecutor::EventHandle>;
+
     // Takes ownership of the "externalState", "topCoord" and "network" objects.
     ReplicationCoordinatorImpl(const ReplSettings& settings,
                                ReplicationCoordinatorExternalState* externalState,
                                executor::NetworkInterface* network,
-                               StorageInterface* storage,
                                TopologyCoordinator* topoCoord,
                                int64_t prngSeed);
     // Takes ownership of the "externalState" and "topCoord" objects.
@@ -93,20 +102,27 @@ public:
                                ReplicationCoordinatorExternalState* externalState,
                                TopologyCoordinator* topoCoord,
                                ReplicationExecutor* replExec,
-                               int64_t prngSeed);
+                               int64_t prngSeed,
+                               stdx::function<bool()>* isDurableStorageEngineFn);
     virtual ~ReplicationCoordinatorImpl();
 
     // ================== Members of public ReplicationCoordinator API ===================
 
-    virtual void startReplication(OperationContext* txn) override;
+    virtual void startup(OperationContext* txn) override;
 
     virtual void shutdown() override;
+
+    virtual ReplicationExecutor* getExecutor() override {
+        return &_replExecutor;
+    }
 
     virtual const ReplSettings& getSettings() const override;
 
     virtual Mode getReplicationMode() const override;
 
     virtual MemberState getMemberState() const override;
+
+    virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
     virtual bool isInPrimaryOrSecondaryState() const override;
 
@@ -153,15 +169,18 @@ public:
 
     virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
-    virtual void setMyLastOptime(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTime(const OpTime& opTime);
+    virtual void setMyLastDurableOpTime(const OpTime& opTime);
 
-    virtual void setMyLastOptimeForward(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime);
+    virtual void setMyLastDurableOpTimeForward(const OpTime& opTime);
 
-    virtual void resetMyLastOptime();
+    virtual void resetMyLastOpTimes();
 
     virtual void setMyHeartbeatMessage(const std::string& msg);
 
-    virtual OpTime getMyLastOptime() const override;
+    virtual OpTime getMyLastAppliedOpTime() const override;
+    virtual OpTime getMyLastDurableOpTime() const override;
 
     virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
                                                 const ReadConcernArgs& settings) override;
@@ -178,9 +197,12 @@ public:
 
     virtual void signalDrainComplete(OperationContext* txn) override;
 
+    virtual Status waitForDrainFinish(Milliseconds timeout) override;
+
     virtual void signalUpstreamUpdater() override;
 
-    virtual bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) override;
+    virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
+        ReplSetUpdatePositionCommandStyle commandStyle) const override;
 
     virtual Status processReplSetGetStatus(BSONObjBuilder* result) override;
 
@@ -193,6 +215,8 @@ public:
     virtual void processReplSetGetConfig(BSONObjBuilder* result) override;
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
+
+    virtual void cancelAndRescheduleElectionTimeout() override;
 
     virtual Status setMaintenanceMode(bool activate) override;
 
@@ -224,6 +248,8 @@ public:
     virtual Status processReplSetElect(const ReplSetElectArgs& args,
                                        BSONObjBuilder* response) override;
 
+    virtual Status processReplSetUpdatePosition(const OldUpdatePositionArgs& updates,
+                                                long long* configVersion) override;
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion) override;
 
@@ -231,7 +257,8 @@ public:
 
     virtual bool buildsIndexes() override;
 
-    virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op) override;
+    virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op,
+                                                       bool durablyWritten) override;
 
     virtual std::vector<HostAndPort> getOtherNodesInReplSet() const override;
 
@@ -245,9 +272,14 @@ public:
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) override;
 
-    virtual void resetLastOpTimeFromOplog(OperationContext* txn) override;
+    virtual void resetLastOpTimesFromOplog(OperationContext* txn) override;
 
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource) override;
+    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
+                                        const OpTime& syncSourceLastOpTime,
+                                        bool syncSourceHasSyncSource) override;
+
+    virtual SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
+                                                        const OpTime& lastOpTimeFetched) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
 
@@ -255,18 +287,16 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) override;
 
-    virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                                       long long* responseTerm) override;
-
     void prepareReplResponseMetadata(const rpc::RequestInterface&,
                                      const OpTime& lastOpTimeFromClient,
-                                     const ReadConcernArgs& readConcern,
                                      BSONObjBuilder* builder) override;
 
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response) override;
 
-    virtual bool isV1ElectionProtocol() override;
+    virtual bool isV1ElectionProtocol() const override;
+
+    virtual bool getWriteConcernMajorityShouldJournal() override;
 
     virtual void summarizeAsHtml(ReplSetHtmlSummary* s) override;
 
@@ -276,7 +306,7 @@ public:
      */
     virtual long long getTerm() override;
 
-    virtual Status updateTerm(long long term) override;
+    virtual Status updateTerm(OperationContext* txn, long long term) override;
 
     virtual SnapshotName reserveSnapshotName(OperationContext* txn) override;
 
@@ -286,7 +316,15 @@ public:
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() override;
 
-    virtual void waitForNewSnapshot(OperationContext* txn) override;
+    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+                                            const SnapshotName& untilSnapshot) override;
+
+    virtual void appendConnectionStats(executor::ConnectionPoolStats* stats) const override;
+
+    virtual size_t getNumUncommittedSnapshots() override;
+
+    virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
+        WriteConcernOptions wc) override;
 
     // ================== Test support API ===================
 
@@ -302,9 +340,57 @@ public:
     ReplicaSetConfig getReplicaSetConfig_forTest();
 
     /**
-     * Simple wrapper around _setLastOptime_inlock to make it easier to test.
+     * Returns scheduled time of election timeout callback.
+     * Returns Date_t() if callback is not scheduled.
      */
-    Status setLastOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
+    Date_t getElectionTimeout_forTest() const;
+
+    /**
+     * Returns scheduled time of priority takeover callback.
+     * Returns Date_t() if callback is not scheduled.
+     */
+    Date_t getPriorityTakeover_forTest() const;
+
+    /**
+     * Simple wrappers around _setLastOptime_inlock to make it easier to test.
+     */
+    Status setLastAppliedOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
+    Status setLastDurableOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
+
+    /**
+     * Non-blocking version of stepDown.
+     * Returns a pair of global shared lock and event handle which are used to wait for the step
+     * down operation to complete. The global shared lock prevents writes until the step down has
+     * completed (or failed).
+     * When the operation is complete (wait() returns), 'result' will be set to the
+     * final status of the operation.
+     * If the handle is invalid, step down failed before we could schedule the rest of
+     * the step down processing and the error will be available immediately in 'result'.
+     */
+    StepDownNonBlockingResult stepDown_nonBlocking(OperationContext* txn,
+                                                   bool force,
+                                                   const Milliseconds& waitTime,
+                                                   const Milliseconds& stepdownTime,
+                                                   Status* result);
+
+    /**
+     * Non-blocking version of setFollowerMode.
+     * Returns event handle that we can use to wait for the operation to complete.
+     * When the operation is complete (wait() returns), 'success' will be set to true
+     * if the member state has been set successfully.
+     */
+    ReplicationExecutor::EventHandle setFollowerMode_nonBlocking(const MemberState& newState,
+                                                                 bool* success);
+
+    /**
+     * Non-blocking version of updateTerm.
+     * Returns event handle that we can use to wait for the operation to complete.
+     * When the operation is complete (waitForEvent() returns), 'updateResult' will be set
+     * to a status telling if the term increased or a stepdown was triggered.
+
+     */
+    ReplicationExecutor::EventHandle updateTerm_forTest(
+        long long term, TopologyCoordinator::UpdateTermResult* updateResult);
 
     /**
      * If called after _startElectSelfV1(), blocks until all asynchronous
@@ -319,13 +405,16 @@ public:
      */
     void waitForElectionDryRunFinish_forTest();
 
-    /**
-     * If called after a stepdown starts, blocks until all asynchronous activities associated with
-     * stepdown complete.
-     */
-    void waitForStepDownFinish_forTest();
-
 private:
+    using CallbackFn = executor::TaskExecutor::CallbackFn;
+
+    using CallbackHandle = executor::TaskExecutor::CallbackHandle;
+
+    using EventHandle = executor::TaskExecutor::EventHandle;
+
+    using ScheduleFn = stdx::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
+        const executor::TaskExecutor::CallbackFn& work)>;
+
     struct SnapshotInfo {
         OpTime opTime;
         SnapshotName name;
@@ -348,6 +437,7 @@ private:
         bool operator>=(const SnapshotInfo& other) const {
             return std::tie(opTime, name) >= std::tie(other.opTime, other.name);
         }
+        std::string toString() const;
     };
 
     class LoseElectionGuardV1;
@@ -358,8 +448,8 @@ private:
                                TopologyCoordinator* topCoord,
                                int64_t prngSeed,
                                executor::NetworkInterface* network,
-                               StorageInterface* storage,
-                               ReplicationExecutor* replExec);
+                               ReplicationExecutor* replExec,
+                               stdx::function<bool()>* isDurableStorageEngineFn);
     /**
      * Configuration states for a replica set node.
      *
@@ -408,7 +498,10 @@ private:
     // Struct that holds information about nodes in this replication group, mainly used for
     // tracking replication progress for write concern satisfaction.
     struct SlaveInfo {
-        OpTime opTime;            // Our last known OpTime that this slave has replicated to.
+        // Our last known OpTime that this slave has applied and journaled to.
+        OpTime lastDurableOpTime;
+        // Our last known OpTime that this slave has applied, whether journaled or unjournaled.
+        OpTime lastAppliedOpTime;
         HostAndPort hostAndPort;  // Client address of the slave.
         int memberId =
             -1;   // Id of the node in the replica set config, or -1 if we're not a replSet.
@@ -417,6 +510,9 @@ private:
         Date_t lastUpdate =
             Date_t::max();  // The last time we heard from this node; used for liveness detection
         bool down = false;  // Indicator set when lastUpdate time exceeds the election timeout.
+
+        BSONObj toBSON() const;
+        std::string toString() const;
     };
 
     typedef std::vector<SlaveInfo> SlaveInfoVector;
@@ -442,11 +538,18 @@ private:
     void _addSlaveInfo_inlock(const SlaveInfo& slaveInfo);
 
     /**
-     * Updates the item in _slaveInfo pointed to by 'slaveInfo' with the given OpTime 'opTime'
-     * and wakes up any threads waiting for replication that now have their write concern
-     * satisfied.
+     * Updates the durableOpTime field on the item in _slaveInfo pointed to by 'slaveInfo' with the
+     * given OpTime 'opTime' and wakes up any threads waiting for replication that now have their
+     * write concern satisfied.
      */
-    void _updateSlaveInfoOptime_inlock(SlaveInfo* slaveInfo, const OpTime& opTime);
+    void _updateSlaveInfoDurableOpTime_inlock(SlaveInfo* slaveInfo, const OpTime& opTime);
+
+    /**
+     * Updates the appliedOpTime field on the item in _slaveInfo pointed to by 'slaveInfo' with the
+     * given OpTime 'opTime' and wakes up any threads waiting for replication that now have their
+     * write concern satisfied.
+     */
+    void _updateSlaveInfoAppliedOpTime_inlock(SlaveInfo* slaveInfo, const OpTime& opTime);
 
     /**
      * Returns the index into _slaveInfo where data corresponding to ourself is stored.
@@ -454,6 +557,11 @@ private:
      * _slaveInfo.
      */
     size_t _getMyIndexInSlaveInfo_inlock() const;
+
+    /**
+     * Returns the _writeConcernMajorityJournalDefault of our current _rsConfig.
+     */
+    bool getWriteConcernMajorityShouldJournal_inlock() const;
 
     /**
      * Helper method that removes entries from _slaveInfo if they correspond to a node
@@ -487,79 +595,6 @@ private:
     void _wakeReadyWaiters_inlock();
 
     /**
-     * Helper method for setting/unsetting maintenance mode.  Scheduled by setMaintenanceMode()
-     * to run in a global write lock in the replication executor thread.
-     */
-    void _setMaintenanceMode_helper(const ReplicationExecutor::CallbackArgs& cbData,
-                                    bool activate,
-                                    Status* result);
-
-    /**
-     * Helper method for retrieving maintenance mode.  Scheduled by getMaintenanceMode() to run
-     * in the replication executor thread.
-     */
-    void _getMaintenanceMode_helper(const ReplicationExecutor::CallbackArgs& cbData,
-                                    bool* maintenanceMode);
-
-    /**
-     * Bottom half of fillIsMasterForReplSet.
-     */
-    void _fillIsMasterForReplSet_finish(const ReplicationExecutor::CallbackArgs& cbData,
-                                        IsMasterResponse* result);
-
-    /**
-     * Bottom half of processReplSetFresh.
-     */
-    void _processReplSetFresh_finish(const ReplicationExecutor::CallbackArgs& cbData,
-                                     const ReplSetFreshArgs& args,
-                                     BSONObjBuilder* response,
-                                     Status* result);
-
-    /**
-     * Bottom half of processReplSetElect.
-     */
-    void _processReplSetElect_finish(const ReplicationExecutor::CallbackArgs& cbData,
-                                     const ReplSetElectArgs& args,
-                                     BSONObjBuilder* response,
-                                     Status* result);
-
-    /**
-     * Bottom half of processReplSetFreeze.
-     */
-    void _processReplSetFreeze_finish(const ReplicationExecutor::CallbackArgs& cbData,
-                                      int secs,
-                                      BSONObjBuilder* response,
-                                      Status* result);
-    /*
-     * Bottom half of clearSyncSourceBlacklist
-     */
-    void _clearSyncSourceBlacklist_finish(const ReplicationExecutor::CallbackArgs& cbData);
-
-    /**
-     * Bottom half of processReplSetDeclareElectionWinner.
-     */
-    void _processReplSetDeclareElectionWinner_finish(
-        const ReplicationExecutor::CallbackArgs& cbData,
-        const ReplSetDeclareElectionWinnerArgs& args,
-        long long* responseTerm,
-        Status* result);
-
-    /**
-     * Bottom half of processReplSetRequestVotes.
-     */
-    void _processReplSetRequestVotes_finish(const ReplicationExecutor::CallbackArgs& cbData,
-                                            const ReplSetRequestVotesArgs& args,
-                                            ReplSetRequestVotesResponse* response,
-                                            Status* result);
-
-    /**
-     * Bottom half of prepareReplResponseMetadata.
-     */
-    void _prepareReplResponseMetadata_finish(const ReplicationExecutor::CallbackArgs& cbData,
-                                             const OpTime& lastOpTimeFromClient,
-                                             const ReadConcernArgs& readConcern,
-                                             rpc::ReplSetMetadata* metadata);
-    /**
      * Scheduled to cause the ReplicationCoordinator to reconsider any state that might
      * need to change as a result of time passing - for instance becoming PRIMARY when a single
      * node replica set member's stepDown period ends.
@@ -591,24 +626,26 @@ private:
 
     /**
      * Helper for _doneWaitingForReplication_inlock that takes an integer write concern.
+     * "durablyWritten" indicates whether the operation has to be durably applied.
      */
-    bool _haveNumNodesReachedOpTime_inlock(const OpTime& opTime, int numNodes);
+    bool _haveNumNodesReachedOpTime_inlock(const OpTime& opTime, int numNodes, bool durablyWritten);
 
     /**
      * Helper for _doneWaitingForReplication_inlock that takes a tag pattern representing a
      * named write concern mode.
+     * "durablyWritten" indicates whether the operation has to be durably applied.
      */
     bool _haveTaggedNodesReachedOpTime_inlock(const OpTime& opTime,
-                                              const ReplicaSetTagPattern& tagPattern);
+                                              const ReplicaSetTagPattern& tagPattern,
+                                              bool durablyWritten);
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
 
     /**
      * Triggers all callbacks that are blocked waiting for new heartbeat data
      * to decide whether or not to finish a step down.
-     * Should only be called from executor callbacks.
+     * Should only be called with _topoMutex held.
      */
-    void _signalStepDownWaitersFromCallback(const ReplicationExecutor::CallbackArgs& cbData);
     void _signalStepDownWaiters();
 
     /**
@@ -616,19 +653,20 @@ private:
      * it is running within a global shared lock, and thus that no writes are going on at the
      * same time.
      */
-    void _stepDownContinue(const ReplicationExecutor::CallbackArgs& cbData,
-                           const ReplicationExecutor::EventHandle finishedEvent,
+    void _stepDownContinue(const ReplicationExecutor::EventHandle finishedEvent,
                            OperationContext* txn,
                            Date_t waitUntil,
                            Date_t stepdownUntil,
                            bool force,
+                           bool restartHeartbeats,
                            Status* result);
 
     OID _getMyRID_inlock() const;
 
     int _getMyId_inlock() const;
 
-    OpTime _getMyLastOptime_inlock() const;
+    OpTime _getMyLastAppliedOpTime_inlock() const;
+    OpTime _getMyLastDurableOpTime_inlock() const;
 
     /**
      * Bottom half of setFollowerMode.
@@ -638,8 +676,7 @@ private:
      * supply an event, "finishedSettingFollowerMode", and wait for that event to
      * be signaled.  Do not observe "*success" until after the event is signaled.
      */
-    void _setFollowerModeFinish(const ReplicationExecutor::CallbackArgs& cbData,
-                                const MemberState& newState,
+    void _setFollowerModeFinish(const MemberState& newState,
                                 const ReplicationExecutor::EventHandle& finishedSettingFollowerMode,
                                 bool* success);
 
@@ -648,21 +685,29 @@ private:
      * This is only valid to call on replica sets.
      * "configVersion" will be populated with our config version if it and the configVersion
      * of "args" differ.
+     *
+     * The OldUpdatePositionArgs version provides support for the pre-3.2.4 format of
+     * UpdatePositionArgs.
      */
+    Status _setLastOptime_inlock(const OldUpdatePositionArgs::UpdateInfo& args,
+                                 long long* configVersion);
     Status _setLastOptime_inlock(const UpdatePositionArgs::UpdateInfo& args,
                                  long long* configVersion);
 
     /**
-     * Helper method for setMyLastOptime that takes in a unique lock on
-     * _mutex.  The passed in lock must already be locked.  It is unspecified what state the
-     * lock will be in after this method finishes.
+     * This function will report our position externally (like upstream) if necessary.
      *
-     * This function has the same rules for "opTime" as setMyLastOptime(), unless
-     * "isRollbackAllowed" is true.
+     * Takes in a unique lock, that must already be locked, on _mutex.
+     *
+     * Lock will be released after this method finishes.
      */
-    void _setMyLastOptime_inlock(stdx::unique_lock<stdx::mutex>* lock,
-                                 const OpTime& opTime,
-                                 bool isRollbackAllowed);
+    void _reportUpstream_inlock(stdx::unique_lock<stdx::mutex> lock);
+
+    /**
+     * Helpers to set the last applied and durable OpTime.
+     */
+    void _setMyLastAppliedOpTime_inlock(const OpTime& opTime, bool isRollbackAllowed);
+    void _setMyLastDurableOpTime_inlock(const OpTime& opTime, bool isRollbackAllowed);
 
     /**
      * Schedules a heartbeat to be sent to "target" at "when". "targetIndex" is the index
@@ -689,20 +734,29 @@ private:
     /**
      * Helper for _handleHeartbeatResponse.
      *
-     * Updates the optime associated with the member at "memberIndex" in our config.
+     * Updates the lastDurableOpTime and lastAppliedOpTime associated with the member at
+     * "memberIndex" in our config.
      */
-    void _updateOpTimeFromHeartbeat_inlock(int memberIndex, const OpTime& optime);
+    void _updateOpTimesFromHeartbeat_inlock(int targetIndex,
+                                            const OpTime& durableOpTime,
+                                            const OpTime& appliedOpTime);
 
     /**
-     * Starts a heartbeat for each member in the current config.  Called within the executor
-     * context.
+     * Starts a heartbeat for each member in the current config.  Called while holding _topoMutex
+     * and replCoord _mutex.
      */
-    void _startHeartbeats();
+    void _startHeartbeats_inlock();
 
     /**
-     * Cancels all heartbeats.  Called within executor context.
+     * Cancels all heartbeats.  Called while holding _topoMutex and replCoord _mutex.
      */
-    void _cancelHeartbeats();
+    void _cancelHeartbeats_inlock();
+
+    /**
+     * Cancels all heartbeats, then starts a heartbeat for each member in the current config.
+     * Called while holding _topoMutex and replCoord _mutex.
+     */
+    void _restartHeartbeats_inlock();
 
     /**
      * Asynchronously sends a heartbeat to "target". "targetIndex" is the index
@@ -717,15 +771,6 @@ private:
 
 
     MemberState _getMemberState_inlock() const;
-
-    /**
-     * Callback that gives the TopologyCoordinator an initial LastVote document from
-     * local storage.
-     *
-     * Called only during replication startup. All other updates come from the
-     * TopologyCoordinator itself.
-     */
-    void _updateLastVote(const LastVote& lastVote);
 
     /**
      * Starts loading the replication configuration from local storage, and if it is valid,
@@ -748,16 +793,24 @@ private:
                                 const StatusWith<LastVote>& lastVoteStatus);
 
     /**
-     * Callback that finishes the work of processReplSetInitiate() inside the replication
-     * executor context, in the event of a successful quorum check.
+     * Start replicating data, and does an initial sync if needed first.
      */
-    void _finishReplSetInitiate(const ReplicationExecutor::CallbackArgs& cbData,
-                                const ReplicaSetConfig& newConfig,
-                                int myIndex);
+    void _startDataReplication(OperationContext* txn);
 
     /**
-     * Callback that finishes the work of processReplSetReconfig inside the replication
-     * executor context, in the event of a successful quorum check.
+     * Stops replicating data by stopping the applier, fetcher and such.
+     */
+    void _stopDataReplication();
+
+    /**
+     * Finishes the work of processReplSetInitiate() while holding _topoMutex, in the event of
+     * a successful quorum check.
+     */
+    void _finishReplSetInitiate(const ReplicaSetConfig& newConfig, int myIndex);
+
+    /**
+     * Finishes the work of processReplSetReconfig while holding _topoMutex, in the event of
+     * a successful quorum check.
      */
     void _finishReplSetReconfig(const ReplicationExecutor::CallbackArgs& cbData,
                                 const ReplicaSetConfig& newConfig,
@@ -787,7 +840,7 @@ private:
      * Begins an attempt to elect this node.
      * Called after an incoming heartbeat changes this node's view of the set such that it
      * believes it can be elected PRIMARY.
-     * For proper concurrency, must be called via a ReplicationExecutor callback.
+     * For proper concurrency, must be called while holding _topoMutex.
      *
      * For old style elections the election path is:
      *      _startElectSelf()
@@ -799,7 +852,6 @@ private:
      *      _writeLastVoteForMyElection()
      *      _startVoteRequester()
      *      _onVoteRequestComplete()
-     *      _onElectionWinnerDeclarerComplete()
      */
     void _startElectSelf();
     void _startElectSelfV1();
@@ -845,36 +897,9 @@ private:
     void _onVoteRequestComplete(long long originalTerm);
 
     /**
-     * Callback called when the ElectWinnerDeclarer has completed; checks the results and
-     * if we received any negative responses, relinquish primary.
-     */
-    void _onElectionWinnerDeclarerComplete();
-
-    /**
      * Callback called after a random delay, to prevent repeated election ties.
      */
     void _recoverFromElectionTie(const ReplicationExecutor::CallbackArgs& cbData);
-
-    /**
-     * Chooses a new sync source.  Must be scheduled as a callback.
-     *
-     * Calls into the Topology Coordinator, which uses its current view of the set to choose
-     * the most appropriate sync source.
-     */
-    void _chooseNewSyncSource(const ReplicationExecutor::CallbackArgs& cbData,
-                              const Timestamp& lastTimestampFetched,
-                              HostAndPort* newSyncSource);
-
-    /**
-     * Adds 'host' to the sync source blacklist until 'until'. A blacklisted source cannot
-     * be chosen as a sync source. Schedules a callback to unblacklist the sync source to be
-     * run at 'until'.
-     *
-     * Must be scheduled as a callback.
-     */
-    void _blacklistSyncSource(const ReplicationExecutor::CallbackArgs& cbData,
-                              const HostAndPort& host,
-                              Date_t until);
 
     /**
      * Removes 'host' from the sync source blacklist. If 'host' isn't found, it's simply
@@ -886,26 +911,19 @@ private:
                                 const HostAndPort& host);
 
     /**
-     * Determines if a new sync source should be considered.
-     *
-     * Must be scheduled as a callback.
-     */
-    void _shouldChangeSyncSource(const ReplicationExecutor::CallbackArgs& cbData,
-                                 const HostAndPort& currentSource,
-                                 bool* shouldChange);
-
-    /**
      * Schedules a request that the given host step down; logs any errors.
      */
     void _requestRemotePrimaryStepdown(const HostAndPort& target);
 
-    void _stepDownStart();
+    ReplicationExecutor::EventHandle _stepDownStart();
 
     /**
      * Completes a step-down of the current node.  Must be run with a global
      * shared or global exclusive lock.
+     * Signals 'finishedEvent' on successful completion.
      */
-    void _stepDownFinish(const ReplicationExecutor::CallbackArgs& cbData);
+    void _stepDownFinish(const ReplicationExecutor::CallbackArgs& cbData,
+                         const ReplicationExecutor::EventHandle& finishedEvent);
 
     /**
      * Schedules a replica set config change.
@@ -941,33 +959,10 @@ private:
                                         const StatusWith<ReplSetHeartbeatResponse>& responseStatus);
 
     /**
-     * Bottom half of processHeartbeat(), which runs in the replication executor.
-     */
-    void _processHeartbeatFinish(const ReplicationExecutor::CallbackArgs& cbData,
-                                 const ReplSetHeartbeatArgs& args,
-                                 ReplSetHeartbeatResponse* response,
-                                 Status* outStatus);
-
-    /**
-     * Bottom half of processHeartbeatV1(), which runs in the replication executor.
-     */
-    void _processHeartbeatFinishV1(const ReplicationExecutor::CallbackArgs& cbData,
-                                   const ReplSetHeartbeatArgsV1& args,
-                                   ReplSetHeartbeatResponse* response,
-                                   Status* outStatus);
-    /**
      * Scan the SlaveInfoVector and determine the highest OplogEntry present on a majority of
      * servers; set _lastCommittedOpTime to this new entry, if greater than the current entry.
      */
     void _updateLastCommittedOpTime_inlock();
-
-    void _summarizeAsHtml_finish(const ReplicationExecutor::CallbackArgs& cbData,
-                                 ReplSetHtmlSummary* output);
-
-    /**
-     * Callback that gets the current term from topology coordinator.
-     */
-    void _getTerm_helper(const ReplicationExecutor::CallbackArgs& cbData, long long* term);
 
     /**
      * This is used to set a floor of "newOpTime" on the OpTimes we will consider committed.
@@ -979,23 +974,20 @@ private:
     /**
      * Callback that attempts to set the current term in topology coordinator and
      * relinquishes primary if the term actually changes and we are primary.
+     * *updateTermResult will be the result of the update term attempt.
+     * Returns the finish event if it does not finish in this function, for example,
+     * due to stepdown, otherwise the returned EventHandle is invalid.
      */
-    void _updateTerm_helper(const ReplicationExecutor::CallbackArgs& cbData,
-                            long long term,
-                            bool* updated);
-    /**
-     * Returns true if the term increased.
-     */
-    bool _updateTerm_incallback(long long term);
+    EventHandle _updateTerm_incallback(
+        long long term, TopologyCoordinator::UpdateTermResult* updateTermResult = nullptr);
 
     /**
      * Callback that processes the ReplSetMetadata returned from a command run against another
      * replica set member and updates protocol version 1 information (most recent optime that is
      * committed, member id of the current PRIMARY, the current config version and the current term)
+     * Returns the finish event which is invalid if the process has already finished.
      */
-    void _processReplSetMetadata_helper(const ReplicationExecutor::CallbackArgs& cbData,
-                                        const rpc::ReplSetMetadata& replMetadata);
-    void _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
+    EventHandle _processReplSetMetadata_incallback(const rpc::ReplSetMetadata& replMetadata);
 
     /**
      * Blesses a snapshot to be used for new committed reads.
@@ -1008,13 +1000,8 @@ private:
     void _dropAllSnapshots_inlock();
 
     /**
-     * Callback which schedules "_handleLivenessTimeout" to be run whenever the liveness timeout
-     * for the node who was least recently reported to be alive occurs.
-     */
-    void _scheduleNextLivenessUpdate();
-
-    /**
      * Bottom half of _scheduleNextLivenessUpdate.
+     * Must be called with _topoMutex held.
      */
     void _scheduleNextLivenessUpdate_inlock();
 
@@ -1032,10 +1019,88 @@ private:
     void _cancelAndRescheduleLivenessUpdate_inlock(int updatedMemberId);
 
     /**
+     * Cancels all outstanding _priorityTakeover callbacks.
+     */
+    void _cancelPriorityTakeover_inlock();
+
+    /**
+     * Cancels the current _handleElectionTimeout callback and reschedules a new callback.
+     * Returns immediately otherwise.
+     */
+    void _cancelAndRescheduleElectionTimeout_inlock();
+
+    /**
+     * Callback which starts an election if this node is electable and using protocolVersion 1.
+     * "isPriorityTakeover" is used to determine if the caller was a priority takeover or not and
+     * log messages accordingly.
+     */
+    void _startElectSelfIfEligibleV1(bool isPriorityTakeover);
+
+    /**
      * Reset the term of last vote to 0 to prevent any node from voting for term 0.
      * Blocking until last vote write finishes. Must be called without holding _mutex.
      */
-    void _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& newConfig);
+    void _resetElectionInfoOnProtocolVersionUpgrade(const ReplicaSetConfig& oldConfig,
+                                                    const ReplicaSetConfig& newConfig);
+
+    /**
+     * Schedules work and returns handle to callback.
+     * If work cannot be scheduled due to shutdown, returns empty handle.
+     * All other non-shutdown scheduling failures will abort the process.
+     * Does not run 'work' if callback is canceled.
+     */
+    CallbackHandle _scheduleWork(const CallbackFn& work);
+
+    /**
+     * Schedules work to be run no sooner than 'when' and returns handle to callback.
+     * If work cannot be scheduled due to shutdown, returns empty handle.
+     * All other non-shutdown scheduling failures will abort the process.
+     * Does not run 'work' if callback is canceled.
+     */
+    CallbackHandle _scheduleWorkAt(Date_t when, const CallbackFn& work);
+
+    /**
+     * Schedules work and waits for completion.
+     */
+    void _scheduleWorkAndWaitForCompletion(const CallbackFn& work);
+
+    /**
+     * Schedules work to be run no sooner than 'when' and waits for completion.
+     */
+    void _scheduleWorkAtAndWaitForCompletion(Date_t when, const CallbackFn& work);
+
+    /**
+     * Schedules DB work and returns handle to callback.
+     * If work cannot be scheduled due to shutdown, returns empty handle.
+     * All other non-shutdown scheduling failures will abort the process.
+     * Does not run 'work' if callback is canceled.
+     */
+    CallbackHandle _scheduleDBWork(const CallbackFn& work);
+
+    /**
+     * Does the actual work of scheduling the work with the executor.
+     * Used by _scheduleWork() and _scheduleWorkAt() only.
+     * Do not call this function directly.
+     */
+    CallbackHandle _wrapAndScheduleWork(ScheduleFn scheduleFn, const CallbackFn& work);
+
+    /**
+     * Creates an event.
+     * Returns invalid event handle if the executor is shutting down.
+     * Otherwise aborts on non-shutdown error.
+     */
+    EventHandle _makeEvent();
+
+    /**
+     * Schedule notification of election win.
+     */
+    void _scheduleElectionWinNotification();
+
+    /**
+     * Wrap a function into executor callback.
+     * If the callback is cancelled, the given function won't run.
+     */
+    executor::TaskExecutor::CallbackFn _wrapAsCallbackFn(const stdx::function<void()>& work);
 
     //
     // All member variables are labeled with one of the following codes indicating the
@@ -1046,16 +1111,23 @@ private:
     // (PS) Pointer is read-only in concurrent operation, item pointed to is self-synchronizing;
     //      Access in any context.
     // (M)  Reads and writes guarded by _mutex
-    // (X)  Reads and writes must be performed in a callback in _replExecutor
-    // (MX) Must hold _mutex and be in a callback in _replExecutor to write; must either hold
-    //      _mutex or be in a callback in _replExecutor to read.
+    // (X)  Reads and writes guarded by _topoMutex
+    // (MX) Must hold _mutex and _topoMutex to write; must either hold _mutex or _topoMutex
+    //      to read.
     // (GX) Readable under a global intent lock.  Must either hold global lock in exclusive
-    //      mode (MODE_X) or both hold global lock in shared mode (MODE_S) and be in executor
-    //      context to write.
+    //      mode (MODE_X) or both hold global lock in shared mode (MODE_S) and hold _topoMutex
+    //      to write.
     // (I)  Independently synchronized, see member variable comment.
+
+    // When both _mutex and _topoMutex are needed, the caller must follow the strict locking order
+    // to avoid deadlock: _topoMutex must be held before locking _mutex.
+    // In other words,  _topoMutex can never be locked while holding _mutex.
 
     // Protects member data of this ReplicationCoordinator.
     mutable stdx::mutex _mutex;  // (S)
+
+    // Protects member data of the TopologyCoordinator.
+    mutable stdx::mutex _topoMutex;  // (S)
 
     // Handles to actively queued heartbeats.
     HeartbeatHandles _heartbeatHandles;  // (X)
@@ -1092,8 +1164,7 @@ private:
     // TODO: ideally this should only change on rollbacks NOT on mongod restarts also.
     int _rbid;  // (M)
 
-    // list of information about clients waiting on replication.  Does *not* own the
-    // WaiterInfos.
+    // list of information about clients waiting on replication.  Does *not* own the WaiterInfos.
     std::vector<WaiterInfo*> _replicationWaiterList;  // (M)
 
     // list of information about clients waiting for a particular opTime.
@@ -1116,17 +1187,20 @@ private:
     // the entry for ourself will be at _thisMemberConfigIndex.
     SlaveInfoVector _slaveInfo;  // (M)
 
+    // Used to signal threads waiting for changes to _memberState.
+    stdx::condition_variable _memberStateChange;  // (M)
+
     // Current ReplicaSet state.
     MemberState _memberState;  // (MX)
+
+    // Used to signal threads waiting for changes to _memberState.
+    stdx::condition_variable _drainFinishedCond;  // (M)
 
     // True if we are waiting for the applier to finish draining.
     bool _isWaitingForDrainToComplete;  // (M)
 
     // Used to signal threads waiting for changes to _rsConfigState.
     stdx::condition_variable _rsConfigStateChange;  // (M)
-
-    // Used to signal threads that are waiting for new snapshots.
-    stdx::condition_variable _snapshotCreatedCond;  // (M)
 
     // Represents the configuration state of the coordinator, which controls how and when
     // _rsConfig may change.  See the state transition diagram in the type definition of
@@ -1153,8 +1227,6 @@ private:
     std::unique_ptr<ElectCmdRunner> _electCmdRunner;  // (X)
 
     std::unique_ptr<VoteRequester> _voteRequester;  // (X)
-
-    std::unique_ptr<ElectionWinnerDeclarer> _electionWinnerDeclarer;  // (X)
 
     // Event that the election code will signal when the in-progress election completes.
     // Unspecified value when _freshnessChecker is NULL.
@@ -1196,19 +1268,47 @@ private:
     AtomicUInt64 _snapshotNameGenerator;  // (S)
 
     // The OpTimes and SnapshotNames for all snapshots newer than the current commit point, kept in
-    // sorted order.
+    // sorted order. Any time this is changed, you must also update _uncommitedSnapshotsSize.
     std::deque<SnapshotInfo> _uncommittedSnapshots;  // (M)
+
+    // A cache of the size of _uncommittedSnaphots that can be read without any locking.
+    // May only be written to while holding _mutex.
+    AtomicUInt64 _uncommittedSnapshotsSize;  // (I)
 
     // The non-null OpTime and SnapshotName of the current snapshot used for committed reads, if
     // there is one.
     // When engaged, this must be <= _lastCommittedOpTime and < _uncommittedSnapshots.front().
     boost::optional<SnapshotInfo> _currentCommittedSnapshot;  // (M)
 
+    // Used to signal threads that are waiting for new committed snapshots.
+    stdx::condition_variable _currentCommittedSnapshotCond;  // (M)
+
     // The cached current term. It's in sync with the term in topology coordinator.
     long long _cachedTerm = OpTime::kUninitializedTerm;  // (M)
 
     // Callback Handle used to cancel a scheduled LivenessTimeout callback.
     ReplicationExecutor::CallbackHandle _handleLivenessTimeoutCbh;  // (M)
+
+    // Callback Handle used to cancel a scheduled ElectionTimeout callback.
+    ReplicationExecutor::CallbackHandle _handleElectionTimeoutCbh;  // (M)
+
+    // Election timeout callback will not run before this time.
+    // If this date is Date_t(), the callback is either unscheduled or canceled.
+    // Used for testing only.
+    Date_t _handleElectionTimeoutWhen;  // (M)
+
+    // Callback Handle used to cancel a scheduled PriorityTakover callback.
+    ReplicationExecutor::CallbackHandle _priorityTakeoverCbh;  // (M)
+
+    // Priority takeover callback will not run before this time.
+    // If this date is Date_t(), the callback is either unscheduled or canceled.
+    // Used for testing only.
+    Date_t _priorityTakeoverWhen;  // (M)
+
+    // Callback handle used by waitForStartUpComplete() to block until configuration
+    // is loaded and external state threads have been started (unless this node is an arbiter).
+    // Used for testing only.
+    CallbackHandle _finishLoadLocalConfigCbh;  // (M)
 
     // The id of the earliest member, for which the handleLivenessTimeout callback has been
     // scheduled.  We need this so that we don't needlessly cancel and reschedule the callback on
@@ -1218,8 +1318,8 @@ private:
     // Cached copy of the current config protocol version.
     AtomicInt64 _protVersion;  // (S)
 
-    // Prevents a busy loop of cancelling heartbeats when we have no sync source.
-    bool _justLostSyncSource = true;  // (M)
+    // Lambda indicating durability of storageEngine.
+    stdx::function<bool()> _isDurableStorageEngine;  // (R)
 };
 
 }  // namespace repl

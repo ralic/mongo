@@ -6,6 +6,7 @@ selector:
     # These tests are not expected to pass with master-slave:
     - jstests/core/dbadmin.js
     - jstests/core/opcounters_write_cmd.js
+    - jstests/core/capped_update.js
 
 executor:
   js_test:
@@ -14,11 +15,11 @@ executor:
         eval: "testingReplication = true;"
         readMode: commands
     hooks:
+    - class: ValidateCollections
     - class: CheckReplDBHash
     fixture:
       class: MasterSlaveFixture
       mongod_options:
         oplogSize: 511
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1

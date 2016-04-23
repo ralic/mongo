@@ -49,9 +49,12 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/write_ops/wc_error_detail.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -79,8 +82,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return Pipeline::aggSupportsWriteConcern(cmd);
     }
 
     virtual void help(std::stringstream& help) const {
@@ -200,17 +204,19 @@ public:
 
         if (!needSplit) {
             invariant(shardResults.size() == 1);
+            invariant(shardResults[0].target.getServers().size() == 1);
+            auto executorPool = grid.getExecutorPool();
             const BSONObj reply =
-                uassertStatusOK(storePossibleCursor(shardResults[0].target.toString(),
+                uassertStatusOK(storePossibleCursor(shardResults[0].target.getServers()[0],
                                                     shardResults[0].result,
-                                                    grid.shardRegistry()->getExecutor(),
+                                                    executorPool->getArbitraryExecutor(),
                                                     grid.getCursorManager()));
             result.appendElements(reply);
             return reply["ok"].trueValue();
         }
 
-        DocumentSourceMergeCursors::CursorIds cursorIds = parseCursors(shardResults, fullns);
-        pipeline->addInitialSource(DocumentSourceMergeCursors::create(cursorIds, mergeCtx));
+        pipeline->addInitialSource(
+            DocumentSourceMergeCursors::create(parseCursors(shardResults), mergeCtx));
 
         MutableDocument mergeCmd(pipeline->serialize());
         mergeCmd["cursor"] = Value(cmdObj["cursor"]);
@@ -223,6 +229,8 @@ public:
             mergeCmd[LiteParsedQuery::cmdOptionMaxTimeMS] =
                 Value(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
         }
+
+        mergeCmd.setField("writeConcern", Value(cmdObj["writeConcern"]));
 
         // Not propagating readConcern to merger since it doesn't do local reads.
 
@@ -243,16 +251,20 @@ public:
             aggRunCommand(conn.get(), dbname, mergeCmd.freeze().toBson(), options);
         conn.done();
 
+        if (auto wcErrorElem = mergedResults["writeConcernError"]) {
+            appendWriteConcernErrorToCmdResponse(mergingShardId, wcErrorElem, result);
+        }
+
         // Copy output from merging (primary) shard to the output object from our command.
         // Also, propagates errmsg and code if ok == false.
-        result.appendElements(mergedResults);
+        result.appendElementsUnique(mergedResults);
 
         return mergedResults["ok"].trueValue();
     }
 
 private:
-    DocumentSourceMergeCursors::CursorIds parseCursors(
-        const vector<Strategy::CommandResult>& shardResults, const string& fullns);
+    std::vector<DocumentSourceMergeCursors::CursorDescriptor> parseCursors(
+        const vector<Strategy::CommandResult>& shardResults);
 
     void killAllCursors(const vector<Strategy::CommandResult>& shardResults);
     void uassertAllShardsSupportExplain(const vector<Strategy::CommandResult>& shardResults);
@@ -271,10 +283,10 @@ private:
                         int queryOptions);
 } clusterPipelineCmd;
 
-DocumentSourceMergeCursors::CursorIds PipelineCommand::parseCursors(
-    const vector<Strategy::CommandResult>& shardResults, const string& fullns) {
+std::vector<DocumentSourceMergeCursors::CursorDescriptor> PipelineCommand::parseCursors(
+    const vector<Strategy::CommandResult>& shardResults) {
     try {
-        DocumentSourceMergeCursors::CursorIds cursors;
+        std::vector<DocumentSourceMergeCursors::CursorDescriptor> cursors;
 
         for (size_t i = 0; i < shardResults.size(); i++) {
             BSONObj result = shardResults[i].result;
@@ -309,10 +321,11 @@ DocumentSourceMergeCursors::CursorIds PipelineCommand::parseCursors(
 
             massert(17025,
                     str::stream() << "shard " << shardResults[i].shardTargetId
-                                  << " returned different ns: " << cursor["ns"],
-                    cursor["ns"].String() == fullns);
+                                  << " returned invalid ns: " << cursor["ns"],
+                    NamespaceString(cursor["ns"].String()).isValid());
 
-            cursors.push_back(std::make_pair(shardResults[i].target, cursor["id"].Long()));
+            cursors.emplace_back(
+                shardResults[i].target, cursor["ns"].String(), cursor["id"].Long());
         }
 
         return cursors;
@@ -398,9 +411,10 @@ BSONObj PipelineCommand::aggRunCommand(DBClientBase* conn,
         throw RecvStaleConfigException("command failed because of stale config", result);
     }
 
-    result = uassertStatusOK(storePossibleCursor(cursor->originalHost(),
+    auto executorPool = grid.getExecutorPool();
+    result = uassertStatusOK(storePossibleCursor(HostAndPort(cursor->originalHost()),
                                                  result,
-                                                 grid.shardRegistry()->getExecutor(),
+                                                 executorPool->getArbitraryExecutor(),
                                                  grid.getCursorManager()));
     return result;
 }
@@ -415,7 +429,14 @@ bool PipelineCommand::aggPassthrough(OperationContext* txn,
     ShardConnection conn(shard->getConnString(), "");
     BSONObj result = aggRunCommand(conn.get(), conf->name(), cmd, queryOptions);
     conn.done();
-    out.appendElements(result);
+
+    // First append the properly constructed writeConcernError. It will then be skipped
+    // in appendElementsUnique.
+    if (auto wcErrorElem = result["writeConcernError"]) {
+        appendWriteConcernErrorToCmdResponse(shard->getId(), wcErrorElem, out);
+    }
+
+    out.appendElementsUnique(result);
     return result["ok"].trueValue();
 }
 

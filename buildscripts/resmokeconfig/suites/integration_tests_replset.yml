@@ -6,11 +6,11 @@ executor:
   cpp_integration_test:
     config: {}
     hooks:
+    - class: ValidateCollections
     - class: CheckReplDBHash
     fixture:
       class: ReplicaSetFixture
       mongod_options:
-        nopreallocj: ''
         set_parameters:
           enableTestCommands: 1
       num_nodes: 2

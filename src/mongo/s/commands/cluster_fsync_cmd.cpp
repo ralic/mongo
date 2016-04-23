@@ -50,7 +50,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -91,11 +92,12 @@ public:
                 continue;
             }
 
-            const auto shardHost = uassertStatusOK(
-                s->getTargeter()->findHost({ReadPreference::PrimaryOnly, TagSet::primaryOnly()}));
-
-            BSONObj x = uassertStatusOK(
-                grid.shardRegistry()->runCommand(shardHost, "admin", BSON("fsync" << 1)));
+            BSONObj x = uassertStatusOK(grid.shardRegistry()->runIdempotentCommandOnShard(
+                txn,
+                s,
+                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                "admin",
+                BSON("fsync" << 1)));
 
             sub.append(s->getId(), x);
 

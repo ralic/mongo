@@ -34,9 +34,14 @@
 
 #include <memory>
 
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/old_thread_pool.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/log.h"
 
@@ -68,30 +73,16 @@ TaskRunner::Task TaskRunner::makeCancelTask() {
     return [](OperationContext* txn, const Status& status) { return NextAction::kCancel; };
 }
 
-TaskRunner::TaskRunner(OldThreadPool* threadPool,
-                       const CreateOperationContextFn& createOperationContext)
-    : _threadPool(threadPool),
-      _createOperationContext(createOperationContext),
-      _active(false),
-      _cancelRequested(false) {
+TaskRunner::TaskRunner(OldThreadPool* threadPool)
+    : _threadPool(threadPool), _active(false), _cancelRequested(false) {
     uassert(ErrorCodes::BadValue, "null thread pool", threadPool);
-    uassert(ErrorCodes::BadValue, "null operation context factory", createOperationContext);
 }
 
 TaskRunner::~TaskRunner() {
-    try {
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        if (!_active) {
-            return;
-        }
-        _cancelRequested = true;
-        _condition.notify_all();
-        while (_active) {
-            _condition.wait(lk);
-        }
-    } catch (...) {
-        error() << "unexpected exception destroying task runner: " << exceptionToStatus();
-    }
+    DESTRUCTOR_GUARD(stdx::unique_lock<stdx::mutex> lk(_mutex);
+                     if (!_active) { return; } _cancelRequested = true;
+                     _condition.notify_all();
+                     while (_active) { _condition.wait(lk); });
 }
 
 std::string TaskRunner::getDiagnosticString() const {
@@ -134,11 +125,21 @@ void TaskRunner::cancel() {
 }
 
 void TaskRunner::_runTasks() {
-    std::unique_ptr<OperationContext> txn;
+    Client* client = nullptr;
+    ServiceContext::UniqueOperationContext txn;
 
     while (Task task = _waitForNextTask()) {
         if (!txn) {
-            txn.reset(_createOperationContext());
+            if (!client) {
+                // We initialize cc() because ServiceContextMongoD::_newOpCtx() expects cc()
+                // to be equal to the client used to create the operation context.
+                Client::initThreadIfNotAlready();
+                client = &cc();
+                if (getGlobalAuthorizationManager()->isAuthEnabled()) {
+                    AuthorizationSession::get(client)->grantInternalAuthorization();
+                }
+            }
+            txn = client->makeOperationContext();
         }
 
         NextAction nextAction = runSingleTask(task, txn.get(), Status::OK());

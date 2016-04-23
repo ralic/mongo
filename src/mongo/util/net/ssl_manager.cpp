@@ -31,6 +31,7 @@
 
 #include "mongo/util/net/ssl_manager.h"
 
+#include <boost/algorithm/string.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread/recursive_mutex.hpp>
 #include <boost/thread/tss.hpp>
@@ -45,18 +46,26 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/exit.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_expiration.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/text.h"
 
 #ifdef MONGO_CONFIG_SSL
 #include <openssl/evp.h>
+#include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
+#if defined(_WIN32)
+#include <wincrypt.h>
+#elif defined(__APPLE__)
+#include <Security/Security.h>
+#endif
 #endif
 
 using std::endl;
@@ -102,7 +111,9 @@ public:
         _id = _next.fetchAndAdd(1);
     }
 
-    ~SSLThreadInfo() {}
+    ~SSLThreadInfo() {
+        ERR_remove_state(0);
+    }
 
     unsigned long id() const {
         return _id;
@@ -178,7 +189,9 @@ public:
      * Initializes an OpenSSL context according to the provided settings. Only settings which are
      * acceptable on non-blocking connections are set.
      */
-    Status initSSLContext(SSL_CTX* context, const SSLParams& params) final;
+    Status initSSLContext(SSL_CTX* context,
+                          const SSLParams& params,
+                          ConnectionDirection direction) final;
 
     virtual SSLConnection* connect(Socket* socket);
 
@@ -189,8 +202,6 @@ public:
 
     StatusWith<boost::optional<std::string>> parseAndValidatePeerCertificate(
         SSL* conn, const std::string& remoteHost) final;
-
-    virtual void cleanupThreadLocals();
 
     virtual const SSLConfiguration& getSSLConfiguration() const {
         return _sslConfiguration;
@@ -235,7 +246,9 @@ private:
      * Init the SSL context using parameters provided in params. This SSL context will
      * be configured for blocking send/receive.
      */
-    bool _initSynchronousSSLContext(UniqueSSLContext* context, const SSLParams& params);
+    bool _initSynchronousSSLContext(UniqueSSLContext* context,
+                                    const SSLParams& params,
+                                    ConnectionDirection direction);
 
     /*
      * Converts time from OpenSSL return value to unsigned long long
@@ -263,7 +276,12 @@ private:
     /*
      * Set up an SSL context for certificate validation by loading a CA
      */
-    bool _setupCA(SSL_CTX* context, const std::string& caFile);
+    Status _setupCA(SSL_CTX* context, const std::string& caFile);
+
+    /*
+     * Set up an SSL context for certificate validation by loading the system's CA store
+     */
+    Status _setupSystemCA(SSL_CTX* context);
 
     /*
      * Import a certificate revocation list into an SSL context
@@ -409,6 +427,42 @@ SSLConnection::~SSLConnection() {
     }
 }
 
+namespace {
+void canonicalizeClusterDN(std::vector<std::string>* dn) {
+    // remove all RDNs we don't care about
+    for (size_t i = 0; i < dn->size(); i++) {
+        std::string& comp = dn->at(i);
+        boost::algorithm::trim(comp);
+        if (!mongoutils::str::startsWith(comp.c_str(), "DC=") &&
+            !mongoutils::str::startsWith(comp.c_str(), "O=") &&
+            !mongoutils::str::startsWith(comp.c_str(), "OU=")) {
+            dn->erase(dn->begin() + i);
+            i--;
+        }
+    }
+    std::stable_sort(dn->begin(), dn->end());
+}
+}
+
+bool SSLConfiguration::isClusterMember(StringData subjectName) const {
+    std::vector<std::string> clientRDN = StringSplitter::split(subjectName.toString(), ",");
+    std::vector<std::string> serverRDN = StringSplitter::split(serverSubjectName, ",");
+
+    canonicalizeClusterDN(&clientRDN);
+    canonicalizeClusterDN(&serverRDN);
+
+    if (clientRDN.size() == 0 || clientRDN.size() != serverRDN.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < serverRDN.size(); i++) {
+        if (clientRDN[i] != serverRDN[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 BSONObj SSLConfiguration::getServerStatusBSON() const {
     BSONObjBuilder security;
     security.append("SSLServerSubjectName", serverSubjectName);
@@ -425,7 +479,7 @@ SSLManager::SSLManager(const SSLParams& params, bool isServer)
       _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
       _allowInvalidHostnames(params.sslAllowInvalidHostnames) {
-    if (!_initSynchronousSSLContext(&_clientContext, params)) {
+    if (!_initSynchronousSSLContext(&_clientContext, params, ConnectionDirection::kOutgoing)) {
         uasserted(16768, "ssl initialization problem");
     }
 
@@ -447,7 +501,7 @@ SSLManager::SSLManager(const SSLParams& params, bool isServer)
     }
     // SSL server specific initialization
     if (isServer) {
-        if (!_initSynchronousSSLContext(&_serverContext, params)) {
+        if (!_initSynchronousSSLContext(&_serverContext, params, ConnectionDirection::kIncoming)) {
             uasserted(16562, "ssl initialization problem");
         }
 
@@ -524,7 +578,13 @@ void SSLManager::SSL_free(SSLConnection* conn) {
     return ::SSL_free(conn->ssl);
 }
 
-Status SSLManager::initSSLContext(SSL_CTX* context, const SSLParams& params) {
+Status SSLManager::initSSLContext(SSL_CTX* context,
+                                  const SSLParams& params,
+                                  ConnectionDirection direction) {
+    if (direction == ConnectionDirection::kIncoming) {
+        fassert(34364, context == _serverContext.get());
+    }
+
     // SSL_OP_ALL - Activate all bug workaround options, to support buggy client SSL's.
     // SSL_OP_NO_SSLv2 - Disable SSL v2 support
     // SSL_OP_NO_SSLv3 - Disable SSL v3 support
@@ -570,7 +630,7 @@ Status SSLManager::initSSLContext(SSL_CTX* context, const SSLParams& params) {
                                     << getSSLErrorMessage(ERR_get_error()));
     }
 
-    if (!params.sslClusterFile.empty()) {
+    if (direction == ConnectionDirection::kOutgoing && !params.sslClusterFile.empty()) {
         ::EVP_set_pw_prompt("Enter cluster certificate passphrase");
         if (!_setupPEM(context, params.sslClusterFile, params.sslClusterPassword)) {
             return Status(ErrorCodes::InvalidSSLConfiguration, "Can not set up ssl clusterFile.");
@@ -583,12 +643,10 @@ Status SSLManager::initSSLContext(SSL_CTX* context, const SSLParams& params) {
         }
     }
 
-    if (!params.sslCAFile.empty()) {
-        // Set up certificate validation with a certificate authority
-        if (!_setupCA(context, params.sslCAFile)) {
-            return Status(ErrorCodes::InvalidSSLConfiguration, "Can not set up CA file.");
-        }
-    }
+    const auto status =
+        params.sslCAFile.empty() ? _setupSystemCA(context) : _setupCA(context, params.sslCAFile);
+    if (!status.isOK())
+        return status;
 
     if (!params.sslCRLFile.empty()) {
         if (!_setupCRL(context, params.sslCRLFile)) {
@@ -599,16 +657,17 @@ Status SSLManager::initSSLContext(SSL_CTX* context, const SSLParams& params) {
     return Status::OK();
 }
 
-bool SSLManager::_initSynchronousSSLContext(UniqueSSLContext* contextPtr, const SSLParams& params) {
-    UniqueSSLContext context(SSL_CTX_new(SSLv23_method()), _free_ssl_context);
+bool SSLManager::_initSynchronousSSLContext(UniqueSSLContext* contextPtr,
+                                            const SSLParams& params,
+                                            ConnectionDirection direction) {
+    *contextPtr = UniqueSSLContext(SSL_CTX_new(SSLv23_method()), _free_ssl_context);
 
-    uassertStatusOK(initSSLContext(context.get(), params));
+    uassertStatusOK(initSSLContext(contextPtr->get(), params, direction));
 
     // If renegotiation is needed, don't return from recv() or send() until it's successful.
     // Note: this is for blocking sockets only.
-    SSL_CTX_set_mode(context.get(), SSL_MODE_AUTO_RETRY);
+    SSL_CTX_set_mode(contextPtr->get(), SSL_MODE_AUTO_RETRY);
 
-    *contextPtr = std::move(context);
     return true;
 }
 
@@ -730,27 +789,194 @@ bool SSLManager::_setupPEM(SSL_CTX* context,
     return true;
 }
 
-bool SSLManager::_setupCA(SSL_CTX* context, const std::string& caFile) {
+Status SSLManager::_setupCA(SSL_CTX* context, const std::string& caFile) {
     // Set the list of CAs sent to clients
     STACK_OF(X509_NAME)* certNames = SSL_load_client_CA_file(caFile.c_str());
     if (certNames == NULL) {
-        error() << "cannot read certificate authority file: " << caFile << " "
-                << getSSLErrorMessage(ERR_get_error()) << endl;
-        return false;
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "cannot read certificate authority file: " << caFile << " "
+                                    << getSSLErrorMessage(ERR_get_error()));
     }
     SSL_CTX_set_client_CA_list(context, certNames);
 
     // Load trusted CA
     if (SSL_CTX_load_verify_locations(context, caFile.c_str(), NULL) != 1) {
-        error() << "cannot read certificate authority file: " << caFile << " "
-                << getSSLErrorMessage(ERR_get_error()) << endl;
-        return false;
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "cannot read certificate authority file: " << caFile << " "
+                                    << getSSLErrorMessage(ERR_get_error()));
     }
+
     // Set SSL to require peer (client) certificate verification
     // if a certificate is presented
     SSL_CTX_set_verify(context, SSL_VERIFY_PEER, &SSLManager::verify_cb);
     _sslConfiguration.hasCA = true;
-    return true;
+    return Status::OK();
+}
+
+inline Status checkX509_STORE_error() {
+    const auto errCode = ERR_peek_last_error();
+    if (ERR_GET_LIB(errCode) != ERR_LIB_X509 ||
+        ERR_GET_REASON(errCode) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+        return {ErrorCodes::InvalidSSLConfiguration,
+                str::stream() << "Error adding certificate to X509 store: "
+                              << ERR_reason_error_string(errCode)};
+    }
+    return Status::OK();
+}
+
+#if defined(_WIN32)
+// This imports the certificates in a given Windows certificate store into an X509_STORE for
+// openssl to use during certificate validation.
+Status importCertStoreToX509_STORE(LPWSTR storeName, DWORD storeLocation, X509_STORE* verifyStore) {
+    HCERTSTORE systemStore =
+        CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, NULL, storeLocation, storeName);
+    if (systemStore == NULL) {
+        return {ErrorCodes::InvalidSSLConfiguration,
+                str::stream() << "error opening system CA store: " << errnoWithDescription()};
+    }
+    auto systemStoreGuard = MakeGuard([systemStore]() { CertCloseStore(systemStore, 0); });
+
+    PCCERT_CONTEXT certCtx = NULL;
+    while ((certCtx = CertEnumCertificatesInStore(systemStore, certCtx)) != NULL) {
+        auto certBytes = static_cast<const unsigned char*>(certCtx->pbCertEncoded);
+        X509* x509Obj = d2i_X509(NULL, &certBytes, certCtx->cbCertEncoded);
+        if (x509Obj == NULL) {
+            return {ErrorCodes::InvalidSSLConfiguration,
+                    str::stream() << "Error parsing X509 object from Windows certificate store"
+                                  << SSLManagerInterface::getSSLErrorMessage(ERR_get_error())};
+        }
+        const auto x509ObjGuard = MakeGuard([&x509Obj]() { X509_free(x509Obj); });
+
+        if (X509_STORE_add_cert(verifyStore, x509Obj) != 1) {
+            auto status = checkX509_STORE_error();
+            if (!status.isOK())
+                return status;
+        }
+    }
+    int lastError = GetLastError();
+    if (lastError != CRYPT_E_NOT_FOUND) {
+        return {
+            ErrorCodes::InvalidSSLConfiguration,
+            str::stream() << "Error enumerating certificates: " << errnoWithDescription(lastError)};
+    }
+
+    return Status::OK();
+}
+#elif defined(__APPLE__)
+
+template <typename T>
+class CFTypeRefHolder {
+public:
+    explicit CFTypeRefHolder(T ptr) : ref(static_cast<CFTypeRef>(ptr)) {}
+    ~CFTypeRefHolder() {
+        CFRelease(ref);
+    }
+    operator T() {
+        return static_cast<T>(ref);
+    }
+
+private:
+    CFTypeRef ref = nullptr;
+};
+template <typename T>
+CFTypeRefHolder<T> makeCFTypeRefHolder(T ptr) {
+    return CFTypeRefHolder<T>(ptr);
+}
+
+std::string OSStatusToString(OSStatus status) {
+    auto errMsg = makeCFTypeRefHolder(SecCopyErrorMessageString(status, NULL));
+    return std::string{CFStringGetCStringPtr(errMsg, kCFStringEncodingUTF8)};
+}
+
+Status importKeychainToX509_STORE(X509_STORE* verifyStore) {
+    // First we construct CFDictionary that specifies the search for certificates we want to do.
+    // These std::arrays make up the dictionary elements.
+    // kSecClass -> kSecClassCertificates (search for certificates)
+    // kSecReturnRef -> kCFBooleanTrue (return SecCertificateRefs)
+    // kSecMatchLimit -> kSecMatchLimitAll (return ALL the certificates).
+    static std::array<const void*, 3> searchDictKeys = {kSecClass, kSecReturnRef, kSecMatchLimit};
+    static std::array<const void*, 3> searchDictValues = {
+        kSecClassCertificate, kCFBooleanTrue, kSecMatchLimitAll};
+    static_assert(searchDictKeys.size() == searchDictValues.size(),
+                  "Sizes of the search keys and values dictionaries should be the same size");
+
+    auto searchDict = makeCFTypeRefHolder(CFDictionaryCreate(kCFAllocatorDefault,
+                                                             searchDictKeys.data(),
+                                                             searchDictValues.data(),
+                                                             searchDictKeys.size(),
+                                                             &kCFTypeDictionaryKeyCallBacks,
+                                                             &kCFTypeDictionaryValueCallBacks));
+
+    CFArrayRef result;
+    OSStatus status;
+    // Run the search against the default list of keychains and store the result in a CFArrayRef
+    if ((status = SecItemCopyMatching(searchDict, reinterpret_cast<CFTypeRef*>(&result))) != 0) {
+        return {ErrorCodes::InvalidSSLConfiguration,
+                str::stream() << "Error enumerating certificates: " << OSStatusToString(status)};
+    }
+    const auto resultGuard = makeCFTypeRefHolder(result);
+
+    for (CFIndex i = 0; i < CFArrayGetCount(result); i++) {
+        SecCertificateRef cert =
+            static_cast<SecCertificateRef>(const_cast<void*>(CFArrayGetValueAtIndex(result, i)));
+
+        auto rawData = makeCFTypeRefHolder(SecCertificateCopyData(cert));
+        if (!rawData) {
+            return {
+                ErrorCodes::InvalidSSLConfiguration,
+                str::stream() << "Error enumerating certificates: " << OSStatusToString(status)};
+        }
+        const uint8_t* rawDataPtr = CFDataGetBytePtr(rawData);
+
+        // Parse an openssl X509 object from each returned certificate
+        X509* x509Cert = d2i_X509(nullptr, &rawDataPtr, CFDataGetLength(rawData));
+        if (!x509Cert) {
+            return {ErrorCodes::InvalidSSLConfiguration,
+                    str::stream() << "Error parsing X509 certificate from system keychain: "
+                                  << ERR_reason_error_string(ERR_peek_last_error())};
+        }
+        const auto x509CertGuard = MakeGuard([&x509Cert]() { X509_free(x509Cert); });
+
+        // Add the parsed X509 object to the X509_STORE verification store
+        if (X509_STORE_add_cert(verifyStore, x509Cert) != 1) {
+            auto status = checkX509_STORE_error();
+            if (!status.isOK())
+                return status;
+        }
+    }
+
+    return Status::OK();
+}
+#endif
+
+Status SSLManager::_setupSystemCA(SSL_CTX* context) {
+#if !defined(_WIN32) && !defined(__APPLE__)
+    // On non-Windows/non-Apple platforms, the OpenSSL libraries should have been configured
+    // with default locations for CA certificates.
+    if (SSL_CTX_set_default_verify_paths(context) != 1) {
+        return {
+            ErrorCodes::InvalidSSLConfiguration,
+            str::stream() << "error loading system CA certificates "
+                          << "(default certificate file: " << X509_get_default_cert_file() << ", "
+                          << "default certificate path: " << X509_get_default_cert_dir() << ")"};
+    }
+    return Status::OK();
+#else
+
+    X509_STORE* verifyStore = SSL_CTX_get_cert_store(context);
+    if (!verifyStore) {
+        return {ErrorCodes::InvalidSSLConfiguration,
+                "no X509 store found for SSL context while loading system certificates"};
+    }
+#if defined(_WIN32)
+    auto status = importCertStoreToX509_STORE(L"root", CERT_SYSTEM_STORE_CURRENT_USER, verifyStore);
+    if (!status.isOK())
+        return status;
+    return importCertStoreToX509_STORE(L"CA", CERT_SYSTEM_STORE_CURRENT_USER, verifyStore);
+#elif defined(__APPLE__)
+    return importKeychainToX509_STORE(verifyStore);
+#endif
+#endif
 }
 
 bool SSLManager::_setupCRL(SSL_CTX* context, const std::string& crlFile) {
@@ -884,8 +1110,7 @@ bool SSLManager::_hostNameMatch(const char* nameToMatch, const char* certHostNam
 
 StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertificate(
     SSL* conn, const std::string& remoteHost) {
-    // only set if a CA cert has been provided
-    if (!_sslConfiguration.hasCA)
+    if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
 
     X509* peerCert = SSL_get_peer_certificate(conn);
@@ -906,11 +1131,11 @@ StatusWith<boost::optional<std::string>> SSLManager::parseAndValidatePeerCertifi
 
     if (result != X509_V_OK) {
         if (_allowInvalidCertificates) {
-            warning() << "SSL peer certificate validation failed:"
+            warning() << "SSL peer certificate validation failed: "
                       << X509_verify_cert_error_string(result);
         } else {
             str::stream msg;
-            msg << "SSL peer certificate validation failed:"
+            msg << "SSL peer certificate validation failed: "
                 << X509_verify_cert_error_string(result);
             error() << msg.ss.str();
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
@@ -984,10 +1209,6 @@ std::string SSLManager::parseAndValidatePeerCertificateDeprecated(const SSLConne
                               swPeerSubjectName.getStatus().reason());
     }
     return swPeerSubjectName.getValue().get_value_or("");
-}
-
-void SSLManager::cleanupThreadLocals() {
-    ERR_remove_state(0);
 }
 
 std::string SSLManagerInterface::getSSLErrorMessage(int code) {

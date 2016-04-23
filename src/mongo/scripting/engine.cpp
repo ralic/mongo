@@ -101,9 +101,8 @@ void Scope::append(BSONObjBuilder& builder, const char* fieldName, const char* s
             builder.appendNull(fieldName);
             break;
         case Date:
-            builder.appendDate(
-                fieldName,
-                Date_t::fromMillisSinceEpoch(static_cast<long long>(getNumber(scopeName))));
+            builder.appendDate(fieldName,
+                               Date_t::fromMillisSinceEpoch(getNumberLongLong(scopeName)));
             break;
         case Code:
             builder.appendCode(fieldName, getString(scopeName));
@@ -177,7 +176,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
     }
 
     StringData code(data.get() + offset, len - offset);
-    return exec(code, filename, printResult, reportError, timeoutMs);
+    return exec(code, filename, printResult, reportError, false, timeoutMs);
 }
 
 class Scope::StoredFuncModLogOpHandler : public RecoveryUnit::Change {
@@ -219,7 +218,7 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
 
     set<string> thisTime;
     while (c->more()) {
-        BSONObj o = c->nextSafe();
+        BSONObj o = c->nextSafe().getOwned();
         BSONElement n = o["_id"];
         BSONElement v = o["value"];
 
@@ -227,10 +226,14 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
         uassert(10210, "value has to be set", v.type() != EOO);
 
         try {
-            setElement(n.valuestr(), v);
+            setElement(n.valuestr(), v, o);
             thisTime.insert(n.valuestr());
             _storedNames.insert(n.valuestr());
         } catch (const DBException& setElemEx) {
+            if (setElemEx.getCode() == ErrorCodes::Interrupted) {
+                throw;
+            }
+
             error() << "unable to load stored JavaScript function " << n.valuestr()
                     << "(): " << setElemEx.what() << endl;
         }
@@ -417,6 +420,9 @@ public:
     void gc() {
         _real->gc();
     }
+    void advanceGeneration() {
+        _real->advanceGeneration();
+    }
     bool isKillPending() const {
         return _real->isKillPending();
     }
@@ -434,6 +440,12 @@ public:
     }
     double getNumber(const char* field) {
         return _real->getNumber(field);
+    }
+    int getNumberInt(const char* field) {
+        return _real->getNumberInt(field);
+    }
+    long long getNumberLongLong(const char* field) {
+        return _real->getNumberLongLong(field);
     }
     Decimal128 getNumberDecimal(const char* field) {
         return _real->getNumberDecimal(field);
@@ -453,8 +465,8 @@ public:
     void setString(const char* field, StringData val) {
         _real->setString(field, val);
     }
-    void setElement(const char* field, const BSONElement& val) {
-        _real->setElement(field, val);
+    void setElement(const char* field, const BSONElement& val, const BSONObj& parent) {
+        _real->setElement(field, val, parent);
     }
     void setObject(const char* field, const BSONObj& obj, bool readOnly = true) {
         _real->setObject(field, obj, readOnly);

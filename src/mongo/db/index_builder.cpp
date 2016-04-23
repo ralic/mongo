@@ -40,7 +40,6 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -82,14 +81,15 @@ void IndexBuilder::run() {
     Client::initThread(name().c_str());
     LOG(2) << "IndexBuilder building index " << _index;
 
-    OperationContextImpl txn;
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;
     txn.lockState()->setIsBatchWriter(true);
 
     AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
 
     {
         stdx::lock_guard<Client> lk(*txn.getClient());
-        CurOp::get(txn)->setOp_inlock(dbInsert);
+        CurOp::get(txn)->setNetworkOp_inlock(dbInsert);
     }
     NamespaceString ns(_index["ns"].String());
 

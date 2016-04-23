@@ -73,13 +73,13 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent + 1);
     *ss << "keyPattern = " << indexKeyPattern.toString() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "query = " << query << '\n';
+    *ss << "query = " << ftsQuery->getQuery() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "language = " << language << '\n';
+    *ss << "language = " << ftsQuery->getLanguage() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "caseSensitive= " << caseSensitive << '\n';
+    *ss << "caseSensitive= " << ftsQuery->getCaseSensitive() << '\n';
     addIndent(ss, indent + 1);
-    *ss << "diacriticSensitive= " << diacriticSensitive << '\n';
+    *ss << "diacriticSensitive= " << ftsQuery->getDiacriticSensitive() << '\n';
     addIndent(ss, indent + 1);
     *ss << "indexPrefix = " << indexPrefix.toString() << '\n';
     if (NULL != filter) {
@@ -95,10 +95,7 @@ QuerySolutionNode* TextNode::clone() const {
 
     copy->_sort = this->_sort;
     copy->indexKeyPattern = this->indexKeyPattern;
-    copy->query = this->query;
-    copy->language = this->language;
-    copy->caseSensitive = this->caseSensitive;
-    copy->diacriticSensitive = this->diacriticSensitive;
+    copy->ftsQuery = this->ftsQuery->clone();
     copy->indexPrefix = this->indexPrefix;
 
     return copy;
@@ -504,6 +501,16 @@ void IndexScanNode::computeProperties() {
             }
             equalityFields.insert(oil.name);
         }
+    } else {
+        BSONObjIterator keyIter(indexKeyPattern);
+        BSONObjIterator startIter(bounds.startKey);
+        BSONObjIterator endIter(bounds.endKey);
+        while (keyIter.more() && startIter.more() && endIter.more()) {
+            BSONElement key = keyIter.next();
+            if (startIter.next() == endIter.next()) {
+                equalityFields.insert(key.fieldName());
+            }
+        }
     }
 
     if (equalityFields.empty()) {
@@ -536,6 +543,10 @@ void IndexScanNode::computeProperties() {
         // We add the sort obtained by dropping 'elt' and all preceding elements from the index
         // key pattern.
         BSONObjIterator droppedPrefixIt = it;
+        if (!droppedPrefixIt.more()) {
+            // Do not insert an empty sort order.
+            break;
+        }
         BSONObjBuilder droppedPrefixBob;
         while (droppedPrefixIt.more()) {
             droppedPrefixBob.append(droppedPrefixIt.next());
@@ -626,15 +637,40 @@ void ProjectionNode::appendToString(mongoutils::str::stream* ss, int indent) con
     children[0]->appendToString(ss, indent + 2);
 }
 
+void ProjectionNode::computeProperties() {
+    invariant(children.size() == 1U);
+    children[0]->computeProperties();
+
+    _sorts.clear();
+
+    const BSONObjSet& inputSorts = children[0]->getSort();
+
+    // Our input sort is not necessarily maintained if we project some fields that are part of the
+    // sort out.
+    for (auto&& sort : inputSorts) {
+        bool sortCompatible = true;
+        for (auto&& key : sort) {
+            if (!parsed.isFieldRetainedExactly(key.fieldNameStringData())) {
+                sortCompatible = false;
+                break;
+            }
+        }
+        if (sortCompatible) {
+            _sorts.insert(sort);
+        }
+    }
+}
+
 QuerySolutionNode* ProjectionNode::clone() const {
-    ProjectionNode* copy = new ProjectionNode();
+    ProjectionNode* copy = new ProjectionNode(parsed);
     cloneBaseData(copy);
 
     copy->_sorts = this->_sorts;
-    copy->fullExpression = this->fullExpression;
 
     // This MatchExpression* is owned by the canonical query, not by the
     // ProjectionNode. Just copying the pointer is fine.
+    copy->fullExpression = this->fullExpression;
+
     copy->projection = this->projection;
 
     return copy;
@@ -891,10 +927,10 @@ QuerySolutionNode* DistinctNode::clone() const {
 }
 
 //
-// CountNode
+// CountScanNode
 //
 
-void CountNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "COUNT\n";
     addIndent(ss, indent + 1);
@@ -905,8 +941,8 @@ void CountNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     *ss << "endKey = " << endKey << '\n';
 }
 
-QuerySolutionNode* CountNode::clone() const {
-    CountNode* copy = new CountNode();
+QuerySolutionNode* CountScanNode::clone() const {
+    CountScanNode* copy = new CountScanNode();
     cloneBaseData(copy);
 
     copy->sorts = this->sorts;
@@ -915,6 +951,30 @@ QuerySolutionNode* CountNode::clone() const {
     copy->startKeyInclusive = this->startKeyInclusive;
     copy->endKey = this->endKey;
     copy->endKeyInclusive = this->endKeyInclusive;
+
+    return copy;
+}
+
+//
+// EnsureSortedNode
+//
+
+void EnsureSortedNode::appendToString(mongoutils::str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "ENSURE_SORTED\n";
+    addIndent(ss, indent + 1);
+    *ss << "pattern = " << pattern.toString() << '\n';
+    addCommon(ss, indent);
+    addIndent(ss, indent + 1);
+    *ss << "Child:" << '\n';
+    children[0]->appendToString(ss, indent + 2);
+}
+
+QuerySolutionNode* EnsureSortedNode::clone() const {
+    EnsureSortedNode* copy = new EnsureSortedNode();
+    cloneBaseData(copy);
+
+    copy->pattern = this->pattern;
 
     return copy;
 }

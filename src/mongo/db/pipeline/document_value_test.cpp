@@ -70,32 +70,36 @@ void assertRoundTrips(const Document& document1) {
     ASSERT_EQUALS(document1, document2);
 }
 
-/** Create a Document. */
-class Create {
-public:
-    void run() {
-        Document document;
-        ASSERT_EQUALS(0U, document.size());
-        assertRoundTrips(document);
-    }
-};
+TEST(DocumentConstruction, Default) {
+    Document document;
+    ASSERT_EQUALS(0U, document.size());
+    assertRoundTrips(document);
+}
 
-/** Create a Document from a BSONObj. */
-class CreateFromBsonObj {
-public:
-    void run() {
-        Document document = fromBson(BSONObj());
-        ASSERT_EQUALS(0U, document.size());
-        document = fromBson(BSON("a" << 1 << "b"
-                                     << "q"));
-        ASSERT_EQUALS(2U, document.size());
-        ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
-        ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
-        ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
-        ASSERT_EQUALS("q", getNthField(document, 1).second.getString());
-        assertRoundTrips(document);
-    }
-};
+TEST(DocumentConstruction, FromEmptyBson) {
+    Document document = fromBson(BSONObj());
+    ASSERT_EQUALS(0U, document.size());
+    assertRoundTrips(document);
+}
+
+TEST(DocumentConstruction, FromNonEmptyBson) {
+    Document document = fromBson(BSON("a" << 1 << "b"
+                                          << "q"));
+    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
+    ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
+    ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
+    ASSERT_EQUALS("q", getNthField(document, 1).second.getString());
+}
+
+TEST(DocumentConstruction, FromInitializerList) {
+    auto document = Document{{"a", 1}, {"b", "q"}};
+    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
+    ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
+    ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
+    ASSERT_EQUALS("q", getNthField(document, 1).second.getString());
+}
 
 /** Add Document fields. */
 class AddField {
@@ -649,6 +653,11 @@ public:
     void run() {
         Value value = Value(Timestamp(777));
         ASSERT(Timestamp(777) == value.getTimestamp());
+        ASSERT_EQUALS(mongo::bsonTimestamp, value.getType());
+        assertRoundTrips(value);
+
+        value = Value(Timestamp(~0U, 3));
+        ASSERT(Timestamp(~0U, 3) == value.getTimestamp());
         ASSERT_EQUALS(mongo::bsonTimestamp, value.getType());
         assertRoundTrips(value);
     }
@@ -1525,6 +1534,8 @@ public:
         // Timestamp.
         assertComparison(0, Timestamp(1234), Timestamp(1234));
         assertComparison(-1, Timestamp(4), Timestamp(1234));
+        // High bit set.
+        assertComparison(1, Timestamp(~0U, 2), Timestamp(0, 3));
 
         // Cross-type comparisons. Listed in order of canonical types.
         assertComparison(-1, Value(mongo::MINKEY), Value());
@@ -1662,8 +1673,6 @@ class All : public Suite {
 public:
     All() : Suite("document") {}
     void setupTests() {
-        add<Document::Create>();
-        add<Document::CreateFromBsonObj>();
         add<Document::AddField>();
         add<Document::GetValue>();
         add<Document::SetField>();

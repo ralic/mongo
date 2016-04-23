@@ -9,7 +9,7 @@ var $config = (function() {
 
     var states = {
         init: function init(db, collName) {
-            this.uniqueDBName = 'drop_database' + this.tid;
+            this.uniqueDBName = db.getName() + 'drop_database' + this.tid;
         },
 
         createAndDrop: function createAndDrop(db, collName) {
@@ -25,8 +25,8 @@ var $config = (function() {
     };
 
     var transitions = {
-        init: { createAndDrop: 1 },
-        createAndDrop: { createAndDrop: 1 }
+        init: {createAndDrop: 1},
+        createAndDrop: {createAndDrop: 1}
     };
 
     return {

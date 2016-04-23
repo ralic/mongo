@@ -32,6 +32,7 @@
 
 #include "mongo/db/concurrency/fast_map_noalloc.h"
 #include "mongo/db/concurrency/locker.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
@@ -92,6 +93,8 @@ public:
 
     virtual ~LockerImpl();
 
+    virtual ClientState getClientState() const;
+
     virtual LockerId getId() const {
         return _id;
     }
@@ -102,7 +105,7 @@ public:
     virtual void lockMMAPV1Flush();
 
     virtual void downgradeGlobalXtoSForMMAPV1();
-    virtual bool unlockAll();
+    virtual bool unlockGlobal();
 
     virtual void beginWriteUnitOfWork();
     virtual void endWriteUnitOfWork();
@@ -178,9 +181,10 @@ private:
 
     /**
      * The main functionality of the unlock method, except accepts iterator in order to avoid
-     * additional lookups during unlockAll.
+     * additional lookups during unlockGlobal. Frees locks immediately, so must not be called from
+     * inside a WUOW.
      */
-    bool _unlockImpl(LockRequestsMap::Iterator& it);
+    bool _unlockImpl(LockRequestsMap::Iterator* it);
 
     /**
      * MMAP V1 locking code yields and re-acquires the flush lock occasionally in order to
@@ -188,7 +192,6 @@ private:
      * acquired. It is based on the type of the operation (IS for readers, IX for writers).
      */
     LockMode _getModeForMMAPV1FlushLock() const;
-
 
     // Used to disambiguate different lockers
     const LockerId _id;
@@ -205,10 +208,6 @@ private:
     // and condition variable every time.
     CondVarLockGrantNotification _notify;
 
-    // Timer for measuring duration and timeouts. This value is set when lock acquisition is
-    // about to wait and is sampled at grant time.
-    uint64_t _requestStartTime;
-
     // Per-locker locking statistics. Reported in the slow-query log message and through
     // db.currentOp. Complementary to the per-instance locking statistics.
     SingleThreadedLockStats _stats;
@@ -218,6 +217,11 @@ private:
     int _wuowNestingLevel;
     std::queue<ResourceId> _resourcesToUnlockAtEndOfUnitOfWork;
 
+    // Mode for which the Locker acquired a ticket, or MODE_NONE if no ticket was acquired.
+    LockMode _modeForTicket = MODE_NONE;
+
+    // Indicates whether the client is active reader/writer or is queued.
+    AtomicWord<ClientState> _clientState{kInactive};
 
     //////////////////////////////////////////////////////////////////////////////////////////
     //
@@ -247,8 +251,6 @@ public:
     virtual bool isBatchWriter() const {
         return _batchWriter;
     }
-
-    virtual bool hasStrongLocks() const;
 
 private:
     bool _batchWriter;

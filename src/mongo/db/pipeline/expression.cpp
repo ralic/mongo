@@ -26,6 +26,7 @@
  * it in the license file.
  */
 
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/expression.h"
@@ -41,6 +42,7 @@
 #include "mongo/db/pipeline/value.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/platform/bits.h"
 
 namespace mongo {
 using Parser = Expression::Parser;
@@ -48,6 +50,7 @@ using Parser = Expression::Parser;
 using namespace mongoutils;
 
 using boost::intrusive_ptr;
+using std::move;
 using std::set;
 using std::string;
 using std::vector;
@@ -402,7 +405,7 @@ Value ExpressionAdd::evaluateInternal(Variables* vars) const {
             doubleTotal += val.coerceToDouble();
             longTotal += val.coerceToLong();
         } else if (val.getType() == Date) {
-            uassert(16612, "only one Date allowed in an $add expression", !haveDate);
+            uassert(16612, "only one date allowed in an $add expression", !haveDate);
             haveDate = true;
 
             // We don't manipulate totalType here.
@@ -445,7 +448,7 @@ Value ExpressionAllElementsTrue::evaluateInternal(Variables* vars) const {
     uassert(17040,
             str::stream() << getOpName() << "'s argument must be an array, but is "
                           << typeName(arr.getType()),
-            arr.getType() == Array);
+            arr.isArray());
     const vector<Value>& array = arr.getArray();
     for (vector<Value>::const_iterator it = array.begin(); it != array.end(); ++it) {
         if (!it->coerceToBool()) {
@@ -539,7 +542,7 @@ Value ExpressionAnyElementTrue::evaluateInternal(Variables* vars) const {
     uassert(17041,
             str::stream() << getOpName() << "'s argument must be an array, but is "
                           << typeName(arr.getType()),
-            arr.getType() == Array);
+            arr.isArray());
     const vector<Value>& array = arr.getArray();
     for (vector<Value>::const_iterator it = array.begin(); it != array.end(); ++it) {
         if (it->coerceToBool()) {
@@ -593,7 +596,7 @@ Value ExpressionArrayElemAt::evaluateInternal(Variables* vars) const {
     uassert(28689,
             str::stream() << getOpName() << "'s first argument must be an array, but is "
                           << typeName(array.getType()),
-            array.getType() == Array);
+            array.isArray());
     uassert(28690,
             str::stream() << getOpName() << "'s second argument must be a numeric value,"
                           << " but is " << typeName(indexArg.getType()),
@@ -814,7 +817,7 @@ Value ExpressionConcatArrays::evaluateInternal(Variables* vars) const {
         uassert(28664,
                 str::stream() << "$concatArrays only supports arrays, not "
                               << typeName(val.getType()),
-                val.getType() == Array);
+                val.isArray());
 
         const auto& subValues = val.getArray();
         values.insert(values.end(), subValues.begin(), subValues.end());
@@ -995,6 +998,9 @@ void ExpressionDateToString::validateFormat(const std::string& format) {
             case 'j':
             case 'w':
             case 'U':
+            case 'G':
+            case 'V':
+            case 'u':
                 break;
             default:
                 uasserted(18536,
@@ -1057,6 +1063,15 @@ string ExpressionDateToString::formatDate(const string& format,
                 break;
             case 'U':  // Week
                 insertPadded(formatted, ExpressionWeek::extract(tm), 2);
+                break;
+            case 'G':  // Iso year of week
+                insertPadded(formatted, ExpressionIsoWeekYear::extract(tm), 4);
+                break;
+            case 'V':  // Iso week
+                insertPadded(formatted, ExpressionIsoWeek::extract(tm), 2);
+                break;
+            case 'u':  // Iso day of week
+                insertPadded(formatted, ExpressionIsoDayOfWeek::extract(tm), 1);
                 break;
             default:
                 // Should never happen as format is pre-validated
@@ -1501,7 +1516,7 @@ void ExpressionFieldPath::addDependencies(DepsTracker* deps, vector<string>* pat
 }
 
 Value ExpressionFieldPath::evaluatePathArray(size_t index, const Value& input) const {
-    dassert(input.getType() == Array);
+    dassert(input.isArray());
 
     // Check for remaining path in each element of array
     vector<Value> result;
@@ -1641,9 +1656,9 @@ Value ExpressionFilter::evaluateInternal(Variables* vars) const {
         return Value(BSONNULL);
 
     uassert(28651,
-            str::stream() << "input to $filter must be an Array not "
+            str::stream() << "input to $filter must be an array not "
                           << typeName(inputVal.getType()),
-            inputVal.getType() == Array);
+            inputVal.isArray());
 
     const vector<Value>& input = inputVal.getArray();
 
@@ -1845,8 +1860,8 @@ Value ExpressionMap::evaluateInternal(Variables* vars) const {
         return Value(BSONNULL);
 
     uassert(16883,
-            str::stream() << "input to $map must be an Array not " << typeName(inputVal.getType()),
-            inputVal.getType() == Array);
+            str::stream() << "input to $map must be an array not " << typeName(inputVal.getType()),
+            inputVal.isArray());
 
     const vector<Value>& input = inputVal.getArray();
 
@@ -1878,7 +1893,7 @@ void ExpressionMap::addDependencies(DepsTracker* deps, vector<string>* path) con
 REGISTER_EXPRESSION(meta, ExpressionMeta::parse);
 intrusive_ptr<Expression> ExpressionMeta::parse(BSONElement expr,
                                                 const VariablesParseState& vpsIn) {
-    uassert(17307, "$meta only supports String arguments", expr.type() == String);
+    uassert(17307, "$meta only supports string arguments", expr.type() == String);
     if (expr.valueStringData() == "textScore") {
         return new ExpressionMeta(MetaType::TEXT_SCORE);
     } else if (expr.valueStringData() == "randVal") {
@@ -2080,6 +2095,29 @@ const char* ExpressionIfNull::getOpName() const {
     return "$ifNull";
 }
 
+/* ----------------------- ExpressionIn ---------------------------- */
+
+Value ExpressionIn::evaluateInternal(Variables* vars) const {
+    Value argument(vpOperand[0]->evaluateInternal(vars));
+    Value arrayOfValues(vpOperand[1]->evaluateInternal(vars));
+
+    uassert(40081,
+            str::stream() << "$in requires an array as a second argument, found: "
+                          << typeName(arrayOfValues.getType()),
+            arrayOfValues.isArray());
+    for (auto&& value : arrayOfValues.getArray()) {
+        if (argument == value) {
+            return Value(true);
+        }
+    }
+    return Value(false);
+}
+
+REGISTER_EXPRESSION(in, ExpressionIn::parse);
+const char* ExpressionIn::getOpName() const {
+    return "$in";
+}
+
 /* ----------------------- ExpressionLn ---------------------------- */
 
 Value ExpressionLn::evaluateNumericArg(const Value& numericArg) const {
@@ -2144,74 +2182,104 @@ const char* ExpressionLog10::getOpName() const {
 
 /* ------------------------ ExpressionNary ----------------------------- */
 
+/**
+ * Optimize a general Nary expression.
+ *
+ * The optimization has the following properties:
+ *   1) Optimize each of the operators.
+ *   2) If the operand is associative, flatten internal operators of the same type. I.e.:
+ *      A+B+(C+D)+E => A+B+C+D+E
+ *   3) If the operand is commutative & associative, group all constant operators. For example:
+ *      c1 + c2 + n1 + c3 + n2 => n1 + n2 + c1 + c2 + c3
+ *   4) If the operand is associative, execute the operation over all the contiguous constant
+ *      operators and replacing them by the result. For example: c1 + c2 + n1 + c3 + c4 + n5 =>
+ *      c5 = c1 + c2, c6 = c3 + c4 => c5 + n1 + c6 + n5
+ *
+ * It returns the optimized expression. It can be exactly the same expression, a modified version
+ * of the same expression or a completely different expression.
+ */
 intrusive_ptr<Expression> ExpressionNary::optimize() {
-    const size_t n = vpOperand.size();
+    uint32_t constOperandCount = 0;
 
-    // optimize sub-expressions and count constants
-    unsigned constCount = 0;
-    for (size_t i = 0; i < n; ++i) {
-        intrusive_ptr<Expression> optimized = vpOperand[i]->optimize();
-
-        // substitute the optimized expression
-        vpOperand[i] = optimized;
-
-        // check to see if the result was a constant
-        if (dynamic_cast<ExpressionConstant*>(optimized.get())) {
-            constCount++;
+    for (auto& operand : vpOperand) {
+        operand = operand->optimize();
+        if (dynamic_cast<ExpressionConstant*>(operand.get())) {
+            ++constOperandCount;
         }
     }
-
-    // If all the operands are constant, we can replace this expression with a constant. Using
-    // an empty Variables since it will never be accessed.
-    if (constCount == n) {
+    // If all the operands are constant expressions, collapse the expression into one constant
+    // expression.
+    if (constOperandCount == vpOperand.size()) {
         Variables emptyVars;
-        Value pResult(evaluateInternal(&emptyVars));
-        intrusive_ptr<Expression> pReplacement(ExpressionConstant::create(pResult));
-        return pReplacement;
+        return intrusive_ptr<Expression>(ExpressionConstant::create(evaluateInternal(&emptyVars)));
     }
 
-    // Remaining optimizations are only for associative and commutative expressions.
-    if (!isAssociativeAndCommutative())
-        return this;
-
-    // Process vpOperand to split it into constant and nonconstant vectors.
-    // This can leave vpOperand in an invalid state that is cleaned up after the loop.
-    ExpressionVector constExprs;
-    ExpressionVector nonConstExprs;
-    for (size_t i = 0; i < vpOperand.size(); ++i) {  // NOTE: vpOperand grows in loop
-        intrusive_ptr<Expression> expr = vpOperand[i];
-        if (dynamic_cast<ExpressionConstant*>(expr.get())) {
-            constExprs.push_back(expr);
-        } else {
-            // If the child operand is the same type as this and is also associative and
-            // commutative, then we can extract its operands and inline them here. We detect
-            // sameness of the child operator by checking for equality of the opNames
-            ExpressionNary* nary = dynamic_cast<ExpressionNary*>(expr.get());
-            if (!nary || !str::equals(nary->getOpName(), getOpName()) ||
-                !nary->isAssociativeAndCommutative()) {
-                nonConstExprs.push_back(expr);
-            } else {
-                // same expression, so flatten by adding to vpOperand which
-                // will be processed later in this loop.
-                vpOperand.insert(vpOperand.end(), nary->vpOperand.begin(), nary->vpOperand.end());
+    // If the expression is associative, we can collapse all the consecutive constant operands into
+    // one by applying the expression to those consecutive constant operands.
+    // If the expression is also commutative we can reorganize all the operands so that all of the
+    // constant ones are together (arbitrarily at the back) and we can collapse all of them into
+    // one.
+    if (isAssociative()) {
+        ExpressionVector constExpressions;
+        ExpressionVector optimizedOperands;
+        for (size_t i = 0; i < vpOperand.size();) {
+            intrusive_ptr<Expression> operand = vpOperand[i];
+            // If the operand is a constant one, add it to the current list of consecutive constant
+            // operands.
+            if (dynamic_cast<ExpressionConstant*>(operand.get())) {
+                constExpressions.push_back(operand);
+                ++i;
+                continue;
             }
+
+            // If the operand is exactly the same type as the one we are currently optimizing and
+            // is also associative, replace the expression for the operands it has.
+            // E.g: sum(a, b, sum(c, d), e) => sum(a, b, c, d, e)
+            ExpressionNary* nary = dynamic_cast<ExpressionNary*>(operand.get());
+            if (nary && str::equals(nary->getOpName(), getOpName()) && nary->isAssociative()) {
+                invariant(!nary->vpOperand.empty());
+                vpOperand[i] = std::move(nary->vpOperand[0]);
+                vpOperand.insert(
+                    vpOperand.begin() + i + 1, nary->vpOperand.begin() + 1, nary->vpOperand.end());
+                continue;
+            }
+
+            // If the operand is not a constant nor a same-type expression and the expression is
+            // not commutative, evaluate an expression of the same type as the one we are
+            // optimizing on the list of consecutive constant operands and use the resulting value
+            // as a constant expression operand.
+            // If the list of consecutive constant operands has less than 2 operands just place
+            // back the operands.
+            if (!isCommutative()) {
+                if (constExpressions.size() > 1) {
+                    ExpressionVector vpOperandSave = std::move(vpOperand);
+                    vpOperand = std::move(constExpressions);
+                    Variables emptyVars;
+                    optimizedOperands.emplace_back(
+                        ExpressionConstant::create(evaluateInternal(&emptyVars)));
+                    vpOperand = std::move(vpOperandSave);
+                } else {
+                    optimizedOperands.insert(
+                        optimizedOperands.end(), constExpressions.begin(), constExpressions.end());
+                }
+                constExpressions.clear();
+            }
+            optimizedOperands.push_back(operand);
+            ++i;
         }
-    }
 
-    // collapse all constant expressions (if any)
-    Value constValue;
-    if (!constExprs.empty()) {
-        vpOperand = constExprs;
-        Variables emptyVars;
-        constValue = evaluateInternal(&emptyVars);
-    }
+        if (constExpressions.size() > 1) {
+            vpOperand = std::move(constExpressions);
+            Variables emptyVars;
+            optimizedOperands.emplace_back(
+                ExpressionConstant::create(evaluateInternal(&emptyVars)));
+        } else {
+            optimizedOperands.insert(
+                optimizedOperands.end(), constExpressions.begin(), constExpressions.end());
+        }
 
-    // now set the final expression list with constant (if any) at the end
-    vpOperand = nonConstExprs;
-    if (!constExprs.empty()) {
-        vpOperand.push_back(ExpressionConstant::create(constValue));
+        vpOperand = std::move(optimizedOperands);
     }
-
     return this;
 }
 
@@ -2468,6 +2536,175 @@ const char* ExpressionPow::getOpName() const {
     return "$pow";
 }
 
+/* ------------------------- ExpressionRange ------------------------------ */
+
+Value ExpressionRange::evaluateInternal(Variables* vars) const {
+    Value startVal(vpOperand[0]->evaluateInternal(vars));
+    Value endVal(vpOperand[1]->evaluateInternal(vars));
+
+    uassert(34443,
+            str::stream() << "$range requires a numeric starting value, found value of type: "
+                          << typeName(startVal.getType()),
+            startVal.numeric());
+    uassert(34444,
+            str::stream() << "$range requires a starting value that can be represented as a 32-bit "
+                             "integer, found value: " << startVal.toString(),
+            startVal.integral());
+    uassert(34445,
+            str::stream() << "$range requires a numeric ending value, found value of type: "
+                          << typeName(endVal.getType()),
+            endVal.numeric());
+    uassert(34446,
+            str::stream() << "$range requires an ending value that can be represented as a 32-bit "
+                             "integer, found value: " << endVal.toString(),
+            endVal.integral());
+
+    int current = startVal.coerceToInt();
+    int end = endVal.coerceToInt();
+
+    int step = 1;
+    if (vpOperand.size() == 3) {
+        // A step was specified by the user.
+        Value stepVal(vpOperand[2]->evaluateInternal(vars));
+
+        uassert(34447,
+                str::stream() << "$range requires a numeric starting value, found value of type:"
+                              << typeName(stepVal.getType()),
+                stepVal.numeric());
+        uassert(34448,
+                str::stream() << "$range requires a step value that can be represented as a 32-bit "
+                                 "integer, found value: " << stepVal.toString(),
+                stepVal.integral());
+        step = stepVal.coerceToInt();
+
+        uassert(34449, "$range requires a non-zero step value", step != 0);
+    }
+
+    std::vector<Value> output;
+
+    while ((step > 0 ? current < end : current > end)) {
+        output.push_back(Value(current));
+        current += step;
+    }
+
+    return Value(output);
+}
+
+REGISTER_EXPRESSION(range, ExpressionRange::parse);
+const char* ExpressionRange::getOpName() const {
+    return "$range";
+}
+
+/* ------------------------ ExpressionReduce ------------------------------ */
+
+REGISTER_EXPRESSION(reduce, ExpressionReduce::parse);
+intrusive_ptr<Expression> ExpressionReduce::parse(BSONElement expr,
+                                                  const VariablesParseState& vps) {
+    uassert(40075,
+            str::stream() << "$reduce requires an object as an argument, found: "
+                          << typeName(expr.type()),
+            expr.type() == Object);
+
+    intrusive_ptr<ExpressionReduce> reduce(new ExpressionReduce());
+
+    // vpsSub is used only to parse 'in', which must have access to $$this and $$value.
+    VariablesParseState vpsSub(vps);
+    reduce->_thisVar = vpsSub.defineVariable("this");
+    reduce->_valueVar = vpsSub.defineVariable("value");
+
+    for (auto&& elem : expr.Obj()) {
+        auto field = elem.fieldNameStringData();
+
+        if (field == "input") {
+            reduce->_input = parseOperand(elem, vps);
+        } else if (field == "initialValue") {
+            reduce->_initial = parseOperand(elem, vps);
+        } else if (field == "in") {
+            reduce->_in = parseOperand(elem, vpsSub);
+        } else {
+            uasserted(40076, str::stream() << "$reduce found an unknown argument: " << field);
+        }
+    }
+
+    uassert(40077, "$reduce requires 'input' to be specified", reduce->_input);
+    uassert(40078, "$reduce requires 'initialValue' to be specified", reduce->_initial);
+    uassert(40079, "$reduce requires 'in' to be specified", reduce->_in);
+
+    return reduce;
+}
+
+Value ExpressionReduce::evaluateInternal(Variables* vars) const {
+    Value inputVal = _input->evaluateInternal(vars);
+
+    if (inputVal.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40080,
+            str::stream() << "$reduce requires that 'input' be an array, found: "
+                          << inputVal.toString(),
+            inputVal.isArray());
+
+    Value accumulatedValue = _initial->evaluateInternal(vars);
+
+    for (auto&& elem : inputVal.getArray()) {
+        vars->setValue(_thisVar, elem);
+        vars->setValue(_valueVar, accumulatedValue);
+
+        accumulatedValue = _in->evaluateInternal(vars);
+    }
+
+    return accumulatedValue;
+}
+
+intrusive_ptr<Expression> ExpressionReduce::optimize() {
+    _input = _input->optimize();
+    _initial = _initial->optimize();
+    _in = _in->optimize();
+    return this;
+}
+
+void ExpressionReduce::addDependencies(DepsTracker* deps, vector<string>* path) const {
+    _input->addDependencies(deps);
+    _initial->addDependencies(deps);
+    _in->addDependencies(deps);
+}
+
+Value ExpressionReduce::serialize(bool explain) const {
+    return Value(Document{{"$reduce",
+                           Document{{"input", _input->serialize(explain)},
+                                    {"initialValue", _initial->serialize(explain)},
+                                    {"in", _in->serialize(explain)}}}});
+}
+
+/* ------------------------ ExpressionReverseArray ------------------------ */
+
+Value ExpressionReverseArray::evaluateInternal(Variables* vars) const {
+    Value input(vpOperand[0]->evaluateInternal(vars));
+
+    if (input.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(34435,
+            str::stream() << "The argument to $reverseArray must be an array, but was of type: "
+                          << typeName(input.getType()),
+            input.isArray());
+
+    if (input.getArrayLength() < 2) {
+        return input;
+    }
+
+    std::vector<Value> array = input.getArray();
+    std::reverse(array.begin(), array.end());
+    return Value(array);
+}
+
+REGISTER_EXPRESSION(reverseArray, ExpressionReverseArray::parse);
+const char* ExpressionReverseArray::getOpName() const {
+    return "$reverseArray";
+}
+
 /* ------------------------- ExpressionSecond ----------------------------- */
 
 Value ExpressionSecond::evaluateInternal(Variables* vars) const {
@@ -2500,11 +2737,11 @@ Value ExpressionSetDifference::evaluateInternal(Variables* vars) const {
     uassert(17048,
             str::stream() << "both operands of $setDifference must be arrays. First "
                           << "argument is of type: " << typeName(lhs.getType()),
-            lhs.getType() == Array);
+            lhs.isArray());
     uassert(17049,
             str::stream() << "both operands of $setDifference must be arrays. Second "
                           << "argument is of type: " << typeName(rhs.getType()),
-            rhs.getType() == Array);
+            rhs.isArray());
 
     ValueSet rhsSet = arrayToSet(rhs);
     const vector<Value>& lhsArray = lhs.getArray();
@@ -2542,7 +2779,7 @@ Value ExpressionSetEquals::evaluateInternal(Variables* vars) const {
         uassert(17044,
                 str::stream() << "All operands of $setEquals must be arrays. One "
                               << "argument is of type: " << typeName(nextEntry.getType()),
-                nextEntry.getType() == Array);
+                nextEntry.isArray());
 
         if (i == 0) {
             lhs.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
@@ -2574,7 +2811,7 @@ Value ExpressionSetIntersection::evaluateInternal(Variables* vars) const {
         uassert(17047,
                 str::stream() << "All operands of $setIntersection must be arrays. One "
                               << "argument is of type: " << typeName(nextEntry.getType()),
-                nextEntry.getType() == Array);
+                nextEntry.isArray());
 
         if (i == 0) {
             currentIntersection.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
@@ -2629,11 +2866,11 @@ Value ExpressionSetIsSubset::evaluateInternal(Variables* vars) const {
     uassert(17046,
             str::stream() << "both operands of $setIsSubset must be arrays. First "
                           << "argument is of type: " << typeName(lhs.getType()),
-            lhs.getType() == Array);
+            lhs.isArray());
     uassert(17042,
             str::stream() << "both operands of $setIsSubset must be arrays. Second "
                           << "argument is of type: " << typeName(rhs.getType()),
-            rhs.getType() == Array);
+            rhs.isArray());
 
     return setIsSubsetHelper(lhs.getArray(), arrayToSet(rhs));
 }
@@ -2658,7 +2895,7 @@ public:
         uassert(17310,
                 str::stream() << "both operands of $setIsSubset must be arrays. First "
                               << "argument is of type: " << typeName(lhs.getType()),
-                lhs.getType() == Array);
+                lhs.isArray());
 
         return setIsSubsetHelper(lhs.getArray(), _cachedRhsSet);
     }
@@ -2680,7 +2917,7 @@ intrusive_ptr<Expression> ExpressionSetIsSubset::optimize() {
         uassert(17311,
                 str::stream() << "both operands of $setIsSubset must be arrays. Second "
                               << "argument is of type: " << typeName(rhs.getType()),
-                rhs.getType() == Array);
+                rhs.isArray());
 
         return new Optimized(arrayToSet(rhs), vpOperand);
     }
@@ -2705,7 +2942,7 @@ Value ExpressionSetUnion::evaluateInternal(Variables* vars) const {
         uassert(17043,
                 str::stream() << "All operands of $setUnion must be arrays. One argument"
                               << " is of type: " << typeName(newEntries.getType()),
-                newEntries.getType() == Array);
+                newEntries.isArray());
 
         unionedSet.insert(newEntries.getArray().begin(), newEntries.getArray().end());
     }
@@ -2721,7 +2958,7 @@ const char* ExpressionSetUnion::getOpName() const {
 
 Value ExpressionIsArray::evaluateInternal(Variables* vars) const {
     Value argument = vpOperand[0]->evaluateInternal(vars);
-    return Value(argument.getType() == Array);
+    return Value(argument.isArray());
 }
 
 REGISTER_EXPRESSION(isArray, ExpressionIsArray::parse);
@@ -2743,9 +2980,9 @@ Value ExpressionSlice::evaluateInternal(Variables* vars) const {
     }
 
     uassert(28724,
-            str::stream() << "First argument to $slice must be an Array, but is"
+            str::stream() << "First argument to $slice must be an array, but is"
                           << " of type: " << typeName(arrayVal.getType()),
-            arrayVal.getType() == Array);
+            arrayVal.isArray());
     uassert(28725,
             str::stream() << "Second argument to $slice must be a numeric value,"
                           << " but is of type: " << typeName(arg2.getType()),
@@ -2821,9 +3058,9 @@ Value ExpressionSize::evaluateInternal(Variables* vars) const {
     Value array = vpOperand[0]->evaluateInternal(vars);
 
     uassert(17124,
-            str::stream() << "The argument to $size must be an Array, but was of type: "
+            str::stream() << "The argument to $size must be an array, but was of type: "
                           << typeName(array.getType()),
-            array.getType() == Array);
+            array.isArray());
     return Value::createIntOrLong(array.getArray().size());
 }
 
@@ -2871,9 +3108,48 @@ const char* ExpressionStrcasecmp::getOpName() const {
     return "$strcasecmp";
 }
 
-/* ----------------------- ExpressionSubstr ---------------------------- */
+namespace {
+/**
+ * UTF-8 multi-byte code points consist of one leading byte of the form 11xxxxxx, and potentially
+ * many continuation bytes of the form 10xxxxxx. This method checks whether 'charByte' is a
+ * continuation byte.
+ */
+bool isContinuationByte(char charByte) {
+    return (charByte & 0xc0) == 0x80;
+}
 
-Value ExpressionSubstr::evaluateInternal(Variables* vars) const {
+/**
+ * UTF-8 multi-byte code points consist of one leading byte of the form 11xxxxxx, and potentially
+ * many continuation bytes of the form 10xxxxxx. This method checks whether 'charByte' is a leading
+ * byte.
+ */
+bool isLeadingByte(char charByte) {
+    return (charByte & 0xc0) == 0xc0;
+}
+
+/**
+ * UTF-8 single-byte code points are of the form 0xxxxxxx. This method checks whether 'charByte' is
+ * a single-byte code point.
+ */
+bool isSingleByte(char charByte) {
+    return (charByte & 0x80) == 0x0;
+}
+
+size_t getCodePointLength(char charByte) {
+    if (isSingleByte(charByte)) {
+        return 1;
+    }
+
+    invariant(isLeadingByte(charByte));
+
+    // In UTF-8, the number of leading ones is the number of bytes the code point takes up.
+    return countLeadingZeros64(~(uint64_t(charByte) << (64 - 8)));
+}
+}  // namespace
+
+/* ----------------------- ExpressionSubstrBytes ---------------------------- */
+
+Value ExpressionSubstrBytes::evaluateInternal(Variables* vars) const {
     Value pString(vpOperand[0]->evaluateInternal(vars));
     Value pLower(vpOperand[1]->evaluateInternal(vars));
     Value pLength(vpOperand[2]->evaluateInternal(vars));
@@ -2893,8 +3169,6 @@ Value ExpressionSubstr::evaluateInternal(Variables* vars) const {
 
     string::size_type lower = static_cast<string::size_type>(pLower.coerceToLong());
     string::size_type length = static_cast<string::size_type>(pLength.coerceToLong());
-
-    auto isContinuationByte = [](char c) { return ((c & 0xc0) == 0x80); };
 
     uassert(28656,
             str::stream() << getOpName()
@@ -2917,9 +3191,136 @@ Value ExpressionSubstr::evaluateInternal(Variables* vars) const {
     return Value(str.substr(lower, length));
 }
 
-REGISTER_EXPRESSION(substr, ExpressionSubstr::parse);
-const char* ExpressionSubstr::getOpName() const {
-    return "$substr";
+// $substr is deprecated in favor of $substrBytes, but for now will just parse into a $substrBytes.
+REGISTER_EXPRESSION(substrBytes, ExpressionSubstrBytes::parse);
+REGISTER_EXPRESSION(substr, ExpressionSubstrBytes::parse);
+const char* ExpressionSubstrBytes::getOpName() const {
+    return "$substrBytes";
+}
+
+/* ----------------------- ExpressionSubstrCP ---------------------------- */
+
+Value ExpressionSubstrCP::evaluateInternal(Variables* vars) const {
+    Value inputVal(vpOperand[0]->evaluateInternal(vars));
+    Value lowerVal(vpOperand[1]->evaluateInternal(vars));
+    Value lengthVal(vpOperand[2]->evaluateInternal(vars));
+
+    std::string str = inputVal.coerceToString();
+    uassert(34450,
+            str::stream() << getOpName() << ": starting index must be a numeric type (is BSON type "
+                          << typeName(lowerVal.getType()) << ")",
+            lowerVal.numeric());
+    uassert(34451,
+            str::stream() << getOpName()
+                          << ": starting index cannot be represented as a 32-bit integral value: "
+                          << lowerVal.toString(),
+            lowerVal.integral());
+    uassert(34452,
+            str::stream() << getOpName() << ": length must be a numeric type (is BSON type "
+                          << typeName(lengthVal.getType()) << ")",
+            lengthVal.numeric());
+    uassert(34453,
+            str::stream() << getOpName()
+                          << ": length cannot be represented as a 32-bit integral value: "
+                          << lengthVal.toString(),
+            lengthVal.integral());
+
+    int startIndexCodePoints = lowerVal.coerceToInt();
+    int length = lengthVal.coerceToInt();
+
+    uassert(34454,
+            str::stream() << getOpName() << ": length must be a nonnegative integer.",
+            length >= 0);
+
+    uassert(34455,
+            str::stream() << getOpName() << ": the starting index must be nonnegative integer.",
+            startIndexCodePoints >= 0);
+
+    size_t startIndexBytes = 0;
+
+    for (int i = 0; i < startIndexCodePoints; i++) {
+        if (startIndexBytes >= str.size()) {
+            return Value("");
+        }
+        uassert(34456,
+                str::stream() << getOpName() << ": invalid UTF-8 string",
+                !isContinuationByte(str[startIndexBytes]));
+        size_t codePointLength = getCodePointLength(str[startIndexBytes]);
+        uassert(
+            34457, str::stream() << getOpName() << ": invalid UTF-8 string", codePointLength <= 4);
+        startIndexBytes += codePointLength;
+    }
+
+    size_t endIndexBytes = startIndexBytes;
+
+    for (int i = 0; i < length && endIndexBytes < str.size(); i++) {
+        uassert(34458,
+                str::stream() << getOpName() << ": invalid UTF-8 string",
+                !isContinuationByte(str[endIndexBytes]));
+        size_t codePointLength = getCodePointLength(str[endIndexBytes]);
+        uassert(
+            34459, str::stream() << getOpName() << ": invalid UTF-8 string", codePointLength <= 4);
+        endIndexBytes += codePointLength;
+    }
+
+    return Value(std::string(str, startIndexBytes, endIndexBytes - startIndexBytes));
+}
+
+REGISTER_EXPRESSION(substrCP, ExpressionSubstrCP::parse);
+const char* ExpressionSubstrCP::getOpName() const {
+    return "$substrCP";
+}
+
+/* ----------------------- ExpressionStrLenBytes ------------------------- */
+
+Value ExpressionStrLenBytes::evaluateInternal(Variables* vars) const {
+    Value str(vpOperand[0]->evaluateInternal(vars));
+
+    uassert(34473,
+            str::stream() << "$strLenBytes requires a string argument, found: "
+                          << typeName(str.getType()),
+            str.getType() == String);
+
+    size_t strLen = str.getString().size();
+
+    uassert(34470,
+            "string length could not be represented as an int.",
+            strLen <= std::numeric_limits<int>::max());
+    return Value(static_cast<int>(strLen));
+}
+
+REGISTER_EXPRESSION(strLenBytes, ExpressionStrLenBytes::parse);
+const char* ExpressionStrLenBytes::getOpName() const {
+    return "$strLenBytes";
+}
+
+/* ----------------------- ExpressionStrLenCP ------------------------- */
+
+Value ExpressionStrLenCP::evaluateInternal(Variables* vars) const {
+    Value val(vpOperand[0]->evaluateInternal(vars));
+
+    uassert(
+        34471,
+        str::stream() << "$strLenCP requires a string argument, found: " << typeName(val.getType()),
+        val.getType() == String);
+
+    std::string stringVal = val.getString();
+
+    size_t strLen = 0;
+    for (char byte : stringVal) {
+        strLen += !isContinuationByte(byte);
+    }
+
+    uassert(34472,
+            "string length could not be represented as an int.",
+            strLen <= std::numeric_limits<int>::max());
+
+    return Value(static_cast<int>(strLen));
+}
+
+REGISTER_EXPRESSION(strLenCP, ExpressionStrLenCP::parse);
+const char* ExpressionStrLenCP::getOpName() const {
+    return "$strLenCP";
 }
 
 /* ----------------------- ExpressionSubtract ---------------------------- */
@@ -2968,6 +3369,136 @@ const char* ExpressionSubtract::getOpName() const {
     return "$subtract";
 }
 
+/* ------------------------- ExpressionSwitch ------------------------------ */
+
+REGISTER_EXPRESSION(switch, ExpressionSwitch::parse);
+const char* ExpressionSwitch::getOpName() const {
+    return "$switch";
+}
+
+Value ExpressionSwitch::evaluateInternal(Variables* vars) const {
+    for (auto&& branch : _branches) {
+        Value caseExpression(branch.first->evaluateInternal(vars));
+
+        if (caseExpression.coerceToBool()) {
+            return branch.second->evaluateInternal(vars);
+        }
+    }
+
+    uassert(40066,
+            "$switch could not find a matching branch for an input, and no default was specified.",
+            _default);
+
+    return _default->evaluateInternal(vars);
+}
+
+boost::intrusive_ptr<Expression> ExpressionSwitch::parse(BSONElement expr,
+                                                         const VariablesParseState& vps) {
+    uassert(40060,
+            str::stream() << "$switch requires an object as an argument, found: "
+                          << typeName(expr.type()),
+            expr.type() == Object);
+
+    intrusive_ptr<ExpressionSwitch> expression(new ExpressionSwitch());
+
+    for (auto&& elem : expr.Obj()) {
+        auto field = elem.fieldNameStringData();
+
+        if (field == "branches") {
+            // Parse each branch separately.
+            uassert(40061,
+                    str::stream() << "$switch expected an array for 'branches', found: "
+                                  << typeName(elem.type()),
+                    elem.type() == Array);
+
+            for (auto&& branch : elem.Array()) {
+                uassert(40062,
+                        str::stream() << "$switch expected each branch to be an object, found: "
+                                      << typeName(branch.type()),
+                        branch.type() == Object);
+
+                ExpressionPair branchExpression;
+
+                for (auto&& branchElement : branch.Obj()) {
+                    auto branchField = branchElement.fieldNameStringData();
+
+                    if (branchField == "case") {
+                        branchExpression.first = parseOperand(branchElement, vps);
+                    } else if (branchField == "then") {
+                        branchExpression.second = parseOperand(branchElement, vps);
+                    } else {
+                        uasserted(40063,
+                                  str::stream() << "$switch found an unknown argument to a branch: "
+                                                << branchField);
+                    }
+                }
+
+                uassert(40064,
+                        "$switch requires each branch have a 'case' expression",
+                        branchExpression.first);
+                uassert(40065,
+                        "$switch requires each branch have a 'then' expression.",
+                        branchExpression.second);
+
+                expression->_branches.push_back(branchExpression);
+            }
+        } else if (field == "default") {
+            // Optional, arbitrary expression.
+            expression->_default = parseOperand(elem, vps);
+        } else {
+            uasserted(40067, str::stream() << "$switch found an unknown argument: " << field);
+        }
+    }
+
+    uassert(40068, "$switch requires at least one branch.", !expression->_branches.empty());
+
+    return expression;
+}
+
+void ExpressionSwitch::addDependencies(DepsTracker* deps, std::vector<std::string>* path) const {
+    for (auto&& branch : _branches) {
+        branch.first->addDependencies(deps, path);
+        branch.second->addDependencies(deps, path);
+    }
+
+    if (_default) {
+        _default->addDependencies(deps, path);
+    }
+}
+
+boost::intrusive_ptr<Expression> ExpressionSwitch::optimize() {
+    if (_default) {
+        _default = _default->optimize();
+    }
+
+    std::transform(_branches.begin(),
+                   _branches.end(),
+                   _branches.begin(),
+                   [](ExpressionPair branch) -> ExpressionPair {
+                       return {branch.first->optimize(), branch.second->optimize()};
+                   });
+
+    return this;
+}
+
+Value ExpressionSwitch::serialize(bool explain) const {
+    std::vector<Value> serializedBranches;
+    serializedBranches.reserve(_branches.size());
+
+    for (auto&& branch : _branches) {
+        serializedBranches.push_back(Value(Document{{"case", branch.first->serialize(explain)},
+                                                    {"then", branch.second->serialize(explain)}}));
+    }
+
+    if (_default) {
+        return Value(Document{{"$switch",
+                               Document{{"branches", Value(serializedBranches)},
+                                        {"default", _default->serialize(explain)}}}});
+    }
+
+    return Value(Document{{"$switch", Document{{"branches", Value(serializedBranches)}}}});
+}
+
 /* ------------------------- ExpressionToLower ----------------------------- */
 
 Value ExpressionToLower::evaluateInternal(Variables* vars) const {
@@ -3009,6 +3540,18 @@ const char* ExpressionTrunc::getOpName() const {
     return "$trunc";
 }
 
+/* ------------------------- ExpressionType ----------------------------- */
+
+Value ExpressionType::evaluateInternal(Variables* vars) const {
+    Value val(vpOperand[0]->evaluateInternal(vars));
+    return Value(typeName(val.getType()));
+}
+
+REGISTER_EXPRESSION(type, ExpressionType::parse);
+const char* ExpressionType::getOpName() const {
+    return "$type";
+}
+
 /* ------------------------- ExpressionWeek ----------------------------- */
 
 Value ExpressionWeek::evaluateInternal(Variables* vars) const {
@@ -3041,6 +3584,158 @@ const char* ExpressionWeek::getOpName() const {
     return "$week";
 }
 
+/* ------------------------- ExpressionIsoDayOfWeek --------------------- */
+
+Value ExpressionIsoDayOfWeek::evaluateInternal(Variables* vars) const {
+    Value date(vpOperand[0]->evaluateInternal(vars));
+    return Value(extract(date.coerceToTm()));
+}
+
+int ExpressionIsoDayOfWeek::extract(const tm& tm) {
+    // translate from sunday=0 … saturday=6 to monday=1 … sunday=7
+    return (tm.tm_wday - 7) % 7 + 7;
+}
+
+REGISTER_EXPRESSION(isoDayOfWeek, ExpressionIsoDayOfWeek::parse);
+const char* ExpressionIsoDayOfWeek::getOpName() const {
+    return "$isoDayOfWeek";
+}
+
+/* ------------------------- ExpressionIsoWeekYear ---------------------- */
+
+Value ExpressionIsoWeekYear::evaluateInternal(Variables* vars) const {
+    Value date(vpOperand[0]->evaluateInternal(vars));
+    return Value(extract(date.coerceToTm()));
+}
+
+int ExpressionIsoWeekYear::extract(const tm& tm) {
+    if (tm.tm_mon > 0 && tm.tm_mon < 11) {
+        // If month is between February and November, it is just the year given.
+        return tm.tm_year + 1900;
+    } else if (tm.tm_mon == 0) {
+        // In January we need to check if the week belongs to previous year.
+        int isoWeek = ExpressionIsoWeek::extract(tm);
+        if (isoWeek > 51) {  // Weeks 52 and 53 belong to the previous year.
+            return tm.tm_year + 1900 - 1;
+        } else {  // All other weeks belong to given year.
+            return tm.tm_year + 1900;
+        }
+    } else {
+        // A week 1 in December belongs to the next year.
+        int isoWeek = ExpressionIsoWeek::extract(tm);
+        if (isoWeek == 1) {
+            return tm.tm_year + 1900 + 1;
+        } else {
+            return tm.tm_year + 1900;
+        }
+    }
+}
+
+REGISTER_EXPRESSION(isoWeekYear, ExpressionIsoWeekYear::parse);
+const char* ExpressionIsoWeekYear::getOpName() const {
+    return "$isoWeekYear";
+}
+
+/* ------------------------- ExpressionIsoWeek -------------------------- */
+
+namespace {
+bool isLeapYear(int year) {
+    if (year % 4 != 0) {
+        // Not a leap year because a leap year must be divisable by 4.
+        return false;
+    } else if (year % 100 != 0) {
+        // Every year that is divisable by 100 is a leap year.
+        return true;
+    } else if (year % 400 != 0) {
+        // Every 400th year is not a leap year, althoght it is divisable by 4.
+        return false;
+    } else {
+        // Every year divisable by 4 but not 400 is a leap year.
+        return true;
+    }
+}
+
+int lastWeek(int year) {
+    // Create YYYY-12-31T23:59:59 so only 1 second left to new year.
+    struct tm tm = {};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = 11;
+    tm.tm_mday = 31;
+    tm.tm_hour = 23;
+    tm.tm_min = 59;
+    tm.tm_sec = 59;
+    mktime(&tm);
+
+    // From: https://en.wikipedia.org/wiki/ISO_week_date#Last_week :
+    // If 31 December is on a Monday, Tuesday or Wednesday, it is in week 01 of the next year. If
+    // it is on a Thursday, it is in week 53 of the year just ending; if on a Friday it is in week
+    // 52 (or 53 if the year just ending is a leap year); if on a Saturday or Sunday, it is in week
+    // 52 of the year just ending.
+    if (tm.tm_wday > 0 && tm.tm_wday < 4) {  // Mon(1), Tue(2), and Wed(3)
+        return 1;
+    } else if (tm.tm_wday == 4) {  // Thu (4)
+        return 53;
+    } else if (tm.tm_wday == 5) {  // Fri (5)
+        // On Fri it's week 52 for non leap years and 53 for leap years.
+        // https://en.wikipedia.org/wiki/Leap_year#Algorithm
+        if (isLeapYear(year)) {
+            return 53;
+        } else {
+            return 52;
+        }
+    } else {  // Sat (6) or Sun (0)
+        return 52;
+    }
+}
+}
+
+Value ExpressionIsoWeek::evaluateInternal(Variables* vars) const {
+    Value date(vpOperand[0]->evaluateInternal(vars));
+    return Value(extract(date.coerceToTm()));
+}
+
+// Quote https://en.wikipedia.org/wiki/ISO_week_date :
+// Weeks start with Monday. The first week of a year is the week that contains the first Thursday of
+// the year (and, hence, always contains 4 January).
+int ExpressionIsoWeek::extract(const tm& tm) {
+    // Calculation taken from:
+    // https://en.wikipedia.org/wiki/ISO_week_date#Calculating_the_week_number_of_a_given_date
+    //
+    // week(date) = floor( (ordinal(data) - weekday(date) + 10) / 7 )
+    //
+    // The first week must contain the first Thursday, therefore the `+ 10` after subtracting the
+    // weekday. Example: 2016-01-07 is the first Thursday
+    // ordinal(2016-01-07) => 7
+    // weekday(2016-01-07) => 4
+    //
+    // floor((7-4+10)/7) = floor(13/7) => 1
+    //
+    // week(date)    = isoWeek
+    // ordinal(date) = isoDayOfYear
+    // weekday(date) = isoDayOfWeek
+    int isoDayOfWeek = ExpressionIsoDayOfWeek::extract(tm);
+    int isoDayOfYear = tm.tm_yday + 1;
+    int isoWeek = (isoDayOfYear - isoDayOfWeek + 10) / 7;
+
+    // There is no week 0, so it must be the last week of the previous year.
+    if (isoWeek < 1) {
+        return lastWeek(tm.tm_year + 1900 - 1);
+        // If the calculated week is 53 and bigger than the last week, than it is the first week of
+        // the
+        // next year.
+    } else if (isoWeek == 53 && isoWeek > lastWeek(tm.tm_year + 1900)) {
+        return 1;
+        // It is just the week calculated
+    } else {
+        return isoWeek;
+    }
+}
+
+REGISTER_EXPRESSION(isoWeek, ExpressionIsoWeek::parse);
+const char* ExpressionIsoWeek::getOpName() const {
+    return "$isoWeek";
+}
+
 /* ------------------------- ExpressionYear ----------------------------- */
 
 Value ExpressionYear::evaluateInternal(Variables* vars) const {
@@ -3051,5 +3746,175 @@ Value ExpressionYear::evaluateInternal(Variables* vars) const {
 REGISTER_EXPRESSION(year, ExpressionYear::parse);
 const char* ExpressionYear::getOpName() const {
     return "$year";
+}
+
+/* -------------------------- ExpressionZip ------------------------------ */
+
+REGISTER_EXPRESSION(zip, ExpressionZip::parse);
+intrusive_ptr<Expression> ExpressionZip::parse(BSONElement expr, const VariablesParseState& vps) {
+    uassert(34460,
+            str::stream() << "$zip only supports an object as an argument, found "
+                          << typeName(expr.type()),
+            expr.type() == Object);
+
+    intrusive_ptr<ExpressionZip> newZip(new ExpressionZip());
+
+    for (auto&& elem : expr.Obj()) {
+        const auto field = elem.fieldNameStringData();
+        if (field == "inputs") {
+            uassert(34461,
+                    str::stream() << "inputs must be an array of expressions, found "
+                                  << typeName(elem.type()),
+                    elem.type() == Array);
+            for (auto&& subExpr : elem.Array()) {
+                newZip->_inputs.push_back(parseOperand(subExpr, vps));
+            }
+        } else if (field == "defaults") {
+            uassert(34462,
+                    str::stream() << "defaults must be an array of expressions, found "
+                                  << typeName(elem.type()),
+                    elem.type() == Array);
+            for (auto&& subExpr : elem.Array()) {
+                newZip->_defaults.push_back(parseOperand(subExpr, vps));
+            }
+        } else if (field == "useLongestLength") {
+            uassert(34463,
+                    str::stream() << "useLongestLength must be a bool, found "
+                                  << typeName(expr.type()),
+                    elem.type() == Bool);
+            newZip->_useLongestLength = elem.Bool();
+        } else {
+            uasserted(34464,
+                      str::stream() << "$zip found an unknown argument: " << elem.fieldName());
+        }
+    }
+
+    uassert(34465, "$zip requires at least one input array", !newZip->_inputs.empty());
+    uassert(34466,
+            "cannot specify defaults unless useLongestLength is true",
+            (newZip->_useLongestLength || newZip->_defaults.empty()));
+    uassert(34467,
+            "defaults and inputs must have the same length",
+            (newZip->_defaults.empty() || newZip->_defaults.size() == newZip->_inputs.size()));
+
+    return std::move(newZip);
+}
+
+Value ExpressionZip::evaluateInternal(Variables* vars) const {
+    // Evaluate input values.
+    vector<vector<Value>> inputValues;
+    inputValues.reserve(_inputs.size());
+
+    size_t minArraySize = 0;
+    size_t maxArraySize = 0;
+    for (size_t i = 0; i < _inputs.size(); i++) {
+        Value evalExpr = _inputs[i]->evaluateInternal(vars);
+        if (evalExpr.nullish()) {
+            return Value(BSONNULL);
+        }
+
+        uassert(
+            34468,
+            str::stream() << "$zip found a non-array expression in input: " << evalExpr.toString(),
+            evalExpr.isArray());
+
+        inputValues.push_back(evalExpr.getArray());
+
+        size_t arraySize = evalExpr.getArrayLength();
+
+        if (i == 0) {
+            minArraySize = arraySize;
+            maxArraySize = arraySize;
+        } else {
+            auto arraySizes = std::minmax({minArraySize, arraySize, maxArraySize});
+            minArraySize = arraySizes.first;
+            maxArraySize = arraySizes.second;
+        }
+    }
+
+    vector<Value> evaluatedDefaults(_inputs.size(), Value(BSONNULL));
+
+    // If we need default values, evaluate each expression.
+    if (minArraySize != maxArraySize) {
+        for (size_t i = 0; i < _defaults.size(); i++) {
+            evaluatedDefaults[i] = _defaults[i]->evaluateInternal(vars);
+        }
+    }
+
+    size_t outputLength = _useLongestLength ? maxArraySize : minArraySize;
+
+    // The final output array, e.g. [[1, 2, 3], [2, 3, 4]].
+    vector<Value> output;
+
+    // Used to construct each array in the output, e.g. [1, 2, 3].
+    vector<Value> outputChild;
+
+    output.reserve(outputLength);
+    outputChild.reserve(_inputs.size());
+
+    for (size_t row = 0; row < outputLength; row++) {
+        outputChild.clear();
+        for (size_t col = 0; col < _inputs.size(); col++) {
+            if (inputValues[col].size() > row) {
+                // Add the value from the appropriate input array.
+                outputChild.push_back(inputValues[col][row]);
+            } else {
+                // Add the corresponding default value.
+                outputChild.push_back(evaluatedDefaults[col]);
+            }
+        }
+        output.push_back(Value(outputChild));
+    }
+
+    return Value(output);
+}
+
+boost::intrusive_ptr<Expression> ExpressionZip::optimize() {
+    std::transform(_inputs.begin(),
+                   _inputs.end(),
+                   _inputs.begin(),
+                   [](intrusive_ptr<Expression> inputExpression)
+                       -> intrusive_ptr<Expression> { return inputExpression->optimize(); });
+
+    std::transform(_defaults.begin(),
+                   _defaults.end(),
+                   _defaults.begin(),
+                   [](intrusive_ptr<Expression> defaultExpression)
+                       -> intrusive_ptr<Expression> { return defaultExpression->optimize(); });
+
+    return this;
+}
+
+Value ExpressionZip::serialize(bool explain) const {
+    vector<Value> serializedInput;
+    vector<Value> serializedDefaults;
+    Value serializedUseLongestLength = Value(_useLongestLength);
+
+    for (auto&& expr : _inputs) {
+        serializedInput.push_back(expr->serialize(explain));
+    }
+
+    for (auto&& expr : _defaults) {
+        serializedDefaults.push_back(expr->serialize(explain));
+    }
+
+    return Value(DOC("$zip" << DOC("inputs" << Value(serializedInput) << "defaults"
+                                            << Value(serializedDefaults) << "useLongestLength"
+                                            << serializedUseLongestLength)));
+}
+
+void ExpressionZip::addDependencies(DepsTracker* deps, std::vector<std::string>* path) const {
+    std::for_each(_inputs.begin(),
+                  _inputs.end(),
+                  [&deps](intrusive_ptr<Expression> inputExpression)
+                      -> void { inputExpression->addDependencies(deps); });
+    std::for_each(_defaults.begin(),
+                  _defaults.end(),
+                  [&deps](intrusive_ptr<Expression> defaultExpression)
+                      -> void { defaultExpression->addDependencies(deps); });
+}
+
+const char* ExpressionZip::getOpName() const {
+    return "$zip";
 }
 }

@@ -47,6 +47,7 @@ StatusWith<BSONObj> fixDocumentForInsert(const BSONObj& doc) {
 
     bool firstElementIsId = doc.firstElement().fieldNameStringData() == "_id";
     bool hasTimestampToFix = false;
+    bool hadId = false;
     {
         BSONObjIterator i(doc);
         while (i.more()) {
@@ -69,6 +70,7 @@ StatusWith<BSONObj> fixDocumentForInsert(const BSONObj& doc) {
 
             // check no regexp for _id (SERVER-9502)
             // also, disallow undefined and arrays
+            // Make sure _id isn't duplicated (SERVER-19361).
             if (str::equals(fieldName, "_id")) {
                 if (e.type() == RegEx) {
                     return StatusWith<BSONObj>(ErrorCodes::BadValue, "can't use a regex for _id");
@@ -86,14 +88,18 @@ StatusWith<BSONObj> fixDocumentForInsert(const BSONObj& doc) {
                     if (!s.isOK())
                         return StatusWith<BSONObj>(s);
                 }
+                if (hadId) {
+                    return StatusWith<BSONObj>(ErrorCodes::BadValue,
+                                               "can't have multiple _id fields in one document");
+                } else {
+                    hadId = true;
+                }
             }
         }
     }
 
     if (firstElementIsId && !hasTimestampToFix)
         return StatusWith<BSONObj>(BSONObj());
-
-    bool hadId = firstElementIsId;
 
     BSONObjIterator i(doc);
 
@@ -105,7 +111,6 @@ StatusWith<BSONObj> fixDocumentForInsert(const BSONObj& doc) {
         BSONElement e = doc["_id"];
         if (e.type()) {
             b.append(e);
-            hadId = true;
         } else {
             b.appendOID("_id", NULL, true);
         }
@@ -146,7 +151,7 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
     if (db.size() == 0)
         return Status(ErrorCodes::BadValue, "db cannot be blank");
 
-    if (!NamespaceString::validDBName(db))
+    if (!NamespaceString::validDBName(db, NamespaceString::DollarInDbNameBehavior::Allow))
         return Status(ErrorCodes::BadValue, "invalid db name");
 
     if (coll.size() == 0)

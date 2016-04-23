@@ -51,11 +51,7 @@ std::shared_ptr<CollectionMetadata> getMetadata(const NamespaceString& nsString)
 
 }  // namespace
 
-UpdateLifecycleImpl::UpdateLifecycleImpl(bool ignoreVersion, const NamespaceString& nsStr)
-    : _nsString(nsStr),
-      _shardVersion((!ignoreVersion && getMetadata(_nsString))
-                        ? getMetadata(_nsString)->getShardVersion()
-                        : ChunkVersion::IGNORED()) {}
+UpdateLifecycleImpl::UpdateLifecycleImpl(const NamespaceString& nsStr) : _nsString(nsStr) {}
 
 void UpdateLifecycleImpl::setCollection(Collection* collection) {
     _collection = collection;
@@ -68,7 +64,7 @@ bool UpdateLifecycleImpl::canContinue() const {
 
 const UpdateIndexData* UpdateLifecycleImpl::getIndexKeys(OperationContext* opCtx) const {
     if (_collection)
-        return &_collection->infoCache()->indexKeys(opCtx);
+        return &_collection->infoCache()->getIndexKeys(opCtx);
     return NULL;
 }
 

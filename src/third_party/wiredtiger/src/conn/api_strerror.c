@@ -38,6 +38,10 @@ __wt_wiredtiger_error(int error)
 		return ("WT_RESTART: restart the operation (internal)");
 	case WT_RUN_RECOVERY:
 		return ("WT_RUN_RECOVERY: recovery must be run to continue");
+	case WT_CACHE_FULL:
+		return ("WT_CACHE_FULL: operation would overflow cache");
+	case WT_PERM_DENIED:
+		return ("WT_PERM_DENIED: permission denied (internal)");
 	}
 
 	/*

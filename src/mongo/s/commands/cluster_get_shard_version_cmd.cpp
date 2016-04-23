@@ -28,7 +28,6 @@
 
 #include "mongo/platform/basic.h"
 
-
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -58,7 +57,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -113,7 +113,7 @@ public:
         }
 
         cm->_printChunks();
-        cm->getVersion().addToBSON(result);
+        cm->getVersion().addToBSON(result, "version");
 
         return true;
     }

@@ -31,6 +31,7 @@
 #include "mongo/s/write_ops/batched_command_request.h"
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
@@ -191,13 +192,63 @@ bool BatchedCommandRequest::isValid(std::string* errMsg) const {
 }
 
 BSONObj BatchedCommandRequest::toBSON() const {
-    INVOKE(toBSON);
+    BSONObjBuilder builder;
+
+    switch (getBatchType()) {
+        case BatchedCommandRequest::BatchType_Insert:
+            builder.appendElements(_insertReq->toBSON());
+            break;
+        case BatchedCommandRequest::BatchType_Update:
+            builder.appendElements(_updateReq->toBSON());
+            break;
+        case BatchedCommandRequest::BatchType_Delete:
+            builder.appendElements(_deleteReq->toBSON());
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    // Append the shard version
+    if (_shardVersion) {
+        _shardVersion.get().appendForCommands(&builder);
+    }
+
+    return builder.obj();
 }
 
 bool BatchedCommandRequest::parseBSON(StringData dbName,
                                       const BSONObj& source,
                                       std::string* errMsg) {
-    INVOKE(parseBSON, dbName, source, errMsg);
+    bool succeeded;
+
+    switch (getBatchType()) {
+        case BatchedCommandRequest::BatchType_Insert:
+            succeeded = _insertReq->parseBSON(dbName, source, errMsg);
+            break;
+        case BatchedCommandRequest::BatchType_Update:
+            succeeded = _updateReq->parseBSON(dbName, source, errMsg);
+            break;
+        case BatchedCommandRequest::BatchType_Delete:
+            succeeded = _deleteReq->parseBSON(dbName, source, errMsg);
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    if (!succeeded)
+        return false;
+
+    // Now parse out the chunk version and optime.
+    auto chunkVersion = ChunkVersion::parseFromBSONForCommands(source);
+    if (chunkVersion.isOK()) {
+        _shardVersion = chunkVersion.getValue();
+        return true;
+    } else if (chunkVersion == ErrorCodes::NoSuchKey) {
+        return true;
+    }
+
+    *errMsg = causedBy(chunkVersion.getStatus());
+    return false;
 }
 
 void BatchedCommandRequest::clear() {
@@ -257,18 +308,6 @@ bool BatchedCommandRequest::isOrderedSet() const {
 
 bool BatchedCommandRequest::getOrdered() const {
     INVOKE(getOrdered);
-}
-
-void BatchedCommandRequest::setMetadata(BatchedRequestMetadata* metadata) {
-    INVOKE(setMetadata, metadata);
-}
-
-bool BatchedCommandRequest::isMetadataSet() const {
-    INVOKE(isMetadataSet);
-}
-
-BatchedRequestMetadata* BatchedCommandRequest::getMetadata() const {
-    INVOKE(getMetadata);
 }
 
 void BatchedCommandRequest::setShouldBypassValidation(bool newVal) {

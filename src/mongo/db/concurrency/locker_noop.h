@@ -41,6 +41,10 @@ class LockerNoop : public Locker {
 public:
     LockerNoop() {}
 
+    virtual ClientState getClientState() const {
+        invariant(false);
+    }
+
     virtual LockerId getId() const {
         invariant(false);
     }
@@ -61,7 +65,7 @@ public:
         invariant(false);
     }
 
-    virtual bool unlockAll() {
+    virtual bool unlockGlobal() {
         invariant(false);
     }
 
@@ -137,7 +141,7 @@ public:
     }
 
     virtual bool isLocked() const {
-        invariant(false);
+        return false;
     }
 
     virtual bool isWriteLocked() const {
@@ -162,10 +166,6 @@ public:
 
     virtual bool isBatchWriter() const {
         invariant(false);
-    }
-
-    virtual bool hasStrongLocks() const {
-        return false;
     }
 };
 

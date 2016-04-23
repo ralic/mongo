@@ -70,7 +70,7 @@ public:
              std::string& errmsg,
              BSONObjBuilder& result);
 
-    virtual bool isWriteCommandForConfigServer() const;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override;
 
     virtual bool slaveOk() const;
 

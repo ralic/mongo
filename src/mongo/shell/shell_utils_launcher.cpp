@@ -54,6 +54,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/quick_exit.h"
@@ -71,8 +72,6 @@ using std::pair;
 using std::string;
 using std::stringstream;
 using std::vector;
-
-extern bool dbexitCalled;
 
 #ifdef _WIN32
 inline int close(int fd) {
@@ -98,95 +97,109 @@ ProgramOutputMultiplexer programOutputLogger;
 
 bool ProgramRegistry::isPortRegistered(int port) const {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    return _ports.count(port) == 1;
+    return _portToPidMap.count(port) == 1;
 }
 
 ProcessId ProgramRegistry::pidForPort(int port) const {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
     verify(isPortRegistered(port));
-    return _ports.find(port)->second.first;
+    return _portToPidMap.find(port)->second;
 }
 
 int ProgramRegistry::portForPid(ProcessId pid) const {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    for (map<int, pair<ProcessId, int>>::const_iterator it = _ports.begin(); it != _ports.end();
-         ++it) {
-        if (it->second.first == pid)
+    for (auto&& it = _portToPidMap.begin(); it != _portToPidMap.end(); ++it) {
+        if (it->second == pid)
             return it->first;
     }
-
     return -1;
 }
 
-void ProgramRegistry::registerPort(int port, ProcessId pid, int output) {
+std::string ProgramRegistry::programName(ProcessId pid) const {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    verify(!isPortRegistered(port));
-    _ports.insert(make_pair(port, make_pair(pid, output)));
+    if (!isPidRegistered(pid)) {
+        // It could be that the program has attempted to log something before it was registered.
+        return "sh";
+    }
+    return _programNames.find(pid)->second;
 }
 
-void ProgramRegistry::deletePort(int port) {
+void ProgramRegistry::registerProgram(ProcessId pid, int output, int port, std::string name) {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    if (!isPortRegistered(port)) {
+    verify(!isPidRegistered(pid));
+    _portToPidMap.emplace(port, pid);
+    _outputs.emplace(pid, output);
+    _programNames.emplace(pid, name);
+}
+
+void ProgramRegistry::deleteProgram(ProcessId pid) {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
+    if (!isPidRegistered(pid)) {
         return;
     }
-    close(_ports.find(port)->second.second);
-    _ports.erase(port);
+    close(_outputs.find(pid)->second);
+    _outputs.erase(pid);
+    _programNames.erase(pid);
+    _portToPidMap.erase(portForPid(pid));
 }
 
 void ProgramRegistry::getRegisteredPorts(vector<int>& ports) {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    for (map<int, pair<ProcessId, int>>::const_iterator i = _ports.begin(); i != _ports.end();
-         ++i) {
-        ports.push_back(i->first);
+    for (auto&& it = _portToPidMap.begin(); it != _portToPidMap.end(); ++it) {
+        ports.push_back(it->first);
     }
 }
 
 bool ProgramRegistry::isPidRegistered(ProcessId pid) const {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    return _pids.count(pid) == 1;
-}
-
-void ProgramRegistry::registerPid(ProcessId pid, int output) {
-    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    verify(!isPidRegistered(pid));
-    _pids.insert(make_pair(pid, output));
-}
-
-void ProgramRegistry::deletePid(ProcessId pid) {
-    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    if (!isPidRegistered(pid)) {
-        int port = portForPid(pid);
-        if (port < 0)
-            return;
-        deletePort(port);
-        return;
-    }
-    close(_pids.find(pid)->second);
-    _pids.erase(pid);
+    return _outputs.count(pid) == 1;
 }
 
 void ProgramRegistry::getRegisteredPids(vector<ProcessId>& pids) {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-    for (map<ProcessId, int>::const_iterator i = _pids.begin(); i != _pids.end(); ++i) {
-        pids.push_back(i->first);
+    for (auto&& v : _outputs) {
+        pids.emplace_back(v.first);
     }
 }
 
-ProgramRegistry& registry = *(new ProgramRegistry());
+#ifdef _WIN32
+HANDLE ProgramRegistry::getHandleForPid(ProcessId pid) {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
 
-void goingAwaySoon() {
-    stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
-    mongo::dbexitCalled = true;
+    return _handles[pid];
 }
+
+void ProgramRegistry::eraseHandleForPid(ProcessId pid) {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
+
+    _handles.erase(pid);
+}
+
+std::size_t ProgramRegistry::countHandleForPid(ProcessId pid) {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
+
+    return _handles.count(pid);
+}
+
+void ProgramRegistry::insertHandleForPid(ProcessId pid, HANDLE handle) {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
+
+    _handles.insert(make_pair(pid, handle));
+}
+
+#endif
+
+ProgramRegistry& registry = *(new ProgramRegistry());
 
 void ProgramOutputMultiplexer::appendLine(int port, ProcessId pid, const char* line) {
     stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
-    uassert(28695, "program is terminating", !mongo::dbexitCalled);
+    uassert(28695, "program is terminating", !mongo::inShutdown());
     stringstream buf;
+    string name = registry.programName(pid);
     if (port > 0)
-        buf << " m" << port << "| " << line;
+        buf << name << port << "| " << line;
     else
-        buf << "sh" << pid << "| " << line;
+        buf << name << pid << "| " << line;
     printf("%s\n", buf.str().c_str());  // cout << buf.str() << endl;
     fflush(stdout);  // not implicit if stdout isn't directly outputting to a console.
     _buffer << buf.str() << endl;
@@ -194,12 +207,7 @@ void ProgramOutputMultiplexer::appendLine(int port, ProcessId pid, const char* l
 
 string ProgramOutputMultiplexer::str() const {
     stdx::lock_guard<stdx::mutex> lk(mongoProgramOutputMutex);
-    string ret = _buffer.str();
-    size_t len = ret.length();
-    if (len > 100000) {
-        ret = ret.substr(len - 100000, 100000);
-    }
-    return ret;
+    return _buffer.str();
 }
 
 void ProgramOutputMultiplexer::clear() {
@@ -217,10 +225,17 @@ ProgramRunner::ProgramRunner(const BSONObj& args) {
     string prefix("mongod-");
     bool isMongodProgram =
         string("mongod") == program || program.compare(0, prefix.size(), prefix) == 0;
-
     prefix = "mongos-";
     bool isMongosProgram =
         string("mongos") == program || program.compare(0, prefix.size(), prefix) == 0;
+
+    if (isMongodProgram) {
+        _name = "d";
+    } else if (isMongosProgram) {
+        _name = "s";
+    } else if (program == "mongobridge") {
+        _name = "b";
+    }
 
 #if 0
             if (isMongosProgram == "mongos") {
@@ -250,10 +265,13 @@ ProgramRunner::ProgramRunner(const BSONObj& args) {
             verify(e.type() == mongo::String);
             str = e.valuestr();
         }
-        if (str == "--port")
+        if (str == "--port") {
             _port = -2;
-        else if (_port == -2)
+        } else if (_port == -2) {
             _port = strtol(str.c_str(), 0, 10);
+        } else if (isMongodProgram && str == "--configsvr") {
+            _name = "c";
+        }
         _argv.push_back(str);
     }
 
@@ -283,7 +301,14 @@ void ProgramRunner::start() {
     }
 
     fflush(0);
+
     launchProcess(pipeEnds[1]);  // sets _pid
+
+    if (_port > 0)
+        registry.registerProgram(_pid, pipeEnds[1], _port, _name);
+    else
+        registry.registerProgram(_pid, pipeEnds[1]);
+    _pipe = pipeEnds[0];
 
     {
         stringstream ss;
@@ -293,12 +318,6 @@ void ProgramRunner::start() {
         }
         log() << ss.str() << endl;
     }
-
-    if (_port > 0)
-        registry.registerPort(_port, _pid, pipeEnds[1]);
-    else
-        registry.registerPid(_pid, pipeEnds[1]);
-    _pipe = pipeEnds[0];
 }
 
 void ProgramRunner::operator()() {
@@ -317,7 +336,7 @@ void ProgramRunner::operator()() {
             }
             verify(lenToRead > 0);
             int ret = read(_pipe, (void*)start, lenToRead);
-            if (mongo::dbexitCalled)
+            if (mongo::inShutdown())
                 break;
             verify(ret != -1);
             start[ret] = '\0';
@@ -362,24 +381,9 @@ boost::filesystem::path ProgramRunner::findProgram(const string& prog) {
     }
 #endif
 
-    if (boost::filesystem::exists(p)) {
-#ifndef _WIN32
-        p = boost::filesystem::initial_path() / p;
-#endif
-        return p;
-    }
-
-    {
-        boost::filesystem::path t = boost::filesystem::current_path() / p;
-        if (boost::filesystem::exists(t))
-            return t;
-    }
-
-    {
-        boost::filesystem::path t = boost::filesystem::initial_path() / p;
-        if (boost::filesystem::exists(t))
-            return t;
-    }
+    boost::filesystem::path t = boost::filesystem::current_path() / p;
+    if (boost::filesystem::exists(t))
+        return t;
 
     return p;  // not found; might find via system path
 }
@@ -448,7 +452,7 @@ void ProgramRunner::launchProcess(int child_stdout) {
     CloseHandle(pi.hThread);
 
     _pid = ProcessId::fromNative(pi.dwProcessId);
-    registry._handles.insert(make_pair(_pid, pi.hProcess));
+    registry.insertHandleForPid(_pid, pi.hProcess);
 
 #else
 
@@ -458,6 +462,7 @@ void ProgramRunner::launchProcess(int child_stdout) {
         argv[i] = _argv[i].c_str();
     }
     argv[_argv.size()] = 0;
+    std::string execErrMsg = str::stream() << "Unable to start program " << argv[0];
 
     unique_ptr<const char* []> envStorage(new const char* [2]);
     const char** env = envStorage.get();
@@ -468,14 +473,25 @@ void ProgramRunner::launchProcess(int child_stdout) {
     _pid = ProcessId::fromNative(nativePid);
     // Async signal unsafe functions should not be called in the child process.
 
-    verify(nativePid != -1);
+    if (nativePid == -1) {
+        // Fork failed so it is time for the process to exit
+        const auto errordesc = errnoWithDescription();
+        cout << "ProgramRunner is unable to fork child process: " << errordesc << endl;
+        fassert(34363, false);
+    }
+
     if (nativePid == 0) {
         // DON'T ASSERT IN THIS BLOCK - very bad things will happen
+        //
+        // Also, deliberately call _exit instead of quickExit. We intended to
+        // fork() and exec() here, so we never want to run any form of cleanup.
+        // This includes things that quickExit calls, such as atexit leak
+        // checks.
 
         if (dup2(child_stdout, STDOUT_FILENO) == -1 || dup2(child_stdout, STDERR_FILENO) == -1) {
             // Async signal unsafe code reporting a terminal error condition.
-            cout << "Unable to dup2 child output: " << errnoWithDescription() << endl;
-            quickExit(-1);  // do not pass go, do not call atexit handlers
+            perror("Unable to dup2 child output: ");
+            _exit(-1);  // do not pass go, do not call atexit handlers
         }
 
         // NOTE execve is async signal safe, but it is not clear that execvp is async
@@ -483,8 +499,9 @@ void ProgramRunner::launchProcess(int child_stdout) {
         execvp(argv[0], const_cast<char**>(argv));
 
         // Async signal unsafe code reporting a terminal error condition.
-        cout << "Unable to start program " << argv[0] << ' ' << errnoWithDescription() << endl;
-        quickExit(-1);
+        perror(execErrMsg.c_str());
+
+        _exit(-1);
     }
 
 #endif
@@ -493,13 +510,18 @@ void ProgramRunner::launchProcess(int child_stdout) {
 // returns true if process exited
 bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = NULL) {
 #ifdef _WIN32
-    verify(registry._handles.count(pid));
-    HANDLE h = registry._handles[pid];
+    verify(registry.countHandleForPid(pid));
+    HANDLE h = registry.getHandleForPid(pid);
 
-    if (block) {
-        if (WaitForSingleObject(h, INFINITE)) {
-            log() << "WaitForSingleObject failed: " << errnoWithDescription();
-        }
+    // wait until the process object is signaled before getting its
+    // exit code. do this even when block is false to ensure that all
+    // file handles open in the process have been closed.
+
+    DWORD ret = WaitForSingleObject(h, (block ? INFINITE : 0));
+    if (ret == WAIT_TIMEOUT) {
+        return false;
+    } else if (ret != WAIT_OBJECT_0) {
+        log() << "wait_for_pid: WaitForSingleObject failed: " << errnoWithDescription();
     }
 
     DWORD tmp;
@@ -510,7 +532,7 @@ bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = NULL) {
             return false;
         }
         CloseHandle(h);
-        registry._handles.erase(pid);
+        registry.eraseHandleForPid(pid);
         if (exit_code)
             *exit_code = tmp;
         return true;
@@ -548,7 +570,7 @@ BSONObj CheckProgram(const BSONObj& args, void* data) {
     ProcessId pid = ProcessId::fromNative(singleArg(args).numberInt());
     bool isDead = wait_for_pid(pid, false);
     if (isDead)
-        registry.deletePid(pid);
+        registry.deleteProgram(pid);
     return BSON(string("") << (!isDead));
 }
 
@@ -556,7 +578,7 @@ BSONObj WaitProgram(const BSONObj& a, void* data) {
     ProcessId pid = ProcessId::fromNative(singleArg(a).numberInt());
     int exit_code = -123456;  // sentinel value
     wait_for_pid(pid, true, &exit_code);
-    registry.deletePid(pid);
+    registry.deleteProgram(pid);
     return BSON(string("") << exit_code);
 }
 
@@ -576,11 +598,7 @@ BSONObj RunMongoProgram(const BSONObj& a, void* data) {
     t.detach();
     int exit_code = -123456;  // sentinel value
     wait_for_pid(r.pid(), true, &exit_code);
-    if (r.port() > 0) {
-        registry.deletePort(r.port());
-    } else {
-        registry.deletePid(r.pid());
-    }
+    registry.deleteProgram(r.pid());
     return BSON(string("") << exit_code);
 }
 
@@ -591,7 +609,7 @@ BSONObj RunProgram(const BSONObj& a, void* data) {
     t.detach();
     int exit_code = -123456;  // sentinel value
     wait_for_pid(r.pid(), true, &exit_code);
-    registry.deletePid(r.pid());
+    registry.deleteProgram(r.pid());
     return BSON(string("") << exit_code);
 }
 
@@ -649,8 +667,9 @@ BSONObj CopyDbpath(const BSONObj& a, void* data) {
 inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
 #ifdef _WIN32
     if (sig == SIGKILL || port == 0) {
-        verify(registry._handles.count(pid));
-        TerminateProcess(registry._handles[pid], 1);  // returns failure for "zombie" processes.
+        verify(registry.countHandleForPid(pid));
+        TerminateProcess(registry.getHandleForPid(pid),
+                         1);  // returns failure for "zombie" processes.
         return;
     }
 
@@ -723,7 +742,7 @@ int killDb(int port, ProcessId _pid, int signal, const BSONObj& opt) {
     int exitCode = 0;
     if (port > 0) {
         if (!registry.isPortRegistered(port)) {
-            log() << "No db started on port: " << port << endl;
+            log() << "No db started on port: " << port;
             return 0;
         }
         pid = registry.pidForPort(port);
@@ -733,31 +752,29 @@ int killDb(int port, ProcessId _pid, int signal, const BSONObj& opt) {
 
     kill_wrapper(pid, signal, port, opt);
 
-    int i = 0;
-    for (; i < 130; ++i) {
-        if (i == 60) {
+    bool processTerminated = false;
+    bool killSignalSent = (signal == SIGKILL);
+    for (int i = 0; i < 1300; ++i) {
+        if (i == 600) {
             log() << "process on port " << port << ", with pid " << pid
-                  << " not terminated, sending sigkill" << endl;
+                  << " not terminated, sending sigkill";
             kill_wrapper(pid, SIGKILL, port, opt);
+            killSignalSent = true;
         }
-        if (wait_for_pid(pid, false, &exitCode))
+        processTerminated = wait_for_pid(pid, false, &exitCode);
+        if (processTerminated) {
             break;
-        sleepmillis(1000);
+        }
+        sleepmillis(100);
     }
-    if (i == 130) {
-        log() << "failed to terminate process on port " << port << ", with pid " << pid << endl;
-        verify("Failed to terminate process" == 0);
+    if (!processTerminated) {
+        severe() << "failed to terminate process on port " << port << ", with pid " << pid;
+        invariant(false);
     }
 
-    if (port > 0) {
-        registry.deletePort(port);
-    } else {
-        registry.deletePid(pid);
-    }
-    // FIXME I think the intention here is to do an extra sleep only when SIGKILL is sent to the
-    // child process. We may want to change the 4 below to 29, since values of i greater than that
-    // indicate we sent a SIGKILL.
-    if (i > 4 || signal == SIGKILL) {
+    registry.deleteProgram(pid);
+
+    if (killSignalSent) {
         sleepmillis(4000);  // allow operating system to reclaim resources
     }
 
@@ -817,14 +834,11 @@ BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
 }
 
 void KillMongoProgramInstances() {
-    vector<int> ports;
-    registry.getRegisteredPorts(ports);
-    for (vector<int>::iterator i = ports.begin(); i != ports.end(); ++i)
-        killDb(*i, ProcessId::fromNative(0), SIGTERM);
     vector<ProcessId> pids;
     registry.getRegisteredPids(pids);
-    for (vector<ProcessId>::iterator i = pids.begin(); i != pids.end(); ++i)
-        killDb(0, *i, SIGTERM);
+    for (auto&& pid : pids) {
+        killDb(0, pid, SIGTERM);
+    }
 }
 
 MongoProgramScope::~MongoProgramScope() {

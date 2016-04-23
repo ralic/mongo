@@ -31,7 +31,7 @@
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/storage/in_memory/in_memory_record_store.h"
+#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/stdx/memory.h"
@@ -66,7 +66,7 @@ public:
         return "devnull";
     }
 
-    virtual void setCappedDeleteCallback(CappedDocumentDeleteCallback*) {}
+    virtual void setCappedCallback(CappedCallback*) {}
 
     virtual long long dataSize(OperationContext* txn) const {
         return 0;
@@ -111,13 +111,13 @@ public:
         return StatusWith<RecordId>(RecordId(6, 4));
     }
 
-    virtual StatusWith<RecordId> updateRecord(OperationContext* txn,
-                                              const RecordId& oldLocation,
-                                              const char* data,
-                                              int len,
-                                              bool enforceQuota,
-                                              UpdateNotifier* notifier) {
-        return StatusWith<RecordId>(oldLocation);
+    virtual Status updateRecord(OperationContext* txn,
+                                const RecordId& oldLocation,
+                                const char* data,
+                                int len,
+                                bool enforceQuota,
+                                UpdateNotifier* notifier) {
+        return Status::OK();
     }
 
     virtual bool updateWithDamagesSupported() const {
@@ -211,7 +211,7 @@ public:
     virtual void fullValidate(OperationContext* txn,
                               bool full,
                               long long* numKeysOut,
-                              BSONObjBuilder* output) const {}
+                              ValidateResults* fullResults) const {}
 
     virtual bool appendCustomStats(OperationContext* txn,
                                    BSONObjBuilder* output,
@@ -243,7 +243,7 @@ RecordStore* DevNullKVEngine::getRecordStore(OperationContext* opCtx,
                                              StringData ident,
                                              const CollectionOptions& options) {
     if (ident == "_mdb_catalog") {
-        return new InMemoryRecordStore(ns, &_catalogInfo);
+        return new EphemeralForTestRecordStore(ns, &_catalogInfo);
     }
     return new DevNullRecordStore(ns, options);
 }

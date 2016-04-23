@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -175,9 +175,11 @@ struct __wt_connection_impl {
 	WT_SPINLOCK checkpoint_lock;	/* Checkpoint spinlock */
 	WT_SPINLOCK dhandle_lock;	/* Data handle list spinlock */
 	WT_SPINLOCK fh_lock;		/* File handle queue spinlock */
+	WT_SPINLOCK metadata_lock;	/* Metadata update spinlock */
 	WT_SPINLOCK reconfig_lock;	/* Single thread reconfigure */
 	WT_SPINLOCK schema_lock;	/* Schema operation spinlock */
 	WT_SPINLOCK table_lock;		/* Table creation spinlock */
+	WT_SPINLOCK turtle_lock;	/* Turtle file spinlock */
 
 	/*
 	 * We distribute the btree page locks across a set of spin locks. Don't
@@ -270,16 +272,18 @@ struct __wt_connection_impl {
 	uint32_t   hazard_max;		/* Hazard array size */
 
 	WT_CACHE  *cache;		/* Page cache */
-	uint64_t   cache_size;		/* Configured cache size */
+	volatile uint64_t cache_size;	/* Cache size (either statically
+					   configured or the current size
+					   within a cache pool). */
 
 	WT_TXN_GLOBAL txn_global;	/* Global transaction state */
 
 	WT_RWLOCK *hot_backup_lock;	/* Hot backup serialization */
-	int hot_backup;
+	bool hot_backup;
 
 	WT_SESSION_IMPL *ckpt_session;	/* Checkpoint thread session */
 	wt_thread_t	 ckpt_tid;	/* Checkpoint thread */
-	int		 ckpt_tid_set;	/* Checkpoint thread set */
+	bool		 ckpt_tid_set;	/* Checkpoint thread set */
 	WT_CONDVAR	*ckpt_cond;	/* Checkpoint wait mutex */
 	const char	*ckpt_config;	/* Checkpoint configuration */
 #define	WT_CKPT_LOGSIZE(conn)	((conn)->ckpt_logsize != 0)
@@ -292,14 +296,13 @@ struct __wt_connection_impl {
 	uint64_t  ckpt_time_recent;	/* Checkpoint time recent/total */
 	uint64_t  ckpt_time_total;
 
-	int compact_in_memory_pass;	/* Compaction serialization */
-
 #define	WT_CONN_STAT_ALL	0x01	/* "all" statistics configured */
 #define	WT_CONN_STAT_CLEAR	0x02	/* clear after gathering */
 #define	WT_CONN_STAT_FAST	0x04	/* "fast" statistics configured */
-#define	WT_CONN_STAT_NONE	0x08	/* don't gather statistics */
-#define	WT_CONN_STAT_ON_CLOSE	0x10	/* output statistics on close */
-#define	WT_CONN_STAT_SIZE	0x20	/* "size" statistics configured */
+#define	WT_CONN_STAT_JSON	0x08	/* output JSON format */
+#define	WT_CONN_STAT_NONE	0x10	/* don't gather statistics */
+#define	WT_CONN_STAT_ON_CLOSE	0x20	/* output statistics on close */
+#define	WT_CONN_STAT_SIZE	0x40	/* "size" statistics configured */
 	uint32_t stat_flags;
 
 					/* Connection statistics */
@@ -317,7 +320,7 @@ struct __wt_connection_impl {
 
 	WT_SESSION_IMPL *evict_session; /* Eviction server sessions */
 	wt_thread_t	 evict_tid;	/* Eviction server thread ID */
-	int		 evict_tid_set;	/* Eviction server thread ID set */
+	bool		 evict_tid_set;	/* Eviction server thread ID set */
 
 	uint32_t	 evict_workers_alloc;/* Allocated eviction workers */
 	uint32_t	 evict_workers_max;/* Max eviction workers */
@@ -327,34 +330,34 @@ struct __wt_connection_impl {
 
 	WT_SESSION_IMPL *stat_session;	/* Statistics log session */
 	wt_thread_t	 stat_tid;	/* Statistics log thread */
-	int		 stat_tid_set;	/* Statistics log thread set */
+	bool		 stat_tid_set;	/* Statistics log thread set */
 	WT_CONDVAR	*stat_cond;	/* Statistics log wait mutex */
 	const char	*stat_format;	/* Statistics log timestamp format */
-	FILE		*stat_fp;	/* Statistics log file handle */
+	WT_FH		*stat_fh;	/* Statistics log file handle */
 	char		*stat_path;	/* Statistics log path format */
 	char	       **stat_sources;	/* Statistics log list of objects */
 	const char	*stat_stamp;	/* Statistics log entry timestamp */
 	uint64_t	 stat_usecs;	/* Statistics log period */
 
-#define	WT_CONN_LOG_ARCHIVE	0x01	/* Archive is enabled */
-#define	WT_CONN_LOG_ENABLED	0x02	/* Logging is enabled */
-#define	WT_CONN_LOG_EXISTED	0x04	/* Log files found */
-#define	WT_CONN_LOG_PREALLOC	0x08	/* Pre-allocation is enabled */
-#define	WT_CONN_LOG_RECOVER_DONE	0x10	/* Recovery completed */
-#define	WT_CONN_LOG_RECOVER_ERR	0x20	/* Error if recovery required */
+#define	WT_CONN_LOG_ARCHIVE		0x01	/* Archive is enabled */
+#define	WT_CONN_LOG_ENABLED		0x02	/* Logging is enabled */
+#define	WT_CONN_LOG_EXISTED		0x04	/* Log files found */
+#define	WT_CONN_LOG_RECOVER_DONE	0x08	/* Recovery completed */
+#define	WT_CONN_LOG_RECOVER_ERR		0x10	/* Error if recovery required */
+#define	WT_CONN_LOG_ZERO_FILL		0x20	/* Manually zero files */
 	uint32_t	 log_flags;	/* Global logging configuration */
 	WT_CONDVAR	*log_cond;	/* Log server wait mutex */
 	WT_SESSION_IMPL *log_session;	/* Log server session */
 	wt_thread_t	 log_tid;	/* Log server thread */
-	int		 log_tid_set;	/* Log server thread set */
+	bool		 log_tid_set;	/* Log server thread set */
 	WT_CONDVAR	*log_file_cond;	/* Log file thread wait mutex */
 	WT_SESSION_IMPL *log_file_session;/* Log file thread session */
 	wt_thread_t	 log_file_tid;	/* Log file thread thread */
-	int		 log_file_tid_set;/* Log file thread set */
+	bool		 log_file_tid_set;/* Log file thread set */
 	WT_CONDVAR	*log_wrlsn_cond;/* Log write lsn thread wait mutex */
 	WT_SESSION_IMPL *log_wrlsn_session;/* Log write lsn thread session */
 	wt_thread_t	 log_wrlsn_tid;	/* Log write lsn thread thread */
-	int		 log_wrlsn_tid_set;/* Log write lsn thread set */
+	bool		 log_wrlsn_tid_set;/* Log write lsn thread set */
 	WT_LOG		*log;		/* Logging structure */
 	WT_COMPRESSOR	*log_compressor;/* Logging compressor */
 	wt_off_t	 log_file_max;	/* Log file max size */
@@ -362,13 +365,28 @@ struct __wt_connection_impl {
 	uint32_t	 log_prealloc;	/* Log file pre-allocation */
 	uint32_t	 txn_logsync;	/* Log sync configuration */
 
-	WT_SESSION_IMPL *sweep_session;	/* Handle sweep session */
-	wt_thread_t	 sweep_tid;	/* Handle sweep thread */
-	int		 sweep_tid_set;	/* Handle sweep thread set */
-	WT_CONDVAR	*sweep_cond;	/* Handle sweep wait mutex */
-	time_t		 sweep_idle_time;/* Handle sweep idle time */
-	time_t		 sweep_interval;/* Handle sweep interval */
-	u_int		 sweep_handles_min;/* Handle sweep minimum open */
+	WT_SESSION_IMPL *meta_ckpt_session;/* Metadata checkpoint session */
+	uint64_t	 meta_uri_hash;	/* Metadata file name hash */
+
+	WT_SESSION_IMPL *sweep_session;	   /* Handle sweep session */
+	wt_thread_t	 sweep_tid;	   /* Handle sweep thread */
+	int		 sweep_tid_set;	   /* Handle sweep thread set */
+	WT_CONDVAR      *sweep_cond;	   /* Handle sweep wait mutex */
+	uint64_t         sweep_idle_time;  /* Handle sweep idle time */
+	uint64_t         sweep_interval;   /* Handle sweep interval */
+	uint64_t         sweep_handles_min;/* Handle sweep minimum open */
+
+	/*
+	 * Shared lookaside lock, session and cursor, used by threads accessing
+	 * the lookaside table (other than eviction server and worker threads
+	 * and the sweep thread, all of which have their own lookaside cursors).
+	 */
+	WT_SPINLOCK	 las_lock;	/* Lookaside table spinlock */
+	WT_SESSION_IMPL *las_session;	/* Lookaside table session */
+	bool		 las_written;	/* Lookaside table has been written */
+
+	WT_ITEM		 las_sweep_key;	/* Sweep server's saved key */
+	int64_t		 las_record_cnt;/* Count of lookaside records */
 
 					/* Locked: collator list */
 	TAILQ_HEAD(__wt_coll_qh, __wt_named_collator) collqh;
@@ -396,9 +414,32 @@ struct __wt_connection_impl {
 	wt_off_t data_extend_len;	/* file_extend data length */
 	wt_off_t log_extend_len;	/* file_extend log length */
 
-	uint32_t direct_io;		/* O_DIRECT file type flags */
-	int	 mmap;			/* mmap configuration */
+	/* O_DIRECT/FILE_FLAG_NO_BUFFERING file type flags */
+	uint32_t direct_io;
+	uint32_t write_through;		/* FILE_FLAG_WRITE_THROUGH type flags */
+	bool	 mmap;			/* mmap configuration */
+	int page_size;			/* OS page size for mmap alignment */
 	uint32_t verbose;
+
+	void *inmemory;			/* In-memory configuration cookie */
+
+#define	WT_STDERR(s)	(&S2C(s)->wt_stderr)
+#define	WT_STDOUT(s)	(&S2C(s)->wt_stdout)
+	WT_FH wt_stderr, wt_stdout;
+
+	/*
+	 * OS library/system call jump table, to support in-memory and readonly
+	 * configurations as well as special devices with other non-POSIX APIs.
+	 */
+	int	(*file_directory_list)(WT_SESSION_IMPL *,
+		    const char *, const char *, uint32_t, char ***, u_int *);
+	int	(*file_directory_sync)(WT_SESSION_IMPL *, const char *);
+	int	(*file_exist)(WT_SESSION_IMPL *, const char *, bool *);
+	int	(*file_remove)(WT_SESSION_IMPL *, const char *);
+	int	(*file_rename)(WT_SESSION_IMPL *, const char *, const char *);
+	int	(*file_size)(WT_SESSION_IMPL *, const char *, bool, wt_off_t *);
+	int	(*handle_open)(WT_SESSION_IMPL *,
+		    WT_FH *, const char *, uint32_t, uint32_t);
 
 	uint32_t flags;
 };

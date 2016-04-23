@@ -43,13 +43,26 @@ public:
     virtual ~DistLockManagerMock() = default;
 
     virtual void startUp() override;
-    virtual void shutDown(bool allowNetworking) override;
+    virtual void shutDown(OperationContext* txn) override;
+
+    virtual std::string getProcessID() override;
 
     virtual StatusWith<DistLockManager::ScopedDistLock> lock(
+        OperationContext* txn,
         StringData name,
         StringData whyMessage,
         stdx::chrono::milliseconds waitFor,
         stdx::chrono::milliseconds lockTryInterval) override;
+
+    virtual StatusWith<DistLockManager::ScopedDistLock> lockWithSessionID(
+        OperationContext* txn,
+        StringData name,
+        StringData whyMessage,
+        const OID lockSessionID,
+        stdx::chrono::milliseconds waitFor,
+        stdx::chrono::milliseconds lockTryInterval) override;
+
+    virtual void unlockAll(OperationContext* txn, const std::string& processID) override;
 
     using LockFunc = stdx::function<void(StringData name,
                                          StringData whyMessage,
@@ -59,9 +72,9 @@ public:
     void expectLock(LockFunc checkerFunc, Status lockStatus);
 
 protected:
-    virtual void unlock(const DistLockHandle& lockHandle) override;
+    virtual void unlock(OperationContext* txn, const DistLockHandle& lockHandle) override;
 
-    virtual Status checkStatus(const DistLockHandle& lockHandle) override;
+    virtual Status checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) override;
 
 private:
     struct LockInfo {

@@ -48,16 +48,19 @@ AsyncSecureStreamFactory::AsyncSecureStreamFactory(SSLManagerInterface* sslManag
     // versions of OpenSSL. This mirrors the call to SSL_CTX_new in ssl_manager.cpp. In
     // initAsyncSSLContext we explicitly disable all protocols other than TLSv1, TLSv1.1,
     // and TLSv1.2.
-    uassertStatusOK(sslManager->initSSLContext(_sslContext.native_handle(), getSSLGlobalParams()));
+    uassertStatusOK(
+        sslManager->initSSLContext(_sslContext.native_handle(),
+                                   getSSLGlobalParams(),
+                                   SSLManagerInterface::ConnectionDirection::kOutgoing));
 }
 
 std::unique_ptr<AsyncStreamInterface> AsyncSecureStreamFactory::makeStream(
-    asio::io_service* io_service, const HostAndPort&) {
+    asio::io_service::strand* strand, const HostAndPort&) {
     int sslModeVal = getSSLGlobalParams().sslMode.load();
     if (sslModeVal == SSLParams::SSLMode_preferSSL || sslModeVal == SSLParams::SSLMode_requireSSL) {
-        return stdx::make_unique<AsyncSecureStream>(io_service, &_sslContext);
+        return stdx::make_unique<AsyncSecureStream>(strand, &_sslContext);
     }
-    return stdx::make_unique<AsyncStream>(io_service);
+    return stdx::make_unique<AsyncStream>(strand);
 }
 
 }  // namespace executor

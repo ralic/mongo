@@ -138,7 +138,7 @@ Listener::~Listener() {
         _timeTracker = 0;
 }
 
-void Listener::setupSockets() {
+bool Listener::setupSockets() {
     checkTicketNumbers();
 
 #if !defined(_WIN32)
@@ -153,7 +153,7 @@ void Listener::setupSockets() {
 
         if (!me.isValid()) {
             error() << "listen(): socket is invalid." << endl;
-            return;
+            return _setupSocketsSuccessful;
         }
 
         SOCKET sock = ::socket(me.getType(), SOCK_STREAM, 0);
@@ -193,7 +193,7 @@ void Listener::setupSockets() {
                     << " for socket: " << me.toString() << endl;
             if (x == EADDRINUSE)
                 error() << "  addr already in use" << endl;
-            return;
+            return _setupSocketsSuccessful;
         }
 
 #if !defined(_WIN32)
@@ -212,6 +212,7 @@ void Listener::setupSockets() {
     }
 
     _setupSocketsSuccessful = true;
+    return _setupSocketsSuccessful;
 }
 
 
@@ -324,14 +325,6 @@ void Listener::initAndListen() {
                 }
                 continue;
             }
-            if (from.getType() != AF_UNIX)
-                disableNagle(s);
-
-#ifdef SO_NOSIGPIPE
-            // ignore SIGPIPE signals on osx, to avoid process exit
-            const int one = 1;
-            setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(int));
-#endif
 
             long long myConnectionNumber = globalConnectionNumber.addAndFetch(1);
 
@@ -341,6 +334,15 @@ void Listener::initAndListen() {
                 log() << "connection accepted from " << from.toString() << " #"
                       << myConnectionNumber << " (" << conns << word << " now open)" << endl;
             }
+
+            if (from.getType() != AF_UNIX)
+                disableNagle(s);
+
+#ifdef SO_NOSIGPIPE
+            // ignore SIGPIPE signals on osx, to avoid process exit
+            const int one = 1;
+            setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(int));
+#endif
 
             std::shared_ptr<Socket> pnewSock(new Socket(s, from));
 #ifdef MONGO_CONFIG_SSL
@@ -450,15 +452,15 @@ void Listener::initAndListen() {
             if (status == SOCKET_ERROR) {
                 const int mongo_errno = WSAGetLastError();
 
-                // During shutdown, we may fail to listen on the socket if it has already
-                // been closed
-                if (inShutdown()) {
-                    return;
+                // We may fail to listen on the socket if it has
+                // already been closed. If we are not in shutdown,
+                // that is possibly interesting, so log an error.
+                if (!inShutdown()) {
+                    error() << "Windows WSAEventSelect returned "
+                            << errnoWithDescription(mongo_errno) << endl;
                 }
 
-                error() << "Windows WSAEventSelect returned " << errnoWithDescription(mongo_errno)
-                        << endl;
-                fassertFailed(16727);
+                return;
             }
         }
 
@@ -545,8 +547,6 @@ void Listener::initAndListen() {
             }
             continue;
         }
-        if (from.getType() != AF_UNIX)
-            disableNagle(s);
 
         long long myConnectionNumber = globalConnectionNumber.addAndFetch(1);
 
@@ -556,6 +556,9 @@ void Listener::initAndListen() {
             log() << "connection accepted from " << from.toString() << " #" << myConnectionNumber
                   << " (" << conns << word << " now open)" << endl;
         }
+
+        if (from.getType() != AF_UNIX)
+            disableNagle(s);
 
         std::shared_ptr<Socket> pnewSock(new Socket(s, from));
 #ifdef MONGO_CONFIG_SSL

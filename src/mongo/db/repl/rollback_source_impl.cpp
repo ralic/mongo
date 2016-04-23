@@ -80,8 +80,7 @@ void RollbackSourceImpl::copyCollectionFromRemote(OperationContext* txn,
     uassert(15909,
             str::stream() << "replSet rollback error resyncing collection " << nss.ns() << ' '
                           << errmsg,
-            cloner.copyCollection(
-                txn, nss.ns(), BSONObj(), errmsg, true, true /* interruptable */, true));
+            cloner.copyCollection(txn, nss.ns(), BSONObj(), errmsg, true));
 }
 
 StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfo(const NamespaceString& nss) const {

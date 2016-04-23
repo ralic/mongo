@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include <string>
@@ -43,6 +45,8 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/util/log.h"
 
 
 namespace {
@@ -140,7 +144,8 @@ bool IndexFilterCommand::run(OperationContext* txn,
     return true;
 }
 
-bool IndexFilterCommand::isWriteCommandForConfigServer() const {
+
+bool IndexFilterCommand::supportsWriteConcern(const BSONObj& cmd) const {
     return false;
 }
 
@@ -278,6 +283,9 @@ Status ClearFilters::clear(OperationContext* txn,
 
         // Remove entry from plan cache
         planCache->remove(*cq);
+
+        LOG(0) << "Removed index filter on " << ns << " " << cq->toStringShort();
+
         return Status::OK();
     }
 
@@ -297,7 +305,7 @@ Status ClearFilters::clear(OperationContext* txn,
     querySettings->clearAllowedIndices();
 
     const NamespaceString nss(ns);
-    const WhereCallbackReal whereCallback(txn, nss.db());
+    const ExtensionsCallbackReal extensionsCallback(txn, &nss);
 
     // Remove corresponding entries from plan cache.
     // Admin hints affect the planning process directly. If there were
@@ -315,13 +323,15 @@ Status ClearFilters::clear(OperationContext* txn,
 
         // Create canonical query.
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, entry->query, entry->sort, entry->projection, whereCallback);
+            nss, entry->query, entry->sort, entry->projection, extensionsCallback);
         invariant(statusWithCQ.isOK());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         // Remove plan cache entry.
         planCache->remove(*cq);
     }
+
+    LOG(0) << "Removed all index filters for collection: " << ns;
 
     return Status::OK();
 }
@@ -393,6 +403,8 @@ Status SetFilter::set(OperationContext* txn,
 
     // Remove entry from plan cache.
     planCache->remove(*cq);
+
+    LOG(0) << "Index filter set on " << ns << " " << cq->toStringShort() << " " << indexesElt;
 
     return Status::OK();
 }

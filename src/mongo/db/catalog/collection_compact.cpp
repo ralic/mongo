@@ -111,12 +111,24 @@ StatusWith<CompactStats> Collection::compact(OperationContext* txn,
                                             << _recordStore->name());
 
     if (_recordStore->compactsInPlace()) {
-        // Since we are compacting in-place, we don't need to touch the indexes.
-        // TODO SERVER-16856 compact indexes
         CompactStats stats;
         Status status = _recordStore->compact(txn, NULL, compactOptions, &stats);
         if (!status.isOK())
             return StatusWith<CompactStats>(status);
+
+        // Compact all indexes (not including unfinished indexes)
+        IndexCatalog::IndexIterator ii(_indexCatalog.getIndexIterator(txn, false));
+        while (ii.more()) {
+            IndexDescriptor* descriptor = ii.next();
+            IndexAccessMethod* index = _indexCatalog.getIndex(descriptor);
+
+            LOG(1) << "compacting index: " << descriptor->toString();
+            Status status = index->compact(txn);
+            if (!status.isOK()) {
+                error() << "failed to compact index: " << descriptor->toString();
+                return status;
+            }
+        }
 
         return StatusWith<CompactStats>(stats);
     }
@@ -124,10 +136,6 @@ StatusWith<CompactStats> Collection::compact(OperationContext* txn,
     if (_indexCatalog.numIndexesInProgress(txn))
         return StatusWith<CompactStats>(ErrorCodes::BadValue,
                                         "cannot compact when indexes in progress");
-
-
-    // same data, but might perform a little different after compact?
-    _infoCache.reset(txn);
 
     vector<BSONObj> indexSpecs;
     {

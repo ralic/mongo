@@ -42,6 +42,7 @@ namespace mongo {
 class BSONObjBuilder;
 class BucketDeletionNotification;
 class SortedDataBuilderInterface;
+struct ValidateResults;
 
 /**
  * This interface is a work in progress.  Notes below:
@@ -121,6 +122,14 @@ public:
      */
     virtual Status dupKeyCheck(OperationContext* txn, const BSONObj& key, const RecordId& loc) = 0;
 
+    /**
+     * Attempt to reduce the storage space used by this index via compaction. Only called if the
+     * indexed record store supports compaction-in-place.
+     */
+    virtual Status compact(OperationContext* txn) {
+        return Status::OK();
+    }
+
     //
     // Information about the tree
     //
@@ -134,7 +143,7 @@ public:
     virtual void fullValidate(OperationContext* txn,
                               bool full,
                               long long* numKeysOut,
-                              BSONObjBuilder* output) const = 0;
+                              ValidateResults* fullResults) const = 0;
 
     virtual bool appendCustomStats(OperationContext* txn,
                                    BSONObjBuilder* output,
@@ -354,6 +363,24 @@ public:
      */
     virtual std::unique_ptr<Cursor> newCursor(OperationContext* txn,
                                               bool isForward = true) const = 0;
+
+    /**
+     * Constructs a cursor over an index that returns entries in a randomized order, and allows
+     * storage engines to provide a more efficient way to randomly sample a collection than
+     * MongoDB's default sampling methods, which are used when this method returns {}. Note if it is
+     * possible to implement RecordStore::getRandomCursor(), that method is preferred, as it will
+     * return the entire document, whereas this method will only return the index key and the
+     * RecordId, requiring an extra lookup.
+     *
+     * This method may be implemented using a pseudo-random walk over B-trees or a similar approach.
+     * Different cursors should return entries in a different order. Random cursors may return the
+     * same entry more than once and, as a result, may return more entries than exist in the index.
+     * Implementations should avoid obvious biases toward older, newer, larger smaller or other
+     * specific classes of entries.
+     */
+    virtual std::unique_ptr<Cursor> newRandomCursor(OperationContext* txn) const {
+        return {};
+    }
 
     //
     // Index creation

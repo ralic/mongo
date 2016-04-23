@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -17,12 +17,14 @@ static const int windows_error_offset = -29000;
  * Windows errors are from 0 - 15999 according to the documentation
  */
 static DWORD
-__wt_map_error_to_windows_error(int error) {
-	/* Ensure we do not exceed the error range
-	   Also validate he do not get any COM errors
-	   (which are negative integers)
-	*/
-	WT_ASSERT(NULL, error > 0 && error > -(windows_error_offset));
+__wt_map_error_to_windows_error(int error)
+{
+	/*
+	 * Ensure we do not exceed the error range
+	 * Also validate we do not get any COM errors
+	 * (which are negative integers)
+	 */
+	WT_ASSERT(NULL, error < 0);
 
 	return (error + -(windows_error_offset));
 }
@@ -32,8 +34,25 @@ __wt_map_error_to_windows_error(int error) {
  *	Return a positive integer, a decoded Windows error
  */
 static int
-__wt_map_windows_error_to_error(DWORD winerr) {
+__wt_map_windows_error_to_error(DWORD winerr)
+{
 	return (winerr + windows_error_offset);
+}
+
+/*
+ * __wt_map_error_rdonly --
+ *	Map an error into a  WiredTiger error code specific for
+ *	read-only operation which intercepts based on certain types
+ *	of failures.
+ */
+int
+__wt_map_error_rdonly(int error)
+{
+	if (error == ERROR_FILE_NOT_FOUND)
+		return (WT_NOTFOUND);
+	else if (error == ERROR_ACCESS_DENIED)
+		return (WT_PERM_DENIED);
+	return (error);
 }
 
 /*
@@ -44,14 +63,33 @@ int
 __wt_errno(void)
 {
 	/*
+	 * Check for 0:
+	 * It's easy to introduce a problem by calling the wrong error function,
+	 * for example, this function when the MSVC function set the C runtime
+	 * error value. Handle gracefully and always return an error.
+	 */
+	return (errno == 0 ? WT_ERROR : errno);
+}
+
+/*
+ * __wt_getlasterror --
+ *	Return GetLastError, or WT_ERROR if error not set.
+ */
+int
+__wt_getlasterror(void)
+{
+	/*
 	 * Called when we know an error occurred, and we want the system
-	 * error code, but there's some chance it's not set.
+	 * error code.
 	 */
 	DWORD err = GetLastError();
 
-	/* GetLastError should only be called if we hit an actual error */
-	WT_ASSERT(NULL, err != ERROR_SUCCESS);
-
+	/*
+	 * Check for ERROR_SUCCESS:
+	 * It's easy to introduce a problem by calling the wrong error function,
+	 * for example, this function when the MSVC function set the C runtime
+	 * error value. Handle gracefully and always return an error.
+	 */
 	return (err == ERROR_SUCCESS ?
 	    WT_ERROR : __wt_map_windows_error_to_error(err));
 }
@@ -96,7 +134,7 @@ __wt_strerror(WT_SESSION_IMPL *session, int error, char *errbuf, size_t errlen)
 		    snprintf(errbuf, errlen, "%s", buf) > 0)
 			return (errbuf);
 		if (lasterror != 0 && session != NULL &&
-		    __wt_buf_set(session, &session->err, buf, strlen(buf)) == 0)
+		    __wt_buf_fmt(session, &session->err, "%s", buf) == 0)
 			return (session->err.data);
 	}
 

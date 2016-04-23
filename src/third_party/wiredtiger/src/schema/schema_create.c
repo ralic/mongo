@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -7,22 +7,6 @@
  */
 
 #include "wt_internal.h"
-
-/*
- * __wt_schema_create_strip --
- *	Discard any configuration information from a schema entry that is not
- * applicable to an session.create call, here for the wt dump command utility,
- * which only wants to dump the schema information needed for load.
- */
-int
-__wt_schema_create_strip(WT_SESSION_IMPL *session,
-    const char *v1, const char *v2, char **value_ret)
-{
-	const char *cfg[] =
-	    { WT_CONFIG_BASE(session, WT_SESSION_create), v1, v2, NULL };
-
-	return (__wt_config_collapse(session, cfg, value_ret));
-}
 
 /*
  * __wt_direct_io_size_check --
@@ -70,15 +54,15 @@ __wt_direct_io_size_check(WT_SESSION_IMPL *session,
  */
 static int
 __create_file(WT_SESSION_IMPL *session,
-    const char *uri, int exclusive, const char *config)
+    const char *uri, bool exclusive, const char *config)
 {
 	WT_DECL_ITEM(val);
 	WT_DECL_RET;
-	uint32_t allocsize;
-	int is_metadata;
 	const char *filename, **p, *filecfg[] =
 	    { WT_CONFIG_BASE(session, file_meta), config, NULL, NULL };
 	char *fileconf;
+	uint32_t allocsize;
+	bool is_metadata;
 
 	fileconf = NULL;
 
@@ -97,7 +81,7 @@ __create_file(WT_SESSION_IMPL *session,
 	}
 
 	/* Sanity check the allocation size. */
-	WT_RET(__wt_direct_io_size_check(
+	WT_ERR(__wt_direct_io_size_check(
 	    session, filecfg, "allocation_size", &allocsize));
 
 	/* Create the file. */
@@ -135,7 +119,7 @@ __create_file(WT_SESSION_IMPL *session,
 	WT_ERR(__wt_session_get_btree(
 	    session, uri, NULL, NULL, WT_DHANDLE_EXCLUSIVE));
 	if (WT_META_TRACKING(session))
-		WT_ERR(__wt_meta_track_handle_lock(session, 1));
+		WT_ERR(__wt_meta_track_handle_lock(session, true));
 	else
 		WT_ERR(__wt_session_release_btree(session));
 
@@ -186,7 +170,7 @@ __wt_schema_colgroup_source(WT_SESSION_IMPL *session,
  */
 static int
 __create_colgroup(WT_SESSION_IMPL *session,
-    const char *name, int exclusive, const char *config)
+    const char *name, bool exclusive, const char *config)
 {
 	WT_CONFIG_ITEM cval;
 	WT_DECL_RET;
@@ -197,13 +181,15 @@ __create_colgroup(WT_SESSION_IMPL *session,
 	    { WT_CONFIG_BASE(session, colgroup_meta), config, NULL, NULL };
 	const char *sourcecfg[] = { config, NULL, NULL };
 	const char *cgname, *source, *sourceconf, *tablename;
-	char *cgconf, *oldconf;
+	char *cgconf, *origconf;
+	bool exists;
 
 	sourceconf = NULL;
-	cgconf = oldconf = NULL;
+	cgconf = origconf = NULL;
 	WT_CLEAR(fmt);
 	WT_CLEAR(confbuf);
 	WT_CLEAR(namebuf);
+	exists = false;
 
 	tablename = name;
 	if (!WT_PREFIX_SKIP(tablename, "colgroup:"))
@@ -216,7 +202,7 @@ __create_colgroup(WT_SESSION_IMPL *session,
 		tlen = strlen(tablename);
 
 	if ((ret =
-	    __wt_schema_get_table(session, tablename, tlen, 1, &table)) != 0)
+	    __wt_schema_get_table(session, tablename, tlen, true, &table)) != 0)
 		WT_RET_MSG(session, (ret == WT_NOTFOUND) ? ENOENT : ret,
 		    "Can't create '%s' for non-existent table '%.*s'",
 		    name, (int)tlen, tablename);
@@ -227,6 +213,14 @@ __create_colgroup(WT_SESSION_IMPL *session,
 		WT_ERR_MSG(session, EINVAL,
 		    "Column group '%s' not found in table '%.*s'",
 		    cgname, (int)tlen, tablename);
+
+	/* Check if the column group already exists. */
+	if ((ret = __wt_metadata_search(session, name, &origconf)) == 0) {
+		if (exclusive)
+			WT_ERR(EEXIST);
+		exists = true;
+	}
+	WT_ERR_NOTFOUND_OK(ret);
 
 	/* Find the first NULL entry in the cfg stack. */
 	for (cfgp = &cfg[1]; *cfgp; cfgp++)
@@ -258,29 +252,22 @@ __create_colgroup(WT_SESSION_IMPL *session,
 			    "No 'columns' configuration for '%s'", name);
 		WT_ERR(__wt_buf_catfmt(session, &fmt, ",value_format="));
 		WT_ERR(__wt_struct_reformat(session,
-		    table, cval.str, cval.len, NULL, 1, &fmt));
+		    table, cval.str, cval.len, NULL, true, &fmt));
 	}
 	sourcecfg[1] = fmt.data;
 	WT_ERR(__wt_config_merge(session, sourcecfg, NULL, &sourceconf));
-
 	WT_ERR(__wt_schema_create(session, source, sourceconf));
 
 	WT_ERR(__wt_config_collapse(session, cfg, &cgconf));
-	if ((ret = __wt_metadata_insert(session, name, cgconf)) != 0) {
-		/*
-		 * If the entry already exists in the metadata, we're done.
-		 * This is an error for exclusive creates but okay otherwise.
-		 */
-		if (ret == WT_DUPLICATE_KEY)
-			ret = exclusive ? EEXIST : 0;
-		goto err;
-	}
 
-	WT_ERR(__wt_schema_open_colgroups(session, table));
+	if (!exists) {
+		WT_ERR(__wt_metadata_insert(session, name, cgconf));
+		WT_ERR(__wt_schema_open_colgroups(session, table));
+	}
 
 err:	__wt_free(session, cgconf);
 	__wt_free(session, sourceconf);
-	__wt_free(session, oldconf);
+	__wt_free(session, origconf);
 	__wt_buf_free(session, &confbuf);
 	__wt_buf_free(session, &fmt);
 	__wt_buf_free(session, &namebuf);
@@ -322,17 +309,59 @@ __wt_schema_index_source(WT_SESSION_IMPL *session,
 }
 
 /*
+ * __fill_index --
+ *	Fill the index from the current contents of the table.
+ */
+static int
+__fill_index(WT_SESSION_IMPL *session, WT_TABLE *table, WT_INDEX *idx)
+{
+	WT_DECL_RET;
+	WT_CURSOR *tcur, *icur;
+	WT_SESSION *wt_session;
+
+	wt_session = &session->iface;
+	tcur = NULL;
+	icur = NULL;
+	WT_RET(__wt_schema_open_colgroups(session, table));
+
+	/*
+	 * If the column groups have not been completely created,
+	 * there cannot be data inserted yet, and we're done.
+	 */
+	if (!table->cg_complete)
+		return (0);
+
+	WT_ERR(wt_session->open_cursor(wt_session,
+	    idx->source, NULL, "bulk=unordered", &icur));
+	WT_ERR(wt_session->open_cursor(wt_session,
+	    table->name, NULL, "readonly", &tcur));
+
+	while ((ret = tcur->next(tcur)) == 0)
+		WT_ERR(__wt_apply_single_idx(session, idx,
+		    icur, (WT_CURSOR_TABLE *)tcur, icur->insert));
+
+	WT_ERR_NOTFOUND_OK(ret);
+err:
+	if (icur)
+		WT_TRET(icur->close(icur));
+	if (tcur)
+		WT_TRET(tcur->close(tcur));
+	return (ret);
+}
+
+/*
  * __create_index --
  *	Create an index.
  */
 static int
 __create_index(WT_SESSION_IMPL *session,
-    const char *name, int exclusive, const char *config)
+    const char *name, bool exclusive, const char *config)
 {
 	WT_CONFIG kcols, pkcols;
 	WT_CONFIG_ITEM ckey, cval, icols, kval;
 	WT_DECL_PACK_VALUE(pv);
 	WT_DECL_RET;
+	WT_INDEX *idx;
 	WT_ITEM confbuf, extra_cols, fmt, namebuf;
 	WT_PACK pack;
 	WT_TABLE *table;
@@ -340,18 +369,18 @@ __create_index(WT_SESSION_IMPL *session,
 	    { WT_CONFIG_BASE(session, index_meta), NULL, NULL, NULL };
 	const char *sourcecfg[] = { config, NULL, NULL };
 	const char *source, *sourceconf, *idxname, *tablename;
-	char *idxconf;
+	char *idxconf, *origconf;
 	size_t tlen;
-	int have_extractor;
+	bool exists, have_extractor;
 	u_int i, npublic_cols;
 
 	sourceconf = NULL;
-	idxconf = NULL;
+	idxconf = origconf = NULL;
 	WT_CLEAR(confbuf);
 	WT_CLEAR(fmt);
 	WT_CLEAR(extra_cols);
 	WT_CLEAR(namebuf);
-	have_extractor = 0;
+	exists = have_extractor = false;
 
 	tablename = name;
 	if (!WT_PREFIX_SKIP(tablename, "index:"))
@@ -363,14 +392,22 @@ __create_index(WT_SESSION_IMPL *session,
 
 	tlen = (size_t)(idxname++ - tablename);
 	if ((ret =
-	    __wt_schema_get_table(session, tablename, tlen, 1, &table)) != 0)
+	    __wt_schema_get_table(session, tablename, tlen, true, &table)) != 0)
 		WT_RET_MSG(session, ret,
 		    "Can't create an index for a non-existent table: %.*s",
 		    (int)tlen, tablename);
 
 	if (table->is_simple)
-		WT_RET_MSG(session, EINVAL,
+		WT_ERR_MSG(session, EINVAL,
 		    "%s requires a table with named columns", name);
+
+	/* Check if the index already exists. */
+	if ((ret = __wt_metadata_search(session, name, &origconf)) == 0) {
+		if (exclusive)
+			WT_ERR(EEXIST);
+		exists = true;
+	}
+	WT_ERR_NOTFOUND_OK(ret);
 
 	if (__wt_config_getones(session, config, "source", &cval) == 0) {
 		WT_ERR(__wt_buf_fmt(session, &namebuf,
@@ -388,7 +425,7 @@ __create_index(WT_SESSION_IMPL *session,
 
 	if (__wt_config_getones_none(
 	    session, config, "extractor", &cval) == 0 && cval.len != 0) {
-		have_extractor = 1;
+		have_extractor = true;
 		/* Custom extractors must supply a key format. */
 		if ((ret = __wt_config_getones(
 		    session, config, "key_format", &kval)) != 0)
@@ -446,8 +483,7 @@ __create_index(WT_SESSION_IMPL *session,
 		WT_ERR(__wt_buf_catfmt(
 		    session, &extra_cols, "%.*s,", (int)ckey.len, ckey.str));
 	}
-	if (ret != 0 && ret != WT_NOTFOUND)
-		goto err;
+	WT_ERR_NOTFOUND_OK(ret);
 
 	/* Index values are empty: all columns are packed into the index key. */
 	WT_ERR(__wt_buf_fmt(session, &fmt, "value_format=,key_format="));
@@ -463,7 +499,7 @@ __create_index(WT_SESSION_IMPL *session,
 	 * for custom extractors.
 	 */
 	WT_ERR(__wt_struct_reformat(session, table,
-	    icols.str, icols.len, (const char *)extra_cols.data, 0, &fmt));
+	    icols.str, icols.len, (const char *)extra_cols.data, false, &fmt));
 
 	/* Check for a record number index key, which makes no sense. */
 	WT_ERR(__wt_config_getones(session, fmt.data, "key_format", &cval));
@@ -483,21 +519,20 @@ __create_index(WT_SESSION_IMPL *session,
 	cfg[1] = sourceconf;
 	cfg[2] = confbuf.data;
 	WT_ERR(__wt_config_collapse(session, cfg, &idxconf));
-	if ((ret = __wt_metadata_insert(session, name, idxconf)) != 0) {
-		/*
-		 * If the entry already exists in the metadata, we're done.
-		 * This is an error for exclusive creates but okay otherwise.
-		 */
-		if (ret == WT_DUPLICATE_KEY)
-			ret = exclusive ? EEXIST : 0;
-		goto err;
+
+	if (!exists) {
+		WT_ERR(__wt_metadata_insert(session, name, idxconf));
+
+		/* Make sure that the configuration is valid. */
+		WT_ERR(__wt_schema_open_index(
+		    session, table, idxname, strlen(idxname), &idx));
+
+		/* If there is data in the table, fill the index. */
+		WT_ERR(__fill_index(session, table, idx));
 	}
 
-	/* Make sure that the configuration is valid. */
-	WT_ERR(__wt_schema_open_index(
-	    session, table, idxname, strlen(idxname), NULL));
-
 err:	__wt_free(session, idxconf);
+	__wt_free(session, origconf);
 	__wt_free(session, sourceconf);
 	__wt_buf_free(session, &confbuf);
 	__wt_buf_free(session, &extra_cols);
@@ -514,7 +549,7 @@ err:	__wt_free(session, idxconf);
  */
 static int
 __create_table(WT_SESSION_IMPL *session,
-    const char *name, int exclusive, const char *config)
+    const char *name, bool exclusive, const char *config)
 {
 	WT_CONFIG conf;
 	WT_CONFIG_ITEM cgkey, cgval, cval;
@@ -526,19 +561,22 @@ __create_table(WT_SESSION_IMPL *session,
 	char *tableconf, *cgname;
 	size_t cgsize;
 	int ncolgroups;
+	bool exists;
 
 	cgname = NULL;
 	table = NULL;
 	tableconf = NULL;
+	exists = false;
 
 	tablename = name;
 	if (!WT_PREFIX_SKIP(tablename, "table:"))
 		return (EINVAL);
 
 	if ((ret = __wt_schema_get_table(session,
-	    tablename, strlen(tablename), 0, &table)) == 0) {
-		__wt_schema_release_table(session, table);
-		return (exclusive ? EEXIST : 0);
+	    tablename, strlen(tablename), false, &table)) == 0) {
+		if (exclusive)
+			WT_ERR(EEXIST);
+		exists = true;
 	}
 	WT_RET_NOTFOUND_OK(ret);
 
@@ -551,25 +589,21 @@ __create_table(WT_SESSION_IMPL *session,
 	WT_ERR_NOTFOUND_OK(ret);
 
 	WT_ERR(__wt_config_collapse(session, cfg, &tableconf));
-	if ((ret = __wt_metadata_insert(session, name, tableconf)) != 0) {
-		/*
-		 * If the entry already exists in the metadata, we're done.
-		 * This is an error for exclusive creates but okay otherwise.
-		 */
-		if (ret == WT_DUPLICATE_KEY)
-			ret = exclusive ? EEXIST : 0;
-		goto err;
-	}
 
-	/* Attempt to open the table now to catch any errors. */
-	WT_ERR(__wt_schema_get_table(
-	    session, tablename, strlen(tablename), 1, &table));
+	if (!exists) {
+		WT_ERR(__wt_metadata_insert(session, name, tableconf));
 
-	if (ncolgroups == 0) {
-		cgsize = strlen("colgroup:") + strlen(tablename) + 1;
-		WT_ERR(__wt_calloc_def(session, cgsize, &cgname));
-		snprintf(cgname, cgsize, "colgroup:%s", tablename);
-		WT_ERR(__create_colgroup(session, cgname, exclusive, config));
+		/* Attempt to open the table now to catch any errors. */
+		WT_ERR(__wt_schema_get_table(
+		    session, tablename, strlen(tablename), true, &table));
+
+		if (ncolgroups == 0) {
+			cgsize = strlen("colgroup:") + strlen(tablename) + 1;
+			WT_ERR(__wt_calloc_def(session, cgsize, &cgname));
+			snprintf(cgname, cgsize, "colgroup:%s", tablename);
+			WT_ERR(__create_colgroup(
+			    session, cgname, exclusive, config));
+		}
 	}
 
 	if (0) {
@@ -629,11 +663,11 @@ __wt_schema_create(
 	WT_CONFIG_ITEM cval;
 	WT_DATA_SOURCE *dsrc;
 	WT_DECL_RET;
-	int exclusive;
+	bool exclusive;
 
-	exclusive = (
+	exclusive =
 	    __wt_config_getones(session, config, "exclusive", &cval) == 0 &&
-	    cval.val != 0);
+	    cval.val != 0;
 
 	/*
 	 * We track create operations: if we fail in the middle of creating a
@@ -659,7 +693,7 @@ __wt_schema_create(
 		ret = __wt_bad_object_type(session, uri);
 
 	session->dhandle = NULL;
-	WT_TRET(__wt_meta_track_off(session, 1, ret != 0));
+	WT_TRET(__wt_meta_track_off(session, true, ret != 0));
 
 	return (ret);
 }

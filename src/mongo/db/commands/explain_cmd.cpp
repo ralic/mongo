@@ -56,7 +56,8 @@ class CmdExplain : public Command {
 public:
     CmdExplain() : Command("explain") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -77,10 +78,6 @@ public:
 
     virtual bool adminOnly() const {
         return false;
-    }
-
-    bool supportsReadConcern() const final {
-        return true;
     }
 
     virtual void help(std::stringstream& help) const {
@@ -142,8 +139,7 @@ public:
         bool commandCanRunOnSecondary = commToExplain->slaveOk();
 
         bool commandIsOverriddenToRunOnSecondary = commToExplain->slaveOverrideOk() &&
-            (rpc::ServerSelectionMetadata::get(txn).isSecondaryOk() ||
-             rpc::ServerSelectionMetadata::get(txn).getReadPreference() != boost::none);
+            rpc::ServerSelectionMetadata::get(txn).canRunOnSecondary();
         bool iAmStandalone = !txn->writesAreReplicated();
 
         const bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||
@@ -158,7 +154,8 @@ public:
         }
 
         // Actually call the nested command's explain(...) method.
-        Status explainStatus = commToExplain->explain(txn, dbname, explainObj, verbosity, &result);
+        Status explainStatus = commToExplain->explain(
+            txn, dbname, explainObj, verbosity, rpc::ServerSelectionMetadata::get(txn), &result);
         if (!explainStatus.isOK()) {
             return appendCommandStatus(result, explainStatus);
         }

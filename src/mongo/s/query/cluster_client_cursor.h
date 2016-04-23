@@ -31,6 +31,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -80,6 +81,30 @@ public:
      * Returns the number of result documents returned so far by this cursor via the next() method.
      */
     virtual long long getNumReturnedSoFar() const = 0;
+
+    /**
+     * Stash the BSONObj so that it gets returned from the CCC on a later call to next().
+     *
+     * Queued documents are returned in FIFO order. The queued results are exhausted before
+     * generating further results from the underlying mongos query stages.
+     *
+     * 'obj' must be owned BSON.
+     */
+    virtual void queueResult(const BSONObj& obj) = 0;
+
+    /**
+     * Returns whether or not all the remote cursors underlying this cursor have been exhausted.
+     */
+    virtual bool remotesExhausted() = 0;
+
+    /**
+     * Sets the maxTimeMS value that the cursor should forward with any internally issued getMore
+     * requests.
+     *
+     * Returns a non-OK status if this cursor type does not support maxTimeMS on getMore (i.e. if
+     * the cursor is not tailable + awaitData).
+     */
+    virtual Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) = 0;
 };
 
 }  // namespace mongo

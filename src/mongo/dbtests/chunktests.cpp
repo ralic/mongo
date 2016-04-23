@@ -31,8 +31,10 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/json.h"
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/stdx/memory.h"
 
 namespace mongo {
 
@@ -54,8 +56,12 @@ public:
             const string shardId = str::stream() << (i - 1);
             _shardIds.insert(shardId);
 
-            std::shared_ptr<Chunk> chunk(
-                new Chunk(this, mySplitPoints[i - 1], mySplitPoints[i], shardId));
+            std::shared_ptr<Chunk> chunk(new Chunk(this,
+                                                   mySplitPoints[i - 1],
+                                                   mySplitPoints[i],
+                                                   shardId,
+                                                   ChunkVersion(0, 0, OID()),
+                                                   0));
             _chunkMap[mySplitPoints[i]] = chunk;
         }
 
@@ -72,12 +78,14 @@ public:
     virtual ~Base() = default;
 
     void run() {
+        auto opCtx = stdx::make_unique<OperationContextNoop>();
+
         ShardKeyPattern shardKeyPattern(shardKey());
         TestableChunkManager chunkManager("", shardKeyPattern, false);
         chunkManager.setSingleChunkForShards(splitPointsVector());
 
         set<ShardId> shardIds;
-        chunkManager.getShardIdsForQuery(shardIds, query());
+        chunkManager.getShardIdsForQuery(opCtx.get(), query(), &shardIds);
 
         BSONArrayBuilder b;
         for (const ShardId& shardId : shardIds) {

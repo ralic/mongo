@@ -372,7 +372,7 @@ public:
     void switchMode(bool jsMode);
     void bailFromJS();
 
-    Collection* getCollectionOrUassert(Database* db, StringData ns);
+    static Collection* getCollectionOrUassert(Database* db, StringData ns);
 
     const Config& _config;
     DBDirectClient _db;
@@ -411,5 +411,11 @@ void addPrivilegesRequiredForMapReduce(Command* commandTemplate,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out);
+
+/**
+ * Returns true if the provided mapReduce command has an 'out' parameter.
+ */
+bool mrSupportsWriteConcern(const BSONObj& cmd);
+
 }  // end mr namespace
 }

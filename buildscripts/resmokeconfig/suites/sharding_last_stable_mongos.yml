@@ -1,0 +1,29 @@
+selector:
+  js_test:
+    roots:
+    - jstests/sharding/*.js
+    exclude_files:
+    # Error format changes. See SERVER-22184.
+    - jstests/sharding/error_propagation.js
+    # New features for v3.4
+    - jstests/sharding/shard_aware_init.js
+    - jstests/sharding/shard_aware_primary_failover.js
+    # v3.4 changes $in shard key extraction.
+    - jstests/sharding/upsert_sharded.js
+    - jstests/sharding/update_sharded.js
+    # validate() format changes. See SERVER-22588.
+    - jstests/sharding/validate_collection.js
+    # Write concern error format changes. See SERVER-22540.
+    - jstests/sharding/move_chunk_wc.js
+    - jstests/sharding/commands_that_write_accept_wc_configRS.js
+    - jstests/sharding/commands_that_write_accept_wc_shards.js
+
+executor:
+  js_test:
+    config:
+      shell_options:
+        global_vars:
+          TestData:
+            mongosBinVersion: 'last-stable'
+        nodb: ''
+

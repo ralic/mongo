@@ -40,8 +40,11 @@
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
+
+class CursorResponse;
 
 /**
  * AsyncResultsMerger is used to generate results from cursor-generating commands on one or more
@@ -70,10 +73,10 @@ class AsyncResultsMerger {
 
 public:
     /**
-     * Constructs a new AsyncResultsMerger. The TaskExecutor* and ClusterClientCursorParams& must
-     * remain valid for the lifetime of the ARM.
+     * Constructs a new AsyncResultsMerger. The TaskExecutor* must remain valid for the lifetime of
+     * the ARM.
      */
-    AsyncResultsMerger(executor::TaskExecutor* executor, ClusterClientCursorParams params);
+    AsyncResultsMerger(executor::TaskExecutor* executor, ClusterClientCursorParams&& params);
 
     /**
      * In order to be destroyed, either
@@ -82,6 +85,20 @@ public:
      *   --all cursors must have been exhausted.
      */
     virtual ~AsyncResultsMerger();
+
+    /**
+     * Returns true if all of the remote cursors are exhausted.
+     */
+    bool remotesExhausted();
+
+    /**
+     * Sets the maxTimeMS value that the ARM should forward with any internally issued getMore
+     * requests.
+     *
+     * Returns a non-OK status if this cursor type does not support maxTimeMS on getMore (i.e. if
+     * the cursor is not tailable + awaitData).
+     */
+    Status setAwaitDataTimeout(Milliseconds awaitDataTimeout);
 
     /**
      * Returns true if there is no need to schedule remote work in order to take the next action.
@@ -153,7 +170,23 @@ private:
      * reported from the remote.
      */
     struct RemoteCursorData {
-        RemoteCursorData(const ClusterClientCursorParams::Remote& params);
+        /**
+         * Creates a new uninitialized remote cursor state, which will have to send a command in
+         * order to establish its cursor id. Must only be used if the remote cursor ids are not yet
+         * known.
+         */
+        RemoteCursorData(ShardId shardId, BSONObj cmdObj);
+
+        /**
+         * Instantiates a new initialized remote cursor, which has an established cursor id. It may
+         * only be used for getMore operations.
+         */
+        RemoteCursorData(HostAndPort hostAndPort, CursorId establishedCursorId);
+
+        /**
+         * Returns the resolved host and port on which the remote cursor resides.
+         */
+        const HostAndPort& getTargetHost() const;
 
         /**
          * Returns whether there is another buffered result available for this remote node.
@@ -166,12 +199,21 @@ private:
          */
         bool exhausted() const;
 
-        HostAndPort hostAndPort;
+        /**
+         * Given the shard id with which the cursor was initialized and a read preference, selects
+         * a host on which the cursor should be created.
+         *
+         * May not be called once a cursor has already been established.
+         */
+        Status resolveShardIdToHostAndPort(const ReadPreferenceSetting& readPref);
+
+        // ShardId on which a cursor will be created.
+        const boost::optional<ShardId> shardId;
 
         // The command object for sending to the remote to establish the cursor. If a remote cursor
         // has not been established yet, this member will be set to a valid command object. If a
         // remote cursor has already been established, this member will be unset.
-        boost::optional<BSONObj> cmdObj;
+        boost::optional<BSONObj> initialCmdObj;
 
         // The cursor id for the remote cursor. If a remote cursor has not been established yet,
         // this member will be unset. If a remote cursor has been established and is not yet
@@ -183,9 +225,19 @@ private:
         executor::TaskExecutor::CallbackHandle cbHandle;
         Status status = Status::OK();
 
+        // Counts how many times we retried the initial cursor establishment command. It is used to
+        // make a decision based on the error type and the retry count about whether we are allowed
+        // to retry sending the request to another host from this shard.
+        int retryCount = 0;
+
         // Count of fetched docs during ARM processing of the current batch. Used to reduce the
         // batchSize in getMore when mongod returned less docs than the requested batchSize.
         long long fetchedCount = 0;
+
+    private:
+        // For a cursor, which has shard id associated contains the exact host on which the remote
+        // cursor resides.
+        boost::optional<HostAndPort> _shardHostAndPort;
     };
 
     class MergingComparator {
@@ -210,6 +262,14 @@ private:
         const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData);
 
     /**
+     * Parses the find or getMore command response object to a CursorResponse.
+     *
+     * Returns a non-OK response if the response fails to parse or if there is a cursor id mismatch.
+     */
+    static StatusWith<CursorResponse> parseCursorResponse(const BSONObj& responseObj,
+                                                          const RemoteCursorData& remote);
+
+    /**
      * Helper to schedule a command asking the remote node for another batch of results.
      *
      * The 'remoteIndex' gives the position of the remote node from which we are retrieving the
@@ -218,6 +278,11 @@ private:
      * Returns success if the command to retrieve the next batch was scheduled successfully.
      */
     Status askForNextBatch_inlock(size_t remoteIndex);
+
+    /**
+     * Checks whether or not the remote cursors are all exhausted.
+     */
+    bool remotesExhausted_inlock();
 
     //
     // Helpers for ready().
@@ -269,6 +334,10 @@ private:
 
     ClusterClientCursorParams _params;
 
+    // The metadata obj to pass along with the command request. Used to indicate that the command is
+    // ok to run on secondaries.
+    BSONObj _metadataObj;
+
     // Must be acquired before accessing any data members (other than _params, which is read-only).
     // Must also be held when calling any of the '_inlock()' helper functions.
     stdx::mutex _mutex;
@@ -291,6 +360,8 @@ private:
     // For tailable cursors, set to true if the next result returned from nextReady() should be
     // boost::none.
     bool _eofNext = false;
+
+    boost::optional<Milliseconds> _awaitDataTimeout;
 
     //
     // Killing

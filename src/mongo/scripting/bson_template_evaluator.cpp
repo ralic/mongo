@@ -46,6 +46,7 @@ void BsonTemplateEvaluator::initializeEvaluator() {
     addOperator("CONCAT", &BsonTemplateEvaluator::evalConcat);
     addOperator("OID", &BsonTemplateEvaluator::evalObjId);
     addOperator("VARIABLE", &BsonTemplateEvaluator::evalVariable);
+    addOperator("CUR_DATE", &BsonTemplateEvaluator::evalCurrentDate);
 }
 
 BsonTemplateEvaluator::BsonTemplateEvaluator(int64_t seed) : _id(0), rng(seed) {
@@ -238,6 +239,8 @@ BsonTemplateEvaluator::Status BsonTemplateEvaluator::evalSeqInt(BsonTemplateEval
         if (!spec["mod"].isNumber())
             return StatusOpEvaluationError;
         int modval = spec["mod"].numberInt();
+        if (modval <= 0)
+            return StatusOpEvaluationError;
         curr_seqval = (curr_seqval % modval);
     }
 
@@ -325,6 +328,16 @@ BsonTemplateEvaluator::Status BsonTemplateEvaluator::evalVariable(BsonTemplateEv
     } else {
         return StatusOpEvaluationError;
     }
+}
+
+BsonTemplateEvaluator::Status BsonTemplateEvaluator::evalCurrentDate(BsonTemplateEvaluator* btl,
+                                                                     const char* fieldName,
+                                                                     const BSONObj& in,
+                                                                     BSONObjBuilder& out) {
+    // in = { #CUR_DATE: 1 }
+    auto offset = Milliseconds(in.firstElement().numberLong());
+    out.append(fieldName, Date_t::now() + offset);
+    return StatusSuccess;
 }
 
 }  // end namespace mongo

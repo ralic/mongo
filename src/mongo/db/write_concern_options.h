@@ -37,10 +37,10 @@ class Status;
 
 struct WriteConcernOptions {
 public:
-    enum SyncMode { NONE, FSYNC, JOURNAL };
+    enum class SyncMode { UNSET, NONE, FSYNC, JOURNAL };
 
-    static const int kNoTimeout = 0;
-    static const int kNoWaiting = -1;
+    static const int kNoTimeout;
+    static const int kNoWaiting;
 
     static const BSONObj Default;
     static const BSONObj Acknowledged;
@@ -55,29 +55,22 @@ public:
 
     WriteConcernOptions(int numNodes, SyncMode sync, int timeout);
 
+    WriteConcernOptions(int numNodes, SyncMode sync, Milliseconds timeout);
+
     WriteConcernOptions(const std::string& mode, SyncMode sync, int timeout);
+
+    WriteConcernOptions(const std::string& mode, SyncMode sync, Milliseconds timeout);
 
     Status parse(const BSONObj& obj);
 
     /**
-     * Extracts the write concern settings from the BSONObj. The BSON object should have
-     * the format:
-     *
-     * {
-     *     ...
-     *     secondaryThrottle: <bool>, // optional
-     *     _secondaryThrottle: <bool>, // optional
-     *     writeConcern: <BSONObj> // optional
-     * }
-     *
-     * Note: secondaryThrottle takes precedence over _secondaryThrottle.
-     *
-     * Also sets output parameter rawWriteConcernObj if the writeCocnern field exists.
-     *
-     * Returns OK if the parse was successful. Also returns ErrorCodes::WriteConcernNotDefined
-     * when secondary throttle is true but write concern was not specified.
+     * Attempts to extract a writeConcern from cmdObj.
+     * Verifies that the writeConcern is of type Object (BSON type).
      */
-    Status parseSecondaryThrottle(const BSONObj& doc, BSONObj* rawWriteConcernObj);
+    static StatusWith<WriteConcernOptions> extractWCFromCommand(
+        const BSONObj& cmdObj,
+        const std::string& dbName,
+        const WriteConcernOptions& defaultWC = WriteConcernOptions());
 
     /**
      * Return true if the server needs to wait for other secondary nodes to satisfy this
@@ -85,8 +78,14 @@ public:
      */
     bool shouldWaitForOtherNodes() const;
 
+    /**
+     * Returns true if this is a valid write concern to use against a config server.
+     * TODO(spencer): Once we stop supporting SCCC config servers, forbid this from allowing w:1
+     */
+    bool validForConfigServers() const;
+
     void reset() {
-        syncMode = NONE;
+        syncMode = SyncMode::UNSET;
         wNumNodes = 0;
         wMode = "";
         wTimeout = 0;
@@ -105,5 +104,9 @@ public:
 
     // Timeout in milliseconds.
     int wTimeout;
+
+    // True if the default write concern was used.
+    bool usedDefault = false;
 };
-}
+
+}  // namespace mongo

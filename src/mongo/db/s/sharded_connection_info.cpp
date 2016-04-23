@@ -38,9 +38,10 @@
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/sharding_connection_hook_for_mongod.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_connection.h"
-#include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -72,12 +73,12 @@ void ShardedConnectionInfo::reset(Client* client) {
     clientSCI(client) = boost::none;
 }
 
-const ChunkVersion ShardedConnectionInfo::getVersion(const std::string& ns) const {
+ChunkVersion ShardedConnectionInfo::getVersion(const std::string& ns) const {
     NSVersionMap::const_iterator it = _versions.find(ns);
     if (it != _versions.end()) {
         return it->second;
     } else {
-        return ChunkVersion(0, 0, OID());
+        return ChunkVersion::UNSHARDED();
     }
 }
 
@@ -85,20 +86,26 @@ void ShardedConnectionInfo::setVersion(const std::string& ns, const ChunkVersion
     _versions[ns] = version;
 }
 
+namespace {
+stdx::mutex addHookMutex;
+AtomicUInt32 alreadyAddedHook{0};
+}  // namespace
+
 void ShardedConnectionInfo::addHook() {
-    static stdx::mutex lock;
-    static bool done = false;
-
-    stdx::lock_guard<stdx::mutex> lk(lock);
-    if (!done) {
-        log() << "first cluster operation detected, adding sharding hook to enable versioning "
-                 "and authentication to remote servers";
-
-        globalConnPool.addHook(new ShardingConnectionHook(false));
-        shardConnectionPool.addHook(new ShardingConnectionHook(true));
-
-        done = true;
+    if (alreadyAddedHook.loadRelaxed()) {
+        return;
     }
+    stdx::lock_guard<stdx::mutex> lk{addHookMutex};
+    if (alreadyAddedHook.load()) {
+        return;
+    }
+    log() << "first cluster operation detected, adding sharding hook to enable versioning "
+             "and authentication to remote servers";
+
+    globalConnPool.addHook(new ShardingConnectionHookForMongod(false));
+    shardConnectionPool.addHook(new ShardingConnectionHookForMongod(true));
+
+    alreadyAddedHook.store(1);
 }
 
 }  // namespace mongo

@@ -98,8 +98,8 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
@@ -138,8 +138,6 @@ public:
         cloneOptions.slaveOk = cmdObj["slaveOk"].trueValue();
         cloneOptions.useReplAuth = false;
         cloneOptions.snapshot = true;
-        cloneOptions.mayYield = true;
-        cloneOptions.mayBeInterrupted = true;
 
         string todb = cmdObj.getStringField("todb");
         if (fromhost.empty() || todb.empty() || cloneOptions.fromDB.empty()) {
@@ -149,7 +147,7 @@ public:
             return false;
         }
 
-        if (!NamespaceString::validDBName(todb)) {
+        if (!NamespaceString::validDBName(todb, NamespaceString::DollarInDbNameBehavior::Allow)) {
             errmsg = "invalid todb name: " + todb;
             return false;
         }

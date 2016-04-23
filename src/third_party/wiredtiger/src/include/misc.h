@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,6 +13,7 @@
 #define	WT_UNUSED(var)		(void)(var)
 
 /* Basic constants. */
+#define	WT_THOUSAND	(1000)
 #define	WT_MILLION	(1000000)
 #define	WT_BILLION	(1000000000)
 
@@ -46,6 +47,9 @@
  */
 #define	WT_ALIGN(n, v)							\
 	((((uintmax_t)(n)) + ((v) - 1)) & ~(((uintmax_t)(v)) - 1))
+
+#define	WT_ALIGN_NEAREST(n, v)						\
+	((((uintmax_t)(n)) + ((v) / 2)) & ~(((uintmax_t)(v)) - 1))
 
 /* Min, max. */
 #define	WT_MIN(a, b)	((a) < (b) ? (a) : (b))
@@ -120,17 +124,21 @@
  * hex constant might be a negative integer), and to ensure the hex constant is
  * the correct size before applying the bitwise not operator.
  */
-#define	F_CLR(p, mask)		((p)->flags &= ~((uint32_t)(mask)))
-#define	F_ISSET(p, mask)	((p)->flags & ((uint32_t)(mask)))
-#define	F_SET(p, mask)		((p)->flags |= ((uint32_t)(mask)))
+#define	FLD_CLR(field, mask)	        ((void)((field) &= ~(uint32_t)(mask)))
+#define	FLD_MASK(field, mask)	        ((field) & (uint32_t)(mask))
+#define	FLD_ISSET(field, mask)	        (FLD_MASK(field, mask) != 0)
+#define	FLD64_ISSET(field, mask)	(((field) & (uint64_t)(mask)) != 0)
+#define	FLD_SET(field, mask)	        ((void)((field) |= (uint32_t)(mask)))
 
-#define	LF_CLR(mask)		((flags) &= ~((uint32_t)(mask)))
-#define	LF_ISSET(mask)		((flags) & ((uint32_t)(mask)))
-#define	LF_SET(mask)		((flags) |= ((uint32_t)(mask)))
+#define	F_CLR(p, mask)		        FLD_CLR((p)->flags, mask)
+#define	F_ISSET(p, mask)	        FLD_ISSET((p)->flags, mask)
+#define	F_MASK(p, mask)	                FLD_MASK((p)->flags, mask)
+#define	F_SET(p, mask)		        FLD_SET((p)->flags, mask)
 
-#define	FLD_CLR(field, mask)	((field) &= ~((uint32_t)(mask)))
-#define	FLD_ISSET(field, mask)	((field) & ((uint32_t)(mask)))
-#define	FLD_SET(field, mask)	((field) |= ((uint32_t)(mask)))
+#define	LF_CLR(mask)		        FLD_CLR(flags, mask)
+#define	LF_ISSET(mask)		        FLD_ISSET(flags, mask)
+#define	LF_MASK(mask)		        FLD_MASK(flags, mask)
+#define	LF_SET(mask)		        FLD_SET(flags, mask)
 
 /*
  * Insertion sort, for sorting small sets of values.
@@ -164,14 +172,14 @@
  */
 #define	WT_BINARY_SEARCH(key, arrayp, n, found) do {			\
 	uint32_t __base, __indx, __limit;				\
-	found = 0;							\
+	found = false;							\
 	for (__base = 0, __limit = (n); __limit != 0; __limit >>= 1) {	\
 		__indx = __base + (__limit >> 1);			\
 		if ((arrayp)[__indx] < key) {				\
 			__base = __indx + 1;				\
 			--__limit;					\
 		} else if ((arrayp)[__indx] == key) {			\
-			found = 1;					\
+			found = true;					\
 			break;						\
 		}							\
 	}								\
@@ -190,12 +198,8 @@
 
 /* Check if a string matches a prefix. */
 #define	WT_PREFIX_MATCH(str, pfx)					\
-	(((const char *)str)[0] == ((const char *)pfx)[0] &&		\
+	(((const char *)(str))[0] == ((const char *)pfx)[0] &&		\
 	    strncmp((str), (pfx), strlen(pfx)) == 0)
-
-/* Check if a non-nul-terminated string matches a prefix. */
-#define	WT_PREFIX_MATCH_LEN(str, len, pfx)				\
-	((len) >= strlen(pfx) && WT_PREFIX_MATCH(str, pfx))
 
 /* Check if a string matches a prefix, and move past it. */
 #define	WT_PREFIX_SKIP(str, pfx)					\
@@ -263,3 +267,6 @@ union __wt_rand_state {
 		uint32_t w, z;
 	} x;
 };
+
+/* Shared array for converting to hex */
+extern const u_char __wt_hex[];

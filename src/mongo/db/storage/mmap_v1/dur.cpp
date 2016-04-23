@@ -81,7 +81,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage/mmap_v1/aligned_builder.h"
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
@@ -90,7 +89,7 @@
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
@@ -400,6 +399,11 @@ void remapPrivateViewImpl(double fraction) {
 DurableImpl durableImpl;
 NonDurableImpl nonDurableImpl;
 
+// Notified when we commit to the journal.
+static JournalListener* journalListener = &NoOpJournalListener::instance;
+// Protects journalListener.
+static stdx::mutex journalListenerMutex;
+
 }  // namespace
 
 
@@ -485,8 +489,8 @@ void Stats::S::_asObj(BSONObjBuilder* builder) const {
                    << (unsigned)(_commitsMicros / 1000) << "commitsInWriteLock"
                    << (unsigned)(_commitsInWriteLockMicros / 1000));
 
-    if (mmapv1GlobalOptions.journalCommitInterval != 0) {
-        b << "journalCommitIntervalMs" << mmapv1GlobalOptions.journalCommitInterval;
+    if (storageGlobalParams.journalCommitIntervalMs != 0) {
+        b << "journalCommitIntervalMs" << storageGlobalParams.journalCommitIntervalMs.load();
     }
 }
 
@@ -672,7 +676,7 @@ static void durThread() {
     uint64_t remapLastTimestamp(0);
 
     while (shutdownRequested.loadRelaxed() == 0) {
-        unsigned ms = mmapv1GlobalOptions.journalCommitInterval;
+        unsigned ms = storageGlobalParams.journalCommitIntervalMs;
         if (ms == 0) {
             ms = samePartition ? 100 : 30;
         }
@@ -711,7 +715,8 @@ static void durThread() {
 
             Timer t;
 
-            OperationContextImpl txn;
+            const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+            OperationContext& txn = *txnPtr;
             AutoAcquireFlushLockForMMAPV1Commit autoFlushLock(txn.lockState());
 
             // We need to snapshot the commitNumber after the flush lock has been obtained,
@@ -730,6 +735,7 @@ static void durThread() {
                 // writes (hasWritten == false).
                 JournalWriter::Buffer* const buffer = journalWriter.newBuffer();
                 buffer->setNoop();
+                buffer->journalListenerToken = getJournalListener()->getToken();
 
                 journalWriter.writeBuffer(buffer, commitNumber);
             } else {
@@ -794,6 +800,7 @@ static void durThread() {
                     autoFlushLock.release();
                 }
 
+                buffer->journalListenerToken = getJournalListener()->getToken();
                 // Request async I/O to the journal. This may block.
                 journalWriter.writeBuffer(buffer, commitNumber);
 
@@ -884,6 +891,16 @@ void startup() {
 
     durableImpl.start();
     DurableInterface::_impl = &durableImpl;
+}
+
+void setJournalListener(JournalListener* jl) {
+    stdx::unique_lock<stdx::mutex> lk(journalListenerMutex);
+    journalListener = jl;
+}
+
+JournalListener* getJournalListener() {
+    stdx::unique_lock<stdx::mutex> lk(journalListenerMutex);
+    return journalListener;
 }
 
 }  // namespace dur

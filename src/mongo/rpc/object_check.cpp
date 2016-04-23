@@ -31,19 +31,19 @@
 #include "mongo/rpc/object_check.h"
 
 #include "mongo/base/status.h"
-#include "mongo/bson/bson_validate.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/server_options.h"
-
+#include "mongo/db/server_parameters.h"
 
 namespace mongo {
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly> enableBSON1_1Parameter(
+    ServerParameterSet::getGlobal(), "enableBSON1_1", &enableBSON1_1);
 
-Status Validator<BSONObj>::validateLoad(const char* ptr, size_t length) {
-    return serverGlobalParams.objcheck ? validateBSON(ptr, length) : Status::OK();
+BSONVersion Validator<BSONObj>::validateVersion() {
+    return enableBSON1_1 ? BSONVersion::kV1_1 : BSONVersion::kV1_0;
 }
 
 Status Validator<BSONObj>::validateStore(const BSONObj& toStore) {
     return Status::OK();
 }
-
 }  // namespace mongo

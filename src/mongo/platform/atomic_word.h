@@ -146,7 +146,7 @@ public:
     }
 
 private:
-    std::atomic<WordType> _value;
+    std::atomic<WordType> _value;  // NOLINT
 };
 
 #define _ATOMIC_WORD_DECLARE(NAME, WTYPE)                                                          \
@@ -160,6 +160,7 @@ _ATOMIC_WORD_DECLARE(AtomicUInt32, unsigned);
 _ATOMIC_WORD_DECLARE(AtomicUInt64, unsigned long long);
 _ATOMIC_WORD_DECLARE(AtomicInt32, int);
 _ATOMIC_WORD_DECLARE(AtomicInt64, long long);
+_ATOMIC_WORD_DECLARE(AtomicBool, bool);
 #undef _ATOMIC_WORD_DECLARE
 
 }  // namespace mongo

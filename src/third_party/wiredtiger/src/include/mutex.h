@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2016 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -20,6 +20,13 @@ struct __wt_condvar {
 
 	int waiters;			/* Numbers of waiters, or
 					   -1 if signalled with no waiters. */
+	/*
+	 * The following fields are only used for automatically adjusting
+	 * condition variables. They could be in a separate structure.
+	 */
+	uint64_t	min_wait;	/* Minimum wait duration */
+	uint64_t	max_wait;	/* Maximum wait duration */
+	uint64_t	prev_wait;	/* Wait duration used last time */
 };
 
 /*
@@ -49,6 +56,24 @@ struct __wt_rwlock {
 	const char *name;		/* Lock name for debugging */
 
 	wt_rwlock_t rwlock;		/* Read/write lock */
+};
+
+/*
+ * A light weight lock that can be used to replace spinlocks if fairness is
+ * necessary. Implements a ticket-based back off spin lock.
+ * The fields are available as a union to allow for atomically setting
+ * the state of the entire lock.
+ */
+struct __wt_fair_lock {
+	union {
+		uint32_t lock;
+		struct {
+			uint16_t owner;		/* Ticket for current owner */
+			uint16_t waiter;	/* Last allocated ticket */
+		} s;
+	} u;
+#define	fair_lock_owner u.s.owner
+#define	fair_lock_waiter u.s.waiter
 };
 
 /*

@@ -53,11 +53,16 @@ using executor::RemoteCommandResponse;
 
 class ReplCoordHBTest : public ReplCoordTest {
 protected:
+    void assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost);
     void assertMemberState(MemberState expected, std::string msg = "");
     ReplSetHeartbeatResponse receiveHeartbeatFrom(const ReplicaSetConfig& rsConfig,
                                                   int sourceId,
                                                   const HostAndPort& source);
 };
+
+void ReplCoordHBTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPort& selfHost) {
+    ReplCoordTest::assertStartSuccess(addProtocolVersion(configDoc, 0), selfHost);
+}
 
 void ReplCoordHBTest::assertMemberState(const MemberState expected, std::string msg) {
     const MemberState actual = getReplCoord()->getMemberState();
@@ -81,17 +86,17 @@ ReplSetHeartbeatResponse ReplCoordHBTest::receiveHeartbeatFrom(const ReplicaSetC
     return response;
 }
 
-TEST_F(ReplCoordHBTest, JoinExistingReplSet) {
+TEST_F(ReplCoordHBTest, NodeJoinsExistingReplSetWhenReceivingAConfigContainingTheNodeViaHeartbeat) {
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    ReplicaSetConfig rsConfig =
-        assertMakeRSConfig(BSON("_id"
-                                << "mySet"
-                                << "version" << 3 << "members"
-                                << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                         << "h1:1")
-                                              << BSON("_id" << 2 << "host"
-                                                            << "h2:1") << BSON("_id" << 3 << "host"
-                                                                                     << "h3:1"))));
+    ReplicaSetConfig rsConfig = assertMakeRSConfigV0(BSON("_id"
+                                                          << "mySet"
+                                                          << "version" << 3 << "members"
+                                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                                   << "h1:1")
+                                                                        << BSON("_id" << 2 << "host"
+                                                                                      << "h2:1")
+                                                                        << BSON("_id" << 3 << "host"
+                                                                                      << "h3:1"))));
     init("mySet");
     addSelf(HostAndPort("h2", 1));
     const Date_t startDate = getNet()->now();
@@ -142,19 +147,20 @@ TEST_F(ReplCoordHBTest, JoinExistingReplSet) {
     exitNetwork();
 }
 
-TEST_F(ReplCoordHBTest, DoNotJoinReplSetIfNotAMember) {
+TEST_F(ReplCoordHBTest,
+       NodeDoesNotJoinExistingReplSetWhenReceivingAConfigNotContainingTheNodeViaHeartbeat) {
     // Tests that a node in RS_STARTUP will not transition to RS_REMOVED if it receives a
     // configuration that does not contain it.
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    ReplicaSetConfig rsConfig =
-        assertMakeRSConfig(BSON("_id"
-                                << "mySet"
-                                << "version" << 3 << "members"
-                                << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                         << "h1:1")
-                                              << BSON("_id" << 2 << "host"
-                                                            << "h2:1") << BSON("_id" << 3 << "host"
-                                                                                     << "h3:1"))));
+    ReplicaSetConfig rsConfig = assertMakeRSConfigV0(BSON("_id"
+                                                          << "mySet"
+                                                          << "version" << 3 << "members"
+                                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                                   << "h1:1")
+                                                                        << BSON("_id" << 2 << "host"
+                                                                                      << "h2:1")
+                                                                        << BSON("_id" << 3 << "host"
+                                                                                      << "h3:1"))));
     init("mySet");
     addSelf(HostAndPort("h4", 1));
     const Date_t startDate = getNet()->now();
@@ -202,7 +208,7 @@ TEST_F(ReplCoordHBTest, DoNotJoinReplSetIfNotAMember) {
     exitNetwork();
 }
 
-TEST_F(ReplCoordHBTest, NotYetInitializedConfigStateEarlyReturn) {
+TEST_F(ReplCoordHBTest, NodeReturnsNotYetInitializedInResponseToAHeartbeatReceivedPriorToAConfig) {
     // ensure that if we've yet to receive an initial config, we return NotYetInitialized
     init("mySet");
     ReplSetHeartbeatArgs hbArgs;
@@ -218,7 +224,8 @@ TEST_F(ReplCoordHBTest, NotYetInitializedConfigStateEarlyReturn) {
     ASSERT_EQUALS(ErrorCodes::NotYetInitialized, status.code());
 }
 
-TEST_F(ReplCoordHBTest, OnlyUnauthorizedUpCausesRecovering) {
+TEST_F(ReplCoordHBTest,
+       NodeChangesToRecoveringStateWhenAllNodesRespondToHeartbeatsWithUnauthorized) {
     // Tests that a node that only has auth error heartbeats is recovering
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
     assertStartSuccess(BSON("_id"

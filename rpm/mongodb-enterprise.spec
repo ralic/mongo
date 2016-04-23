@@ -192,7 +192,7 @@ if ! /usr/bin/id -g mongod &>/dev/null; then
     /usr/sbin/groupadd -r mongod
 fi
 if ! /usr/bin/id mongod &>/dev/null; then
-    /usr/sbin/useradd -M -r -g mongod -d /var/lib/mongo -s /bin/false 	-c mongod mongod > /dev/null 2>&1
+    /usr/sbin/useradd -M -r -g mongod -d /var/lib/mongo -s /bin/false   -c mongod mongod > /dev/null 2>&1
 fi
 
 %post server
@@ -221,7 +221,7 @@ fi
 %{_bindir}/mongod
 %{_mandir}/man1/mongod.1*
 /etc/init.d/mongod
-/etc/sysconfig/mongod
+%config(noreplace) /etc/sysconfig/mongod
 %attr(0755,mongod,mongod) %dir /var/lib/mongo
 %attr(0755,mongod,mongod) %dir /var/log/mongodb
 %attr(0755,mongod,mongod) %dir /var/run/mongodb
@@ -253,6 +253,7 @@ fi
 #%doc README GNU-AGPL-3.0.txt
 
 %{_bindir}/bsondump
+%{_bindir}/mongodecrypt
 %{_bindir}/mongodump
 %{_bindir}/mongoexport
 %{_bindir}/mongofiles

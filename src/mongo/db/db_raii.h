@@ -74,7 +74,12 @@ class AutoGetCollection {
     MONGO_DISALLOW_COPYING(AutoGetCollection);
 
 public:
-    AutoGetCollection(OperationContext* txn, const NamespaceString& nss, LockMode mode);
+    AutoGetCollection(OperationContext* txn, const NamespaceString& nss, LockMode modeAll);
+
+    AutoGetCollection(OperationContext* txn,
+                      const NamespaceString& nss,
+                      LockMode modeDB,
+                      LockMode modeColl);
 
     Database* getDb() const {
         return _autoDb.getDb();
@@ -143,20 +148,21 @@ public:
     ~AutoGetCollectionForRead();
 
     Database* getDb() const {
-        return _autoColl.getDb();
+        return _autoColl->getDb();
     }
 
     Collection* getCollection() const {
-        return _autoColl.getCollection();
+        return _autoColl->getCollection();
     }
 
 private:
     void _init(const std::string& ns, StringData coll);
+    void _ensureMajorityCommittedSnapshotIsValid(const NamespaceString& nss);
 
     const Timer _timer;
     OperationContext* const _txn;
     const ScopedTransaction _transaction;
-    const AutoGetCollection _autoColl;
+    boost::optional<AutoGetCollection> _autoColl;
 };
 
 /**
@@ -176,20 +182,10 @@ public:
      */
     OldClientContext(OperationContext* txn, const std::string& ns, Database* db, bool justCreated);
 
-    /**
-     * note: this does not call _finishInit -- i.e., does not call
-     * ensureShardVersionOKOrThrow for example.
-     * see also: reset().
-     */
-    OldClientContext(OperationContext* txn, const std::string& ns, Database* db);
-
     ~OldClientContext();
 
     Database* db() const {
         return _db;
-    }
-    const char* ns() const {
-        return _ns.c_str();
     }
 
     /** @return if the db was created by this OldClientContext */

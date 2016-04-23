@@ -94,6 +94,13 @@ Status ModifierBit::init(const BSONElement& modExpr, const Options& opts, bool* 
                                     << ". You must pass in an embedded document: "
                                        "{$bit: {field: {and/or/xor: #}}");
 
+    if (modExpr.embeddedObject().isEmpty()) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "You must pass in at least one bitwise operation. "
+                                    << "The format is: "
+                                       "{$bit: {field: {and/or/xor: #}}");
+    }
+
     BSONObjIterator opsIterator(modExpr.embeddedObject());
 
     while (opsIterator.more()) {
@@ -176,7 +183,7 @@ Status ModifierBit::prepare(mutablebson::Element root,
     if (!_preparedState->elemFound.ok() || _preparedState->idxFound < (_fieldRef.numParts() - 1)) {
         // If no target element exists, the value we will write is the result of applying
         // the operation to a zero-initialized integer element.
-        _preparedState->newValue = apply(SafeNum(static_cast<int>(0)));
+        _preparedState->newValue = apply(SafeNum(static_cast<int32_t>(0)));
         return Status::OK();
     }
 

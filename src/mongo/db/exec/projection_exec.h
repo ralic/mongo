@@ -66,22 +66,13 @@ public:
 
     ProjectionExec(const BSONObj& spec,
                    const MatchExpression* queryExpression,
-                   const MatchExpressionParser::WhereCallback& whereCallback =
-                       MatchExpressionParser::WhereCallback());
+                   const ExtensionsCallback& extensionsCallback);
     ~ProjectionExec();
 
     /**
      * Apply this projection to the 'member'.  Changes the type to OWNED_OBJ.
      */
     Status transform(WorkingSetMember* member) const;
-
-    /**
-     * Apply this projection to the object 'in'.
-     *
-     * Upon success, 'out' is set to the new object and Status::OK() is returned.
-     * Otherwise, returns an error Status and *out is not mutated.
-     */
-    Status transform(const BSONObj& in, BSONObj* out) const;
 
 private:
     //
@@ -122,13 +113,6 @@ private:
      */
     bool transformRequiresDetails() const {
         return ARRAY_OP_POSITIONAL == _arrayOpType;
-    }
-
-    /**
-     * Is the full document required to compute this projection?
-     */
-    bool requiresDocument() const {
-        return _include || _hasNonSimple || _hasDottedField;
     }
 
     /**
@@ -178,21 +162,19 @@ private:
 
     ArrayOpType _arrayOpType;
 
-    // Is there an slice, elemMatch or meta operator?
-    bool _hasNonSimple;
-
-    // Is there a projection over a dotted field or a $ positional operator?
-    bool _hasDottedField;
-
     // The full query expression.  Used when we need MatchDetails.
     const MatchExpression* _queryExpression;
 
     // Projections that aren't sourced from the document or index keys.
     MetaMap _meta;
 
-    // Do we have a returnKey projection?  If so we *only* output the index key metadata.  If
-    // it's not found we output nothing.
+    // Do we have a returnKey projection?  If so we *only* output the index key metadata, and
+    // possibly the sort key for mongos to use.  If it's not found we output nothing.
     bool _hasReturnKey;
+
+    // The field names associated with any sortKey meta-projection(s). Empty if there is no sortKey
+    // meta-projection.
+    std::vector<StringData> _sortKeyMetaFields;
 };
 
 }  // namespace mongo

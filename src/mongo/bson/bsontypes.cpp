@@ -29,66 +29,99 @@
 
 #include "mongo/bson/bsontypes.h"
 
+#include "mongo/config.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
+bool enableBSON1_1 = false;
+
 const char kMaxKeyData[] = {7, 0, 0, 0, static_cast<char>(MaxKey), 0, 0};
-const BSONObj maxKey(kMaxKeyData);
+const BSONObj kMaxBSONKey(kMaxKeyData);
 
 const char kMinKeyData[] = {7, 0, 0, 0, static_cast<char>(MinKey), 0, 0};
-const BSONObj minKey(kMinKeyData);
+const BSONObj kMinBSONKey(kMinKeyData);
 
 /* take a BSONType and return the name of that type as a char* */
 const char* typeName(BSONType type) {
     switch (type) {
         case MinKey:
-            return "MinKey";
+            return "minKey";
         case EOO:
-            return "EOO";
+            return "missing";
         case NumberDouble:
-            return "NumberDouble";
+            return "double";
         case String:
-            return "String";
+            return "string";
         case Object:
-            return "Object";
+            return "object";
         case Array:
-            return "Array";
+            return "array";
         case BinData:
-            return "BinaryData";
+            return "binData";
         case Undefined:
-            return "Undefined";
+            return "undefined";
         case jstOID:
-            return "OID";
+            return "objectId";
         case Bool:
-            return "Bool";
+            return "bool";
         case Date:
-            return "Date";
+            return "date";
         case jstNULL:
-            return "NULL";
+            return "null";
         case RegEx:
-            return "RegEx";
+            return "regex";
         case DBRef:
-            return "DBRef";
+            return "dbPointer";
         case Code:
-            return "Code";
+            return "javascript";
         case Symbol:
-            return "Symbol";
+            return "symbol";
         case CodeWScope:
-            return "CodeWScope";
+            return "javascriptWithScope";
         case NumberInt:
-            return "NumberInt32";
+            return "int";
         case bsonTimestamp:
-            return "Timestamp";
+            return "timestamp";
         case NumberLong:
-            return "NumberLong64";
+            return "long";
         case NumberDecimal:
-            return "NumberDecimal128";
+            return "decimal";
         // JSTypeMax doesn't make sense to turn into a string; overlaps with highest-valued type
         case MaxKey:
-            return "MaxKey";
+            return "maxKey";
         default:
-            return "Invalid";
+            return "invalid";
+    }
+}
+
+bool isValidBSONType(int type) {
+    switch (type) {
+        case MinKey:
+        case EOO:
+        case NumberDouble:
+        case String:
+        case Object:
+        case Array:
+        case BinData:
+        case Undefined:
+        case jstOID:
+        case Bool:
+        case Date:
+        case jstNULL:
+        case RegEx:
+        case DBRef:
+        case Code:
+        case Symbol:
+        case CodeWScope:
+        case NumberInt:
+        case bsonTimestamp:
+        case NumberLong:
+        case NumberDecimal:
+        case MaxKey:
+            return true;
+        default:
+            return false;
     }
 }
 

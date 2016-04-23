@@ -28,15 +28,18 @@
 
 #pragma once
 
+#include <memory>
 #include <boost/filesystem/path.hpp>
 
 #include "mongo/db/db.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/data_protector.h"
 
 namespace mongo {
 
 class Collection;
 class Cursor;
+class DataProtector;
 class OperationContext;
 struct KeyRange;
 struct WriteConcernOptions;
@@ -174,33 +177,6 @@ struct Helpers {
                                  bool fromMigrate = false,
                                  bool onlyRemoveOrphanedDocs = false);
 
-
-    // TODO: This will supersede Chunk::MaxObjectsPerChunk
-    static const long long kMaxDocsPerChunk;
-
-    /**
-     * Get sorted disklocs that belong to a range of a namespace defined over an index
-     * key pattern (KeyRange).
-     *
-     * @param chunk range of a namespace over an index key pattern.
-     * @param maxChunkSizeBytes max number of bytes that we will retrieve locs for, if the
-     * range is estimated larger (from avg doc stats) we will stop recording locs.
-     * @param locs set to record locs in
-     * @param estChunkSizeBytes chunk size estimated from doc count and avg doc size
-     * @param chunkTooBig whether the chunk was estimated larger than our maxChunkSizeBytes
-     * @param errmsg filled with textual description of error if this call return false
-     *
-     * @return NamespaceNotFound if the namespace doesn't exist
-     * @return IndexNotFound if the index pattern doesn't match any indexes
-     * @return InvalidLength if the estimated size exceeds maxChunkSizeBytes
-     */
-    static Status getLocsInRange(OperationContext* txn,
-                                 const KeyRange& range,
-                                 long long maxChunkSizeBytes,
-                                 std::set<RecordId>* locs,
-                                 long long* numDocs,
-                                 long long* estChunkSizeBytes);
-
     /**
      * Remove all documents from a collection.
      * You do not need to set the database before calling.
@@ -218,12 +194,18 @@ struct Helpers {
         RemoveSaver(const std::string& type, const std::string& ns, const std::string& why);
         ~RemoveSaver();
 
-        void goingToDelete(const BSONObj& o);
+        /**
+         * Writes document to file. File is created lazily before writing the first document.
+         * Returns error status if the file could not be created or if there were errors writing
+         * to the file.
+         */
+        Status goingToDelete(const BSONObj& o);
 
     private:
         boost::filesystem::path _root;
         boost::filesystem::path _file;
-        std::ofstream* _out;
+        std::unique_ptr<DataProtector> _protector;
+        std::unique_ptr<std::ostream> _out;
     };
 };
 

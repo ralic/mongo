@@ -35,6 +35,7 @@
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
 
+#include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
@@ -44,7 +45,7 @@ namespace mongo {
 //
 // system warnings
 //
-void logCommonStartupWarnings() {
+void logCommonStartupWarnings(const ServerGlobalParams& serverParams) {
     // each message adds a leading and a trailing newline
 
     bool warned = false;
@@ -58,6 +59,52 @@ void logCommonStartupWarnings() {
             log() << "**       Not recommended for production." << startupWarningsLog;
             warned = true;
         }
+    }
+
+    if (serverParams.authState == ServerGlobalParams::AuthState::kEnabled &&
+        (serverParams.rest || serverParams.isHttpInterfaceEnabled || serverParams.jsonp)) {
+        log() << startupWarningsLog;
+        log()
+            << "** WARNING: The server is started with the web server interface and access control."
+            << startupWarningsLog;
+        log() << "**          The web interfaces (rest, httpinterface and/or jsonp) are insecure "
+              << startupWarningsLog;
+        log() << "**          and should be disabled unless required for backward compatibility."
+              << startupWarningsLog;
+        warned = true;
+    }
+
+    // SERVER-23838 Disable warnings for no access control enabled and no bind_ip
+    // if (serverParams.authState == ServerGlobalParams::AuthState::kUndefined) {
+    //     log() << startupWarningsLog;
+    //     if (serverParams.bind_ip.empty()) {
+    //         log() << "** WARNING: Insecure configuration, access control is not "
+    //                  "enabled and no --bind_ip has been specified." << startupWarningsLog;
+    //         log() << "**          Read and write access to data and configuration is "
+    //                  "unrestricted, " << startupWarningsLog;
+    //        log() << "**          and the server listens on all available network interfaces."
+    //               << startupWarningsLog;
+    //     } else {
+    //         log() << "** WARNING: Access control is not enabled for the database."
+    //               << startupWarningsLog;
+    //         log() << "**          Read and write access to data and configuration is "
+    //                  "unrestricted." << startupWarningsLog;
+    //     }
+    //     warned = true;
+    // } else if (serverParams.bind_ip.empty()) {
+    //     log() << startupWarningsLog;
+    //     log() << "** WARNING: The server was started without specifying a "
+    //              "--bind_ip " << startupWarningsLog;
+    //     log() << "**          and listens for connections on all available "
+    //              "network interfaces." << startupWarningsLog;
+    //     warned = true;
+    // }
+
+    const bool is32bit = sizeof(int*) == 4;
+    if (is32bit) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: This 32-bit MongoDB binary is deprecated" << startupWarningsLog;
+        warned = true;
     }
 
 #if defined(_WIN32) && !defined(_WIN64)
